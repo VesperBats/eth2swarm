@@ -8,9 +8,14 @@ use clap::{Parser, Subcommand};
 #[command(name = "ethswarm", version, about)]
 struct Cli {
     /// JSON-RPC endpoint of the execution client.
-    /// Defaults to $ETH2SWARM_RPC, then http://localhost:8545
-    /// (the bee-factory Anvil node).
-    #[arg(long, global = true, env = "ETH2SWARM_RPC", default_value = "http://localhost:8545")]
+    /// Defaults to $ETH2SWARM_RPC, then the zbox mainnet node
+    /// (use http://localhost:8545 for the bee-factory Anvil).
+    #[arg(
+        long,
+        global = true,
+        env = "ETH2SWARM_RPC",
+        default_value = "http://zbox.tail2ab6c8.ts.net:8561"
+    )]
     rpc: Url,
 
     #[command(subcommand)]

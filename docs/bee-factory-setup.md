@@ -147,8 +147,8 @@ bee-factory stop   # removes containers + docker network (bee-factory-net)
 
 ## ethswarm configuration
 
-`ethswarm` reads its RPC endpoint from `$ETH2SWARM_RPC` (default `http://localhost:8545`,
-which is exactly the bee-factory Anvil):
+`ethswarm` defaults to the zbox mainnet node (`http://zbox.tail2ab6c8.ts.net:8561`).
+Against the bee-factory stack point it at Anvil instead:
 
 ```sh
 export ETH2SWARM_RPC=http://localhost:8545
