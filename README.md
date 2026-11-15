@@ -5,7 +5,7 @@ Importer of Ethereum blocks into Ethereum Swarm.
 - `ethswarm` — Rust CLI (binary). Talks to an execution-layer JSON-RPC endpoint to read
   block data. Default: `http://zbox.tail2ab6c8.ts.net:8561` (zbox mainnet node, reachable
   over Tailscale); override with `$ETH2SWARM_RPC` or `--rpc`
-  (e.g. `http://localhost:8545` for the bee-factory Anvil).
+  (e.g. `http://localhost:8546` for the patched bee-factory Anvil).
 
 ## Development environment
 
@@ -15,6 +15,6 @@ The local Swarm dev stack (5 Bee nodes + Anvil + Swarm contracts) is managed by
 
 ```sh
 bee-factory start                              # bring up the stack
-ETH2SWARM_RPC=http://localhost:8545 cargo run -- tip   # verify block access
+ETH2SWARM_RPC=http://localhost:8546 cargo run -- tip   # verify block access
 bee-factory stop                               # tear down
 ```

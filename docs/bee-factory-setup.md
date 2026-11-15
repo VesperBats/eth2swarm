@@ -15,7 +15,7 @@ See “Alternative: global Swarm” at the bottom.
 |---|---|
 | Docker | must be usable without `sudo` (Linux: user in `docker` group) |
 | Node.js ≥ 18 | verified working: v26; the npm CLI runs the stack |
-| Free host ports | `8545` (Anvil) and `1633`–`1642` (Bee API/P2P) |
+| Free host ports | `8546` (Anvil) and `1733`–`1742` (Bee API/P2P) with the port patch below; `8545` / `1633`–`1642` without it |
 
 ### macOS (MacBook)
 
@@ -43,33 +43,37 @@ bee-factory --help
 
 (`--allow-scripts` is needed on npm ≥ 11 because dependencies run postinstall scripts.)
 
-## Port conflicts (nuc only)
+## Port patch (runs alongside everything else)
 
-On the nuc two *other* containers occupy ports bee-factory needs:
+Upstream bee-factory hardcodes Anvil on `8545` and Bee on `1633`–`1642`. On the nuc those
+clash with `nethermind` (Gnosis EL, `8545`) and the DAppNode Bee package (`1634`), so we run a
+**patched copy** on different ports instead of stopping those containers:
 
-- `nethermind` (Gnosis chain EL) → **8545**
-- `DAppNodePackage-bee.swarm.public.dappnode.eth` → **1634**
+| Service   | Default      | Patched      |
+|-----------|--------------|--------------|
+| Anvil RPC | 8545         | **8546**     |
+| Bee API/P2P | 1633–1642  | **1733–1742** |
 
-Stop them before `bee-factory start` (and be aware this pauses Gnosis staking until restored):
+`scripts/patch-bee-factory-ports.sh` copies the npm package to `~/tools/bee-factory-patched`,
+applies the port changes there (including adding the `--port` flag upstream forgot to pass to
+Anvil) and installs a shim at `$(npm prefix -g)/bin/bee-factory`. The global package stays
+pristine. **Re-run the script after every `npm update -g @ethersphere/bee-factory`.**
 
 ```sh
-docker stop nethermind DAppNodePackage-bee.swarm.public.dappnode.eth
+scripts/patch-bee-factory-ports.sh
 ```
 
-The two setups are **mutually exclusive** while running (shared ports): after `bee-factory stop`,
-restore with
+With the patch, bee-factory and the Gnosis stack run **simultaneously** — no need to stop
+nethermind or the DAppNode Bee. (Skip the patch on a clean machine where the default ports
+are free; then the port table below reads 8545/1633–1642.)
 
-```sh
-docker start nethermind DAppNodePackage-bee.swarm.public.dappnode.eth
-```
-
-Check for whatever else sits on those ports (macOS/Linux):
+Check for whatever else sits on the ports (macOS/Linux):
 
 ```sh
 # macOS
-lsof -iTCP -sTCP:LISTEN -P | grep -E ':(8545|163[3-9]|164[0-2])\b'
+lsof -iTCP -sTCP:LISTEN -P | grep -E ':(854[56]|163[3-9]|164[0-2]|17[34][0-9])\b'
 # Linux
-ss -ltnp | grep -E ':(8545|163[3-9]|164[0-2])\b'
+ss -ltnp | grep -E ':(854[56]|163[3-9]|164[0-2]|17[34][0-9])\b'
 ```
 
 ## Start
@@ -91,30 +95,30 @@ The command returns once all nodes report `isWarmingUp: false`.
 
 | Node     | API                   | P2P                 |
 |----------|-----------------------|---------------------|
-| Queen    | http://localhost:1633 | localhost:1634      |
-| Worker 1 | http://localhost:1635 | localhost:1636      |
-| Worker 2 | http://localhost:1637 | localhost:1638      |
-| Worker 3 | http://localhost:1639 | localhost:1640      |
-| Worker 4 | http://localhost:1641 | localhost:1642      |
+| Queen    | http://localhost:1733 | localhost:1734      |
+| Worker 1 | http://localhost:1735 | localhost:1736      |
+| Worker 2 | http://localhost:1737 | localhost:1738      |
+| Worker 3 | http://localhost:1739 | localhost:1740      |
+| Worker 4 | http://localhost:1741 | localhost:1742      |
 
-**Anvil RPC:** `http://localhost:8545` (chain ID 1337, 1 s block time)
+**Anvil RPC:** `http://localhost:8546` (chain ID 1337, 1 s block time)
 
 Smoke tests (verified against Bee 2.8.3 — note the endpoints are `/status` and `/topology`,
 not `/node/status`):
 
 ```sh
-curl -s localhost:1633/status | python3 -m json.tool      # expect beeMode=full, connectedPeers=4, isWarmingUp=false
-curl -s localhost:1633/topology | python3 -m json.tool    # expect population=4
-ETH2SWARM_RPC=http://localhost:8545 cargo run -- tip      # expect Chain ID: 1337
-ETH2SWARM_RPC=http://localhost:8545 cargo run -- block 0
+curl -s localhost:1733/status | python3 -m json.tool      # expect beeMode=full, connectedPeers=4, isWarmingUp=false
+curl -s localhost:1733/topology | python3 -m json.tool    # expect population=4
+ETH2SWARM_RPC=http://localhost:8546 cargo run -- tip      # expect Chain ID: 1337
+ETH2SWARM_RPC=http://localhost:8546 cargo run -- block 0
 ```
 
 Roundtrip upload/download (the postage batch is bought on **worker 1**, not the queen):
 
 ```sh
-BATCH=$(curl -s localhost:1635/stamps | python3 -c "import json,sys; print(json.load(sys.stdin)['stamps'][0]['batchID'])")
-REF=$(curl -s -X POST -H "Swarm-Postage-Batch-Id: $BATCH" --data-binary "hello swarm" localhost:1635/bytes | python3 -c "import json,sys; print(json.load(sys.stdin)['reference'])")
-curl -s localhost:1633/bytes/$REF                          # fetch via queen → proves p2p sync
+BATCH=$(curl -s localhost:1735/stamps | python3 -c "import json,sys; print(json.load(sys.stdin)['stamps'][0]['batchID'])")
+REF=$(curl -s -X POST -H "Swarm-Postage-Batch-Id: $BATCH" --data-binary "hello swarm" localhost:1735/bytes | python3 -c "import json,sys; print(json.load(sys.stdin)['reference'])")
+curl -s localhost:1733/bytes/$REF                          # fetch via queen → proves p2p sync
 ```
 
 ## Contracts & wallets (Foundry test keys — never use in production)
@@ -151,7 +155,7 @@ bee-factory stop   # removes containers + docker network (bee-factory-net)
 Against the bee-factory stack point it at Anvil instead:
 
 ```sh
-export ETH2SWARM_RPC=http://localhost:8545
+export ETH2SWARM_RPC=http://localhost:8546
 cargo run -- tip
 ```
 
