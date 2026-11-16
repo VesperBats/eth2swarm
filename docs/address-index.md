@@ -15,7 +15,8 @@ into one slice of twice the length, like a binary counter, up to a cap of 2^16 u
 13 at mainnet's current height, at most 22 until late 2027. Inside a slice, addresses
 are hashed into **buckets** of about 2.8 KB, and each bucket is one SOC at a
 deterministic identifier. A lookup reads one bucket per slice. Nothing is ever
-overwritten: only a head feed advances.
+overwritten: only a head feed advances. Large merges run in the background while clients
+keep using the smaller slices they replace.
 
 ## Design constraints
 
@@ -31,12 +32,18 @@ These follow from how Swarm and the block store work; the discussion is in #5.
   million in the last 16,384 blocks alone), most with a handful of appearances. A stamped
   4 KB chunk each would cost terabytes of postage for about 70 GB of data.
 - **Some privacy.** An identifier derived from a single address tells the storer
-  neighbourhood which address someone looks up. Buckets hide the address among the other
-  addresses in the bucket (k-anonymity; about 180, measured). This is
-  weaker than scanning every bloom filter.
+  neighbourhood which address someone looks up. A bucket hides the address among the other
+  addresses in it: about 180 in 64-block slices, 127 in 16,384-block slices (measured),
+  fewer in top-level slices. Whoever sees a client's whole lookup (the Bee node or gateway
+  the wallet uses) can intersect the hash ranges of the buckets it asks for across slices,
+  which differ because `B` differs, and is left with a fraction of one bucket. This is much
+  weaker than scanning every bloom filter; a wallet that cares runs its own Bee node or
+  fetches decoy buckets.
 - **Finalized blocks only.** Slices are immutable, so they must not contain blocks that can
-  still be reorganized. A unit of 64 blocks is about two beacon-chain epochs, which is also
-  the finality delay: the index runs 13–26 minutes behind the tip.
+  still be reorganized. A unit of 64 blocks is about two beacon-chain epochs. Units are not
+  aligned to epochs, and a block is finalized up to about three epochs after it, so the
+  index runs about 13–32 minutes behind the tip, plus the time to build and upload a small
+  slice (large merges do not hold the head back, see *Writing*).
 
 ## Appearances
 
@@ -67,9 +74,11 @@ are normative.
   read as a number, are at least 2^128. This approximates TrueBlocks' heuristic: it skips
   small integers, but also vanity addresses with four or more leading zero bytes.
 - **The zero address is never indexed.**
-- `FROM`: the transaction's sender. `TO`: its `to`, or the `contractAddress` of its receipt
-  for a contract creation. Failed transactions keep `FROM`, `TO` and their input `WORD`s;
-  they have no logs.
+- `FROM`: the transaction's sender. `TO`: its `to`; for a contract creation the address
+  `keccak256(rlp([sender, nonce]))[12..32]`, from the transaction's sender and nonce, whether
+  the creation succeeded or not (the consensus receipt carries no contract address; the
+  `contractAddress` of an RPC receipt is derived by the node). Failed transactions keep
+  `FROM`, `TO` and their input `WORD`s; they have no logs.
 - `EMITTER`: the `address` of every log of the transaction.
 - `TOPIC`, known events: for a log whose `topic0` is the keccak256 of one of the signatures
   below, the listed topics are addresses, taken whatever their value (so vanity addresses,
@@ -90,9 +99,13 @@ are normative.
 - `WORD`: the address-shaped words of the input data of a call at byte offsets `4 + 32·k`
   (after the selector), and of every log's data at offsets `32·k`. Contract-creation init
   code is not scanned. The code address of an EIP-7702 authorization is a `WORD` as well.
-- `AUTH`: the authority of every entry in the authorization list of a type-4 transaction,
-  recovered from the entry's signature. Every recoverable entry counts, whether the
-  authorization took effect or not (deciding that needs state).
+- `AUTH`: the authority of an entry in the authorization list of a type-4 transaction. An
+  entry counts if `y_parity ∈ {0, 1}`, `0 < r < n`, `0 < s ≤ n/2` (`n` the secp256k1 group
+  order) and `ecrecover(keccak256(0x05 ‖ rlp([chain_id, address, nonce])), y_parity, r, s)`
+  returns an address; that address is the authority. Chain ID and nonce are not checked, and
+  it does not matter whether the authorization took effect (deciding that needs state).
+  EIP-7702 skips invalid entries instead of rejecting the transaction, so this exact rule
+  keeps importers on different libraries in agreement.
 - `BLOCK` (slot 0): the header's beneficiary, the beneficiary of every uncle, and the
   address of every withdrawal.
 - `TRACE`: from and to of every internal call frame, created contracts and self-destruct
@@ -114,7 +127,7 @@ Namespace `addr1` fixes these values. A change of any of them is a new namespace
 |---|---|---|
 | `U` (unit length) | 64 blocks | ≈ the finality delay; small units keep the index fresh |
 | `L_max` (top level) | 16 | top slices of 2^16 units = 4,194,304 blocks are never merged again |
-| bucket target `T` | 2816 bytes | average bucket payload; about 1 bucket in 3,000 exceeds a chunk |
+| bucket target `T` | 2816 bytes | average bucket payload; about 1 bucket in 3,000 exceeds a chunk and is paged |
 | spill threshold | 256 bytes | inline entries of one address above this go to a spill file |
 | fingerprint | 8 bytes | collision handling below |
 
@@ -164,23 +177,51 @@ publishes the head (below) with `N`. A lower level `L` gets a slice for one unit
 `2^(L+1)`. Over its life a block is uploaded about 9 times: in about half of levels 0–15,
 and once at level 16.
 
+**Large merges in the background.** The new slice cannot be prepared ahead (its buckets
+depend on the last unit), and it can be large: about 60 K chunks at level 8, 1 M at level 12,
+15.5 M at level 16 (extrapolated from the measurements). Publishing the head only after
+such a slice is uploaded would leave the index hours or days behind. So the importer may
+**defer** the merge:
+
+1. It writes the level-0 slice `(0, N − 1)` of the last unit. This is the only case in which
+   a slice with an odd index is written.
+2. It publishes the head for `N` with `(L, (N >> L) − 1)` in its `pending` list.
+3. It builds and uploads the merged slice in the background, and drops it from `pending`
+   with the first head update after the slice is complete.
+
+A client replaces every pending slice `(L, i)` in its cover by the slices it merges, all of
+which exist: the cover of units `[i·2^L, (i+1)·2^L − 1)` (even indices, written when they
+completed) followed by `(0, (i+1)·2^L − 1)` from step 1. That is `L + 1` slices, so a lookup
+reads up to 16 more buckets while a top-level merge runs. If that expansion contains another
+pending slice (a merge was deferred before the previous one finished), it is expanded the
+same way.
+
+The importer needs a sustained upload rate of only about 4 chunks per second
+(≈ 10 M chunks per month at today's activity, see *Full history and cost*), but merges come
+in bursts: a top-level merge at 200 chunks per second takes about a day. The block-store
+importer in this repository uploads one chunk per request, sequentially; the index importer
+must upload in parallel.
+
 **Initial import (backfill).** Starting at `N0` complete units, the importer writes only
 what a cover can still reference: the top-level slices `(L_max, j)` for `j < N0 >> L_max`
 and the lower slices of the cover of `[0, N0)`. Every other lower slice of the past would be
-dead on arrival and is skipped. Then it publishes head update 0 with `N0`, and from then on
-one slice and one head update per unit.
+dead on arrival and is skipped. Then it publishes head update 0 with `N0`, writes the same
+record to the origin identifier (below), and from then on one slice and one head update per
+unit.
 
 **Incremental sync.** A client that has read everything up to unit `M` takes the cover of
 `[0, N)` and reads only its slices that end after unit `M`. A slice that starts before `M`
-is read whole and the entries before unit `M` are dropped: since a bucket is about one
-chunk whatever the slice length, that re-read costs one chunk. Results the client keeps
-per block range stay valid, because a merged slice holds exactly the entries of the slices
-it replaces.
+is read whole and the entries before unit `M` are dropped. A client `d` units behind reads up
+to `⌈log2(d + 1)⌉` such slices, each a descriptor and a bucket it has not seen (about 7 after
+a day, 10 after a week, 12 after a month; about half that plus one on average). Results the
+client keeps per block range stay valid, because a merged slice holds exactly the entries
+of the slices it replaces.
 
 **Lifetime.** A lower slice `(L, i)` is in the cover of the head while `N` is in
 `[(i + 1)·2^L, (i + 2)·2^L)`, i.e. for `2^L·U` blocks, plus a grace period for clients that
-still hold an older head. Top-level slices are permanent. Only the slices in the current
-cover must stay, and together they hold one copy of the history.
+still hold an older head, and longer while a pending merge's expansion uses it. Top-level
+slices are permanent. Only the slices in the current cover (and expansions of pending
+merges) must stay, and together they hold one copy of the history.
 
 The lower levels are not small, though. On average the live lower slices hold half a
 top-level slice of data (2^15 units), just before a top slice is written almost a whole one,
@@ -205,15 +246,20 @@ string; `<chain>` is the decimal chain ID; all numbers in identifiers are decima
 | Slice descriptor | `keccak256("eth:<chain>:addr1:slice:<L>:<i>")` | `SliceRecord` |
 | Bucket | `keccak256("eth:<chain>:addr1:bucket:<L>:<i>:<k>")` | `BucketRecord` |
 | Head (feed update `n`) | `keccak256(topic ‖ n as u64 BE)`, `topic = keccak256("eth:<chain>:addr1:head")` | `HeadRecord` |
+| Origin | `keccak256("eth:<chain>:addr1:origin")` | `HeadRecord`: a copy of head update 0 |
 | Spill file | Swarm file (`/bytes`), referenced from a bucket | spill pages |
+| Bucket pages | Swarm file (`/bytes`), referenced from a paged bucket | bucket pages |
 
-The head uses Bee's sequence-feed identifier scheme, so Bee's feed lookup can find the
-latest update. Every unit gets exactly one head update, also while the importer catches up
-after downtime, so `N − n` is constant (`N0`, from update 0).
+The head identifiers follow Bee's sequence-feed scheme, but the design does not rely on
+Bee's feed lookup: that lookup finds the last update by asking for indices until one is
+missing, so it always pays at least one retrieval timeout and grows with `n` (about 41,000
+updates a year). Every unit gets exactly one head update, also while the importer catches
+up after downtime, so `N − n` is constant: `N0`, which a client reads once from the origin
+record. A client without a cached head starts from the origin like a returning one.
 
 A client avoids asking for an update that does not exist yet (a miss is a timeout), and
-bounds the misses it cannot avoid. It caches the last head it read (`n`, `N`,
-`last_block_timestamp`):
+bounds the misses it cannot avoid. It caches the last head it read, or the origin
+(`n`, `N`, `last_block_timestamp`):
 
 - **Best:** if the client knows the latest finalized block number `F` from elsewhere (a
   beacon light client, an RPC), the newest update that can exist is `⌊(F + 1) / U⌋ − N0` (update `n` announces
@@ -265,22 +311,13 @@ spill files uploaded with Bee's default chunker, unencrypted and without erasure
 | `roles` | u8 | the role bits the importer detects for this slice (e.g. no `TRACE` without a tracing source) |
 
 `buckets_root` uses the accumulator's keccak256 tree (`src/accumulator.rs`, leaves
-zero-padded to the next power of two). It is there for reproducibility: two independent
-importers can compare slices by this root alone.
+zero-padded to the next power of two). It is there for reproducibility: an auditor who
+rebuilds a slice can compare it by this root alone. A client cannot check a bucket against
+it (see *Verification*).
 
-`B` is chosen deterministically, so that honest importers produce identical slices:
-
-1. Start with `B = ⌈(sum of address-record bytes) / T⌉`, the records encoded with the
-   256-byte spill threshold.
-2. Assign the addresses to buckets. In every bucket over 4096 bytes, spill records whose
-   spilling saves bytes (inline entries longer than 32 bytes, the size of a `spill_ref`),
-   the largest first (ties: the smaller fingerprint), until it fits.
-3. If a bucket still does not fit, set `B = B + 1` and go back to step 2 with the records as
-   they were after step 1.
-
-This terminates: the more buckets, the fewer records each one holds, and a single record is
-at most about 270 bytes. Step 3 should practically never run: the measured overflows were
-at most 350 bytes over at `T = 2816` (not simulated with this rule).
+`B = max(1, ⌈(sum of address-record bytes) / T⌉)`, the records encoded with the 256-byte
+spill threshold. A slice without appearances (possible on a dev chain) still has one, empty,
+bucket.
 
 ### `BucketRecord` (kind 5)
 
@@ -290,13 +327,16 @@ at most 350 bytes over at `T = 2816` (not simulated with this rule).
 | `level` | u8 | `L` |
 | `index` | u32 | `i` |
 | `bucket` | u32 | `k` |
+| `paged` | u8 | 0: the records follow; 1: they are in a pages file |
 | `count` | u32 | number of address records |
-| records | | `count` address records, ascending by fingerprint |
+| records | | if not paged: `count` address records, ascending by (fingerprint, address) |
+| `pages` | u32 | if paged: number of pages |
+| `pages_ref` | 32 bytes | if paged: Swarm reference of the bucket pages file |
 
 Address `A` belongs to bucket `k = (u32(h[0..4]) · B) >> 32` and has fingerprint
-`fp = h[4..12]`, where `h = keccak256(A)` and `B` is the slice's `bucket_count`. The
-multiply-shift spreads addresses evenly over any `B`, so `B` does not have to be a power
-of two and buckets average `T` bytes.
+`fp = h[4..12]`, where `h = keccak256` of the 20 address bytes, `u32` reads big-endian,
+and `B` is the slice's `bucket_count`. The multiply-shift spreads addresses evenly over any
+`B`, so `B` does not have to be a power of two and buckets average `T` bytes.
 
 Address record:
 
@@ -314,15 +354,28 @@ another slot in the same block).
 An address whose inline entries would take more than 256 bytes is **spilled**: its record
 holds only `n` and `spill_ref`, and its entries go to a spill file of their own.
 
-Fingerprints are not unique: the largest slices hold hundreds of millions of addresses, so
-two of them can share 64 bits of their hash. The importer keeps records with the same
-fingerprint next to each other; a client reads every record with its fingerprint and the
-verification step (below) drops entries that are not about its address.
+Fingerprints are not unique: by chance two addresses in a bucket can share 64 bits of their
+hash, and on purpose it takes a 96-bit collision of `h[0..12]` (about 2^48 hashes). Records
+are therefore ordered by fingerprint and then by the 20 address bytes, which the importer
+knows although the record does not carry them. A client reads every record with its
+fingerprint, and verification (below) drops entries that are not about its address.
 
-A bucket always fits one chunk (4096 bytes of payload), by the choice of `B` under
-`SliceRecord`. At `T = 2816` extra spills were needed for 0–0.03 % of buckets, depending on
-slice length (measured). So every bucket is a plain single-chunk SOC, which is also what
-`src/swarm/soc.rs` accepts.
+**Paged buckets.** A bucket whose inline payload, header included, would exceed 4096 bytes is
+stored paged: the bucket SOC holds only the header, `count`, `pages` and `pages_ref`, and the
+records go to a pages file. Pages are 4096 bytes, `count (u16) ‖ records`, filled greedily in
+record order, zero-padded except the last; page `p` is the `p`-th data chunk of the file. A
+client binary-searches the pages by the fingerprint of their first record, paying a path
+through the file's tree per probe.
+
+Paging is rare by chance (0–0.03 % of buckets at `T = 2816`, measured) but can be forced:
+addresses that share `h[0..4]` share a bucket for every `B`, and 340 single-entry records
+(12 bytes each) already overflow a chunk. Grinding 340 such values costs about 1.5 × 10^12
+hashes, and a single transaction can put them on chain as `WORD`s. Paging keeps every slice
+writable in that case, every bucket SOC a single chunk (which `src/swarm/soc.rs` requires),
+and the cost to the affected addresses' lookups a few extra chunks. A per-slice salt in the
+bucket hash would prevent the grinding, but it would also give a client's address a
+different bucket set in every slice, so whoever sees the whole lookup could intersect them
+down to the address itself.
 
 ### Spill file
 
@@ -343,7 +396,7 @@ The client learns the number of pages from the file's span (`⌈span / 4096⌉`)
 last page for the newest entries, and binary-searches pages by `first_block` for a block
 range. `u32` block numbers last until block 2^32, more than 1600 years of 12-second slots.
 
-### `HeadRecord` (kind 6), 61 bytes
+### `HeadRecord` (kind 6), 62 + 5·p bytes
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -352,16 +405,20 @@ range. `u32` block numbers last until block 2^32, more than 1600 years of 12-sec
 | `last_block` | u64 | `N·U − 1` |
 | `last_block_hash` | 32 bytes | hash of `last_block` |
 | `last_block_timestamp` | u64 | timestamp of `last_block` (seconds) |
+| `pending_count` | u8 | `p`, the number of deferred merges |
+| `pending` | `p` × (u8 level ‖ u32 index) | the deferred merged slices, ascending by first unit |
 
 ## Client lookup
 
 Newest first, for address `A`:
 
-1. Read the head (cached index + 1, or Bee's feed lookup) → `N`.
-2. Compute the cover of `[0, N)`, or only its slices after unit `M` for an incremental sync.
+1. Read the head as described under *Identifiers* (from the cached head or the origin) → `N`
+   and the pending merges.
+2. Compute the cover of `[0, N)` and expand the pending slices, or take only the slices
+   after unit `M` for an incremental sync.
 3. For each slice, newest first: read the `SliceRecord` (immutable, cached forever), compute
    `k` and `fp`, read bucket `k`, and scan it for `fp` (records have variable length, so the
-   2.8 KB are read front to back).
+   2.8 KB are read front to back). For a paged bucket, binary-search its pages.
 4. For a spilled address, walk the spill file's tree from its root chunk to the last page,
    then earlier pages as the user scrolls. Each tree level is one chunk and one round
    trip: root and page for up to 128 pages, one intermediate level more up to 16,384 pages
@@ -377,9 +434,9 @@ Oldest first is the same in the opposite order.
 
 - **Most entries can be checked.** Fetch the header of the block from the block store
   (verified against the trust anchor), then the evidence for the role:
-  - `FROM`, `TO` (call), input `WORD`, `AUTH`: the transaction (sender and authorities by
-    signature recovery).
-  - `TO` (creation), `EMITTER`, `TOPIC`, log `WORD`: the receipt.
+  - `FROM`, `TO`, input `WORD`, `AUTH`: the transaction (sender and authorities by
+    signature recovery; a created contract's address from sender and nonce).
+  - `EMITTER`, `TOPIC`, log `WORD`: the receipt.
   - `BLOCK` (slot 0): the header itself (beneficiary) or the body (withdrawals, uncles),
     checked against the header's roots.
   - `TRACE`: cannot be checked from the block. Internal calls are not recorded in the
@@ -419,10 +476,12 @@ Oldest first is the same in the opposite order.
 
 Measured on 2026-11-16 against mainnet (the zbox geth node: full history, no traces, so no
 `TRACE` role) with throwaway scripts that encode the sampled appearances in the record formats above.
-Three simplifications: the address-shaped test was applied to all topics (no known-event
-rule), `AUTH` and uncle beneficiaries were not detected, and an overflowing bucket was
-counted as a two-chunk file instead of spilling more records. Each changes the totals by a
-fraction of a percent. Bucket assignment used sha256 instead of keccak256, which gives the
+Simplifications: the address-shaped test was applied to all topics (no known-event rule),
+`AUTH` and uncle beneficiaries were not detected, a created contract's address was taken from
+the RPC receipt, the bucket header was counted as 18 bytes (19 with `paged`), and an
+overflowing bucket was counted as a two-chunk file (as a paged bucket it is three: the
+bucket SOC, the file root and one page). Each changes the totals by a fraction of a
+percent. Bucket assignment used sha256 instead of keccak256, which gives the
 same size distribution for a uniform hash. A later `ethswarm addr-stats` subcommand built on the real
 encoder should replace the scripts and make the numbers reproducible.
 
@@ -490,7 +549,8 @@ levels to a quarter and need 25 top slices today instead of 6.
 | Operation | Data |
 |---|---|
 | Cold full-history lookup, typical address (13 slices today, at most 22 until late 2027) | 13–22 buckets of ≈ 2.8 KB + as many 111-byte descriptors: ≈ 40–65 KB |
-| Incremental sync | 1–3 buckets: ≈ 3–9 KB |
+| Incremental sync, `d` units behind | up to `⌈log2(d + 1)⌉` new slices, each a descriptor and a bucket, in two round trips: after a day up to 7 (≈ 10–20 KB), after a month up to 12 |
+| While a merge is pending | up to `L + 1` buckets instead of one for the pending slice (up to 17 for a top-level merge) |
 | Spilled address | per slice, the path from the spill file's root to its last page (2–3 chunks) for the ≈ 1,000 newest entries |
 | Storage on the phone | the results for its own addresses; descriptors are cached forever |
 
@@ -529,9 +589,11 @@ receipts on top for log roles.
   headers. devp2p delivers whole blocks only, so this suits a wallet that checks a
   transaction when it is opened. If post-merge history expiry follows, Swarm takes over
   block ranges as they leave the devp2p window.
-- **Head of chain.** The index runs up to 26 minutes behind. A wallet that needs "paid just
+- **Head of chain.** The index runs up to about 32 minutes behind. A wallet that needs "paid just
   now" uses RPC or a light client for the last blocks.
-- **Privacy default.** `T` is also the k-anonymity dial. A wallet may fetch decoy buckets.
+- **Privacy default.** `T` sets the k-anonymity of a single bucket request, but a whole
+  lookup can be intersected across slices (see *Design constraints*). A wallet may fetch
+  decoy buckets or use its own Bee node; how much that buys is open.
 - **Block store.** Receipts, transaction offsets and trie nodes (above); moving the header
   accumulator to a Merkle Mountain Range (the same doubling scheme) would remove the
   "extending the range changes the anchor" limitation.
