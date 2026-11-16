@@ -51,7 +51,10 @@ impl Bee {
         }
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
+            // Per read, not per request: a large body arriving slowly but steadily
+            // completes, and only a connection that stalls for this long fails (and is
+            // retried). It also bounds the wait for an upload's answer.
+            .read_timeout(Duration::from_secs(120))
             .build()
             .context("building HTTP client")?;
         Ok(Self { base, http })
@@ -154,7 +157,7 @@ impl Bee {
             let resp = match self.http.get(url.clone()).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    last = e.to_string();
+                    last = format!("{:#}", anyhow::Error::from(e));
                     continue;
                 }
             };
@@ -168,7 +171,7 @@ impl Bee {
                     }
                     // A reset or timeout mid-body: drop the partial body and retry.
                     Err(e @ ReadError::Transport(_)) => {
-                        last = e.to_string();
+                        last = format!("{:#}", anyhow::Error::from(e));
                         continue;
                     }
                 }
@@ -192,12 +195,19 @@ impl std::fmt::Display for ReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReadError::TooLarge(max) => write!(f, "response exceeds {max} bytes"),
-            ReadError::Transport(e) => write!(f, "reading response: {e}"),
+            ReadError::Transport(_) => write!(f, "reading response"),
         }
     }
 }
 
-impl std::error::Error for ReadError {}
+impl std::error::Error for ReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ReadError::TooLarge(_) => None,
+            ReadError::Transport(e) => Some(e),
+        }
+    }
+}
 
 /// Read a response body, refusing more than `max` bytes.
 async fn read_capped(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>, ReadError> {
@@ -292,6 +302,20 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(bee.get_bytes(&B256::ZERO, 64).await.unwrap(), b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn retry_error_keeps_its_cause() {
+        // Every answer is cut mid-body: the final error must say more than reqwest's top line.
+        let cut = || http("200 OK", 10, b"abc");
+        let bee = Bee::new(serve((0..RETRIES).map(|_| cut()).collect())).unwrap();
+        let err = bee
+            .get_bytes(&B256::ZERO, 64)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reading response: "), "{err}");
+        assert!(err.matches(": ").count() >= 3, "no cause chain in: {err}");
     }
 
     #[tokio::test]
