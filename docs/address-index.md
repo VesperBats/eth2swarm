@@ -280,7 +280,7 @@ importers can compare slices by this root alone.
 
 This terminates: the more buckets, the fewer records each one holds, and a single record is
 at most about 270 bytes. Step 3 should practically never run: the measured overflows were
-at most 350 bytes over at `T = 2816`, less than two spillable records.
+at most 350 bytes over at `T = 2816` (not simulated with this rule).
 
 ### `BucketRecord` (kind 5)
 
