@@ -59,22 +59,26 @@ field names.
 
 ```sh
 bee-factory start --tag v2.8.3
-scripts/e2e-bee-factory.sh            # import 4×64 blocks, verify via queen, negative tests
+scripts/e2e-bee-factory.sh            # mainnet blocks from zbox → local Swarm, verify via queen
+ETH2SWARM_RPC=http://localhost:8545 scripts/e2e-bee-factory.sh   # same against local Anvil
 ```
+
+Blocks are read from Ethereum mainnet (zbox, the default `--rpc`); only the storage side is
+the local bee-factory Swarm. Verified on 2026-11-16: mainnet blocks 0–255 (genesis
+`0xd4e5…8fa3`, 59 blocks with uncles) imported and verified through the queen.
 
 Manual use:
 
 ```sh
-export ETH2SWARM_RPC=http://localhost:8545
-# import (via worker 1, which owns the postage batch); prints the trust anchor
+# import mainnet blocks (default --rpc = zbox) (via worker 1, which owns the postage batch); prints the trust anchor
 cargo run -- --bee http://localhost:1635 import --key <hex key> --epoch-size 64 --epochs 4
 # verify (via the queen → proves p2p retrieval)
 cargo run -- --bee http://localhost:1633 get 3 --owner <owner> --anchor <anchor>
 cargo run -- --bee http://localhost:1633 verify-epoch 0 --owner <owner> --anchor <anchor>
 ```
 
-The client's `--chain-id` defaults to 1337 (bee-factory Anvil); pass `--chain-id 1` for a
-mainnet import.
+The client's `--chain-id` defaults to 1 (mainnet); pass `--chain-id 1337` for data
+imported from the bee-factory Anvil.
 
 ## Limitations of the prototype
 

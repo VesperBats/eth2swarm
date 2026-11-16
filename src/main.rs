@@ -47,8 +47,8 @@ struct Source {
     /// Address of the SOC owner (the importer's key).
     #[arg(long, env = "ETH2SWARM_OWNER")]
     owner: Address,
-    /// Chain ID used in the SOC identifiers.
-    #[arg(long, env = "ETH2SWARM_CHAIN_ID", default_value_t = 1337)]
+    /// Chain ID used in the SOC identifiers (1 = Ethereum mainnet; 1337 = bee-factory Anvil).
+    #[arg(long, env = "ETH2SWARM_CHAIN_ID", default_value_t = 1)]
     chain_id: u64,
     /// Pinned trust anchor. If omitted, the owner's published anchor is used (trusts the
     /// publisher instead of verifying independently).
