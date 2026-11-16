@@ -112,16 +112,23 @@ that produced this note.
   code `main` also carries is the one exception, and it is step 4 of the
   multi-PR rule above: that fix is its own single PR into `main`.)
 - **Drive CI to green.** Do not leave a PR on a red or pending check without
-  either pushing a fix or stating the blocker explicitly. This repository's
-  only PR check so far is `claude-review`: no workflow builds or tests the
-  code yet. Until one does, run `cargo fmt --check`, `cargo clippy --locked
-  --all-targets -- -D warnings` and `cargo test --locked` on the head of a PR
-  you author (never on a fork PR's tree) before opening it and after every
-  push to it, and record in the PR description, above the session links and
-  kept current, what was run and how it ended. Until a workflow replaces them,
-  these runs are what "CI green" means for the code in this repository.
-  A check that ran nothing (0 tests, a filtered or ignored test) is "not
-  run", never "passed".
+  either pushing a fix or stating the blocker explicitly. The PR checks are:
+  - `CI` (`.github/workflows/ci.yml`, every PR): rustfmt, clippy with
+    warnings denied and the tests, all `--locked`. It fails when no test
+    passed at all. Beyond that, a check that ran nothing (a filtered or
+    ignored test) is "not run", never "passed": say so in the PR.
+  - `integration` (`.github/workflows/integration.yml`): the bee-factory
+    end-to-end test (`scripts/e2e-bee-factory.sh`), on PRs that touch the
+    code, the toolchain, the script, `ci/bee-factory/` or the workflow. It
+    is path-filtered: a
+    PR outside those paths gets no run. If such a PR can still change the
+    end-to-end behaviour (a doc that changes how the stack is started, say),
+    run the script by hand and say so in the PR.
+  - `claude-review` (below).
+  Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D
+  warnings` and `cargo test --locked` on the head of a PR you author (never
+  on a fork PR's tree) before opening it as well: CI is the gate, not a
+  substitute for running them.
   `claude-review` itself needs the one-time setup in the header of
   `.github/workflows/claude-review.yml`: the `CLAUDE_CODE_OAUTH_TOKEN` secret
   (`ANTHROPIC_API_KEY` is optional, for its last attempt only). Until the

@@ -1,0 +1,60 @@
+# Build and test on every pull request and every push to main.
+#
+# The checks the PR rules (.claude/agent/pull-requests.md, "Drive CI to
+# green") asked authors to run by hand until a workflow did: rustfmt, clippy
+# with warnings denied, and the tests, all against the committed Cargo.lock
+# (--locked fails instead of silently rewriting a stale lock). Adapted from
+# Myotis's ci.yml and rust-clippy.yml: every action pinned by commit, the
+# rustc pinned in rust-toolchain.toml.
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  # Unscoped (any base branch): part PRs into a feature branch get these checks
+  # too (.claude/agent/multi-pr-plans.md). Do not narrow it to main.
+  pull_request:
+  workflow_dispatch:
+
+# A newer push cancels a PR's superseded run. On main every run finishes: each
+# merge commit keeps its result (security-fixes.md step 7 checks them), and in
+# integration.yml the weekly run never cancels a push's or the other way round.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/rust-toolchain
+        with:
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # A run that executed no test is "not run", never "passed" (PR rules):
+      # fail if the harness reports zero tests, e.g. after a filter or a
+      # refactor that unhooked the test modules.
+      - name: Tests
+        run: |
+          set -euo pipefail
+          cargo test --locked 2>&1 | tee "$RUNNER_TEMP/test.log"
+          # "test result: ok. 11 passed; ..." — field 4 is the count passed.
+          ran=$(awk '/^test result:/ { sum += $4 } END { print sum + 0 }' "$RUNNER_TEMP/test.log")
+          echo "Tests passed: $ran"
+          [ "$ran" -gt 0 ] || { echo "::error::cargo test ran no tests."; exit 1; }

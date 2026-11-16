@@ -1,0 +1,14 @@
+# The EXACT rustc every build of this crate uses: local builds through rustup and
+# CI, where every workflow installs this version through
+# .github/actions/rust-toolchain, which reads it from this line. A floating
+# `stable` would let two runs of one commit compile with different rustc
+# versions. (Adopted from Myotis, rust/rust-toolchain.toml, #734 there.)
+#
+# rustup installs this toolchain the first time a build on a machine needs it. A
+# cargo not managed by rustup (e.g. Homebrew's) ignores this file.
+#
+# Bumping it is a reviewed PR like any dependency bump: change this line (the
+# x.y.z form is required — the CI action refuses a channel name) and let CI
+# build and test with it.
+[toolchain]
+channel = "1.99.1"

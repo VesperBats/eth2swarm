@@ -1,0 +1,134 @@
+# Integration test against a real Swarm dev network.
+#
+# Starts bee-factory (5 Bee nodes + Anvil with the Swarm contracts) on the
+# runner's Docker and runs scripts/e2e-bee-factory.sh: import blocks as SOCs
+# through worker 1, read and verify them through the queen (p2p retrieval),
+# check that bad anchors, owners and ranges are rejected, and check that the
+# inspector (`ethswarm serve`) verifies a block and refuses a foreign Host.
+#
+# Block source: the stack's own Anvil chain (chain 1337). The zbox mainnet node
+# the script uses by default is reachable only over Tailscale, not from GitHub.
+# 4 epochs × 16 blocks keeps the run short; the early Anvil blocks carry the
+# contract deployments, so bodies with transactions are covered.
+#
+# bee-factory comes from ci/bee-factory/package-lock.json (exact versions and
+# integrity hashes, resolved from releases older than 2026-11-08, the day
+# before the bee-js / Swarm Desktop supply-chain incident Myotis records in
+# its dependabot.yml), installed with --ignore-scripts: it runs without the
+# install scripts of cpu-features, protobufjs and ssh2.
+#
+# The stack: `start --tag v2.8.3` runs bee-factory's six prebuilt images
+# (ethersphere/bee-factory-{blockchain,queen,worker-1..4}:v2.8.3; Anvil runs
+# from the blockchain image). bee-factory pulls them by tag, and if any pull
+# fails it silently falls back to cloning ethersphere/bee, building it and
+# pulling ghcr.io/foundry-rs/foundry:latest — an unpinned stack that could still
+# go green. So this workflow pulls the six images itself, BY DIGEST (multi-arch
+# manifest lists, linux/amd64 included, checked 2026-11-16), tags them :v2.8.3
+# (bee-factory skips an image already present), and fails unless bee-factory
+# reports the prebuilt mode. Moving to another Bee tag means new digests here:
+# `docker buildx imagetools inspect ethersphere/bee-factory-<name>:<tag>`.
+name: integration
+
+on:
+  push:
+    branches: [ "main" ]
+    paths: &paths
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "scripts/e2e-bee-factory.sh"
+      - "ci/bee-factory/**"
+      - ".github/workflows/integration.yml"
+      - ".github/actions/rust-toolchain/**"
+  # Unscoped base branch, like ci.yml; path-filtered because the run takes
+  # minutes and pulls ~1.5 GB of images.
+  pull_request:
+    paths: *paths
+  # Weekly: a registry or upstream change (a pinned digest deleted, Docker Hub
+  # limits, the runner image) shows up here before a PR needs the job.
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+# A newer push cancels a PR's superseded run. On main every run finishes: each
+# merge commit keeps its result (security-fixes.md step 7 checks them), and in
+# integration.yml the weekly run never cancels a push's or the other way round.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  e2e:
+    name: bee-factory end-to-end
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      BEE_TAG: v2.8.3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/rust-toolchain
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+
+      # Test-only interpreter, floating on its major like Myotis's test lanes;
+      # bee-factory needs Node >= 18.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install bee-factory (locked, no install scripts)
+        run: npm ci --prefix ci/bee-factory --ignore-scripts --no-audit --no-fund
+
+      # Before the stack starts, so the minutes it takes overlap with nothing
+      # that could time out.
+      - name: Build ethswarm
+        run: cargo build --locked
+
+      - name: Pull the bee-factory images by digest
+        run: |
+          set -euo pipefail
+          while read -r name digest; do
+            docker pull "ethersphere/bee-factory-$name@$digest"
+            docker tag "ethersphere/bee-factory-$name@$digest" "ethersphere/bee-factory-$name:$BEE_TAG"
+          done <<'EOF'
+          blockchain sha256:64ff38a8bd39ac86dc6db7ec3f7d42dafb4a87afc423b5d64e4f4f58b44703a6
+          queen sha256:9a4762ec73c4ec6e653f7b4ecb2dc95cb550de81ac7516456a3b04fc508cb058
+          worker-1 sha256:80c34992f38c38a8d702bb5243b48ef525d00e2ce1a26d224b7fc5ac2ff49e91
+          worker-2 sha256:d7769174afc78a57377b067560c75cb7faec09ea8266b3a829e6cd9ce27bee2c
+          worker-3 sha256:b2b859cea56920608b6e72eec833e7cfad166731f906c9a2770c17d64d927c08
+          worker-4 sha256:25fcebca325883d6ba48f2a80dfc3cc615a14d6e48d013cd930f416cf06c5985
+          EOF
+
+      - name: Start bee-factory (prebuilt images only)
+        run: |
+          set -euo pipefail
+          ci/bee-factory/node_modules/.bin/bee-factory start --tag "$BEE_TAG" 2>&1 | tee "$RUNNER_TEMP/start.log"
+          grep -q 'Pre-built images found' "$RUNNER_TEMP/start.log" \
+            || { echo "::error::bee-factory did not use the digest-pinned prebuilt images (it fell back to building Bee); see the output above."; exit 1; }
+
+      - name: End-to-end test
+        env:
+          ETH2SWARM_RPC: http://localhost:8545
+          EPOCH_SIZE: "16"
+          EPOCHS: "4"
+        run: scripts/e2e-bee-factory.sh
+
+      - name: Container state and logs (on failure)
+        if: failure()
+        run: |
+          docker ps -a
+          for c in $(docker ps -a --format '{{.Names}}' | grep '^bee-factory-'); do
+            echo "::group::$c"
+            docker logs --tail 200 "$c" 2>&1
+            echo "::endgroup::"
+          done
+
+      - name: Stop bee-factory
+        if: always()
+        run: ci/bee-factory/node_modules/.bin/bee-factory stop || true
