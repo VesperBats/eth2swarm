@@ -4,11 +4,15 @@ use super::soc::SignedSoc;
 use alloy::hex;
 use alloy::primitives::{Address, B256};
 use alloy::transports::http::reqwest::Url;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::time::Duration;
 
 const RETRIES: u32 = 5;
+/// How much of an error response's body is kept for the message.
+const ERROR_BODY_MAX: usize = 1024;
+/// Upper bound for an upload's JSON answer (`{"reference": "…"}`).
+const UPLOAD_ANSWER_MAX: usize = 64 * 1024;
 
 async fn backoff(attempt: u32) {
     if attempt > 0 {
@@ -121,12 +125,19 @@ impl Bee {
                 .await;
             match sent {
                 Ok(resp) if resp.status().is_success() => {
-                    return Ok(resp.json::<Reference>().await?.reference);
+                    // The upload may already be stored; resending the same payload is
+                    // harmless (content-addressed, or the same signed SOC), so a failure
+                    // to read or parse the answer is retried like a transport error.
+                    match read_capped(resp, UPLOAD_ANSWER_MAX).await {
+                        Ok(body) => match serde_json::from_slice::<Reference>(&body) {
+                            Ok(r) => return Ok(r.reference),
+                            Err(e) => last = Some(anyhow::anyhow!("parsing upload answer: {e}")),
+                        },
+                        Err(e) => last = Some(e.into()),
+                    }
                 }
-                Ok(resp) if !resp.status().is_server_error() => {
-                    return Err(check(resp).await.unwrap_err());
-                }
-                Ok(resp) => last = Some(check(resp).await.unwrap_err()),
+                Ok(resp) if !resp.status().is_server_error() => return Err(error_from(resp).await),
+                Ok(resp) => last = Some(error_from(resp).await),
                 Err(e) => last = Some(e.into()),
             }
         }
@@ -151,7 +162,7 @@ impl Bee {
         let mut last = String::new();
         for attempt in 0..self.retries {
             backoff(attempt).await;
-            let mut resp = match self.http.get(url.clone()).send().await {
+            let resp = match self.http.get(url.clone()).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     last = e.to_string();
@@ -160,17 +171,20 @@ impl Bee {
             };
             let status = resp.status();
             if status.is_success() {
-                let mut body = Vec::new();
-                while let Some(part) = resp.chunk().await? {
-                    ensure!(
-                        body.len() + part.len() <= max_len,
-                        "GET {url}: response exceeds {max_len} bytes"
-                    );
-                    body.extend_from_slice(&part);
+                match read_capped(resp, max_len).await {
+                    Ok(body) => return Ok(body),
+                    // Oversized is the content's fault: retrying cannot help.
+                    Err(ReadError::TooLarge(max)) => {
+                        bail!("GET {url}: response exceeds {max} bytes")
+                    }
+                    // A reset or timeout mid-body: drop the partial body and retry.
+                    Err(e @ ReadError::Transport(_)) => {
+                        last = e.to_string();
+                        continue;
+                    }
                 }
-                return Ok(body);
             }
-            last = format!("{status}: {}", resp.text().await.unwrap_or_default());
+            last = format!("{status}: {}", error_body(resp).await);
             if !(status.as_u16() == 404 || status.is_server_error()) {
                 break;
             }
@@ -179,12 +193,145 @@ impl Bee {
     }
 }
 
-async fn check(resp: reqwest::Response) -> Result<reqwest::Response> {
-    let status = resp.status();
-    if status.is_success() {
-        return Ok(resp);
+#[derive(Debug)]
+enum ReadError {
+    TooLarge(usize),
+    Transport(reqwest::Error),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::TooLarge(max) => write!(f, "response exceeds {max} bytes"),
+            ReadError::Transport(e) => write!(f, "reading response: {e}"),
+        }
     }
-    let url = resp.url().clone();
-    let body = resp.text().await.unwrap_or_default();
-    bail!("{url} returned {status}: {body}")
+}
+
+impl std::error::Error for ReadError {}
+
+/// Read a response body, refusing more than `max` bytes.
+async fn read_capped(mut resp: reqwest::Response, max: usize) -> Result<Vec<u8>, ReadError> {
+    let mut body = Vec::new();
+    while let Some(part) = resp.chunk().await.map_err(ReadError::Transport)? {
+        if body.len() + part.len() > max {
+            return Err(ReadError::TooLarge(max));
+        }
+        body.extend_from_slice(&part);
+    }
+    Ok(body)
+}
+
+/// At most [`ERROR_BODY_MAX`] bytes of an error response's body, for a message; the rest is
+/// never read (dropping the response closes the connection).
+async fn error_body(mut resp: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while body.len() < ERROR_BODY_MAX {
+        match resp.chunk().await {
+            Ok(Some(part)) => {
+                let take = part.len().min(ERROR_BODY_MAX - body.len());
+                body.extend_from_slice(&part[..take]);
+            }
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+/// The error for a non-success response, with a bounded excerpt of its body.
+async fn error_from(resp: reqwest::Response) -> anyhow::Error {
+    let (url, status) = (resp.url().clone(), resp.status());
+    anyhow::anyhow!("{url} returned {status}: {}", error_body(resp).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// A local HTTP server answering its n-th connection with `responses[n]` (raw bytes),
+    /// then closing it — mid-body when the body is shorter than its Content-Length.
+    fn serve(responses: Vec<Vec<u8>>) -> Url {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(&response);
+            }
+        });
+        url
+    }
+
+    fn http(status: &str, content_length: usize, body: &[u8]) -> Vec<u8> {
+        let mut r = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        r.extend_from_slice(body);
+        r
+    }
+
+    #[tokio::test]
+    async fn error_body_is_bounded() {
+        let huge = vec![b'x'; 1 << 20];
+        let bee = Bee::new(serve(vec![http("400 Bad Request", huge.len(), &huge)])).unwrap();
+        let err = bee
+            .get_bytes(&B256::ZERO, 16)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("400"), "{err}");
+        assert!(
+            err.len() < ERROR_BODY_MAX + 300,
+            "message is {} bytes",
+            err.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn download_cut_mid_body_is_retried() {
+        // The first answer promises 10 bytes and closes after 3; the retry gets all of them.
+        let bee = Bee::new(serve(vec![
+            http("200 OK", 10, b"abc"),
+            http("200 OK", 10, b"0123456789"),
+        ]))
+        .unwrap();
+        assert_eq!(bee.get_bytes(&B256::ZERO, 64).await.unwrap(), b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn oversized_download_fails_without_retry() {
+        // One answer only: a retry would find no server and fail with another error.
+        let bee = Bee::new(serve(vec![http("200 OK", 100, &[0u8; 100])])).unwrap();
+        let err = bee
+            .get_bytes(&B256::ZERO, 10)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds 10 bytes"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn upload_answer_cut_mid_body_is_retried() {
+        let answer = format!(
+            "{{\"reference\":\"{}\"}}",
+            hex::encode(B256::repeat_byte(7))
+        );
+        let bee = Bee::new(serve(vec![
+            http("201 Created", answer.len(), &answer.as_bytes()[..5]),
+            http("201 Created", answer.len(), answer.as_bytes()),
+        ]))
+        .unwrap();
+        let got = bee
+            .upload_bytes(&B256::ZERO, b"data".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(got, B256::repeat_byte(7));
+    }
 }
