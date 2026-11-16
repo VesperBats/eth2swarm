@@ -63,38 +63,65 @@ pub fn sign(signer: &PrivateKeySigner, identifier: B256, payload: Vec<u8>) -> Re
     })
 }
 
-/// Parse a raw SOC as returned by `GET /chunks/{address}` and check that it is a valid SOC
-/// at `address` signed by `owner`. Returns the verified payload.
-pub fn verify(raw: &[u8], address: &B256, owner: &Address) -> Result<Vec<u8>> {
+/// A raw SOC split into its fields, with the signer recovered but nothing checked yet.
+pub struct ParsedSoc {
+    pub identifier: B256,
+    pub signature: [u8; 65],
+    pub span: u64,
+    pub payload: Vec<u8>,
+    /// Address of the inner content-addressed chunk (what the owner signed).
+    pub cac_address: B256,
+    /// Owner recovered from the signature (`None` if the signature is malformed).
+    pub signer: Option<Address>,
+}
+
+/// Split a raw SOC as returned by `GET /chunks/{address}` into its fields.
+pub fn parse(raw: &[u8]) -> Result<ParsedSoc> {
     ensure!(
         raw.len() >= ID_LEN + SIG_LEN + SPAN_LEN,
         "chunk too short for a SOC ({} bytes)",
         raw.len()
     );
     let identifier = B256::from_slice(&raw[..ID_LEN]);
-    let sig = Signature::from_raw(&raw[ID_LEN..ID_LEN + SIG_LEN]).context("bad SOC signature")?;
+    let signature: [u8; 65] = raw[ID_LEN..ID_LEN + SIG_LEN].try_into()?;
     let span_start = ID_LEN + SIG_LEN;
     let span = u64::from_le_bytes(raw[span_start..span_start + SPAN_LEN].try_into()?);
-    let payload = &raw[span_start + SPAN_LEN..];
+    let payload = raw[span_start + SPAN_LEN..].to_vec();
     ensure!(
         payload.len() <= CHUNK_SIZE && span == payload.len() as u64,
         "SOC wraps a multi-chunk or malformed CAC (span {span}, payload {})",
         payload.len()
     );
+    let cac_address = cac_address(span, &payload);
+    let signer = Signature::from_raw(&signature).ok().and_then(|sig| {
+        sig.recover_address_from_msg(signing_digest(&identifier, &cac_address).as_slice())
+            .ok()
+    });
+    Ok(ParsedSoc {
+        identifier,
+        signature,
+        span,
+        payload,
+        cac_address,
+        signer,
+    })
+}
 
-    let cac = cac_address(span, payload);
-    let signer = sig
-        .recover_address_from_msg(signing_digest(&identifier, &cac).as_slice())
-        .context("recovering SOC signer")?;
-    if signer != *owner {
-        bail!("SOC signed by {signer}, expected owner {owner}");
+/// Parse a raw SOC and check that it is a valid SOC at `address` signed by `owner`.
+/// Returns the verified payload.
+pub fn verify(raw: &[u8], address: &B256, owner: &Address) -> Result<Vec<u8>> {
+    let soc = parse(raw)?;
+    match soc.signer {
+        Some(signer) if signer == *owner => {}
+        Some(signer) => bail!("SOC signed by {signer}, expected owner {owner}"),
+        None => bail!("bad SOC signature"),
     }
-    let expected = soc_address(&identifier, owner);
+    let expected = soc_address(&soc.identifier, owner);
     ensure!(
         expected == *address,
         "SOC address mismatch: chunk is {expected}, requested {address}"
     );
-    Ok(payload.to_vec())
+    Ok(soc.payload)
 }
 
 #[cfg(test)]
