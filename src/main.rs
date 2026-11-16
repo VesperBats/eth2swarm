@@ -1,7 +1,17 @@
+mod accumulator;
+mod chain;
+mod client;
+mod import;
+mod layout;
+mod swarm;
+
+use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::signers::local::PrivateKeySigner;
 use alloy::transports::http::reqwest::Url;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
+use swarm::bee::Bee;
 
 /// ethswarm — import Ethereum blocks into Ethereum Swarm.
 #[derive(Parser)]
@@ -18,8 +28,32 @@ struct Cli {
     )]
     rpc: Url,
 
+    /// Bee API endpoint (bee-factory: worker 1 holds the postage batch).
+    #[arg(
+        long,
+        global = true,
+        env = "ETH2SWARM_BEE",
+        default_value = "http://localhost:1635"
+    )]
+    bee: Url,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Where a client finds data on Swarm.
+#[derive(clap::Args)]
+struct Source {
+    /// Address of the SOC owner (the importer's key).
+    #[arg(long, env = "ETH2SWARM_OWNER")]
+    owner: Address,
+    /// Chain ID used in the SOC identifiers.
+    #[arg(long, env = "ETH2SWARM_CHAIN_ID", default_value_t = 1337)]
+    chain_id: u64,
+    /// Pinned trust anchor. If omitted, the owner's published anchor is used (trusts the
+    /// publisher instead of verifying independently).
+    #[arg(long, env = "ETH2SWARM_ANCHOR")]
+    anchor: Option<B256>,
 }
 
 #[derive(Subcommand)]
@@ -30,6 +64,44 @@ enum Command {
     Block {
         /// Block number.
         number: u64,
+    },
+    /// RLP header sizes over a block range, grouped by fork shape (header field count).
+    HeaderStats {
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        /// Last block (inclusive). Defaults to the tip.
+        #[arg(long)]
+        to: Option<u64>,
+        /// Sample every n-th block.
+        #[arg(long, default_value_t = 1)]
+        step: u64,
+    },
+    /// Import blocks 0..epochs*epoch_size into Swarm as SOCs plus an accumulator.
+    Import {
+        /// Private key of the SOC owner.
+        #[arg(long, env = "ETH2SWARM_KEY", hide_env_values = true)]
+        key: PrivateKeySigner,
+        /// Blocks per epoch (power of two; Portal/era1 use 8192).
+        #[arg(long, default_value_t = 64)]
+        epoch_size: u32,
+        /// Number of epochs to import, starting at block 0.
+        #[arg(long, default_value_t = 4)]
+        epochs: u32,
+        /// Postage batch ID. Defaults to the Bee node's first usable batch.
+        #[arg(long)]
+        batch: Option<B256>,
+    },
+    /// Fetch a block from Swarm and verify header and body against the trust anchor.
+    Get {
+        number: u64,
+        #[command(flatten)]
+        source: Source,
+    },
+    /// Fetch an epoch's header file from Swarm and verify all its headers.
+    VerifyEpoch {
+        epoch: u64,
+        #[command(flatten)]
+        source: Source,
     },
 }
 
@@ -44,6 +116,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let provider = ProviderBuilder::new().connect_http(cli.rpc.clone());
+    let bee = Bee::new(cli.bee.clone())?;
 
     match cli.command {
         Command::Tip => {
@@ -73,6 +146,104 @@ async fn main() -> Result<()> {
             println!("Txs:        {}", block.transactions.len());
             println!("Gas used:   {}", block.header.gas_used);
         }
+        Command::HeaderStats { from, to, step } => {
+            header_stats(&provider, from, to, step).await?;
+        }
+        Command::Import {
+            key,
+            epoch_size,
+            epochs,
+            batch,
+        } => {
+            let opts = import::ImportOptions {
+                epoch_size,
+                num_epochs: epochs,
+                batch,
+            };
+            import::run(&provider, &bee, &key, opts).await?;
+        }
+        Command::Get { number, source } => {
+            let (client, anchor) = client_for(&bee, &source).await?;
+            let b = client.get_block(number, anchor).await?;
+            println!("Verified #{} {}", b.header.number, b.hash);
+            println!("  header RLP:   {} bytes", b.header_rlp_len);
+            println!("  SOC payload:  {} bytes", b.soc_payload_len);
+            println!("  txs:          {}", b.body.transactions.len());
+            println!("  ommers:       {}", b.body.ommers.len());
+            println!(
+                "  withdrawals:  {}",
+                b.body.withdrawals.as_ref().map_or(0, |w| w.len())
+            );
+        }
+        Command::VerifyEpoch { epoch, source } => {
+            let (client, anchor) = client_for(&bee, &source).await?;
+            let headers = client.verify_epoch(epoch, anchor).await?;
+            println!(
+                "Verified epoch {epoch}: {} headers #{}..=#{}",
+                headers.len(),
+                headers.first().map_or(0, |h| h.number),
+                headers.last().map_or(0, |h| h.number)
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn client_for<'a>(bee: &'a Bee, source: &Source) -> Result<(client::Client<'a>, B256)> {
+    let client = client::Client {
+        bee,
+        owner: source.owner,
+        chain_id: source.chain_id,
+    };
+    let anchor = match source.anchor {
+        Some(a) => a,
+        None => {
+            let rec = client.published_anchor().await?;
+            tracing::warn!(anchor = %rec.anchor, "no --anchor pinned; trusting the owner's published anchor");
+            rec.anchor
+        }
+    };
+    Ok((client, anchor))
+}
+
+async fn header_stats(
+    provider: &impl Provider,
+    from: u64,
+    to: Option<u64>,
+    step: u64,
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    ensure!(step > 0, "--step must be positive");
+    let to = match to {
+        Some(t) => t,
+        None => provider.get_block_number().await?,
+    };
+    // field count → (count, min, max, sum, first block, last block)
+    let mut groups: BTreeMap<usize, (u64, usize, usize, usize, u64, u64)> = BTreeMap::new();
+    for n in (from..=to).step_by(step as usize) {
+        let block = provider
+            .get_block_by_number(n.into())
+            .await?
+            .with_context(|| format!("block {n} not found"))?;
+        let header = block.header.inner;
+        let len = alloy::rlp::encode(&header).len();
+        let g =
+            groups
+                .entry(chain::header_field_count(&header))
+                .or_insert((0, usize::MAX, 0, 0, n, n));
+        g.0 += 1;
+        g.1 = g.1.min(len);
+        g.2 = g.2.max(len);
+        g.3 += len;
+        g.5 = n;
+    }
+    println!("fields  blocks          sampled   min   avg   max  per 4096-byte chunk");
+    for (fields, (count, min, max, sum, first, last)) in groups {
+        let avg = sum as f64 / count as f64;
+        println!(
+            "{fields:>6}  #{first}..#{last}  {count:>8} {min:>5} {avg:>5.0} {max:>5}  {}",
+            4096 / max
+        );
     }
     Ok(())
 }
