@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swarm Inspector</title>
+<style>
+:root {
+  --bg: #f6f5f1; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a64; --line: #e3e1da;
+  --accent: #d9661f; --ok: #1f8a4c; --bad: #c62828; --info: #3b6ea8; --warn: #b7791f; --code: #f0eee8;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151514; --panel: #1e1e1c; --ink: #ecebe6; --muted: #9a988f; --line: #33322e;
+          --accent: #f08a3e; --ok: #4cc27f; --bad: #ff6b6b; --info: #7aa7e0; --warn: #e0a84a; --code: #262624; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 var(--sans); }
+header { padding: 14px 20px 0; border-bottom: 1px solid var(--line); background: var(--panel); }
+h1 { margin: 0 0 10px; font-size: 17px; letter-spacing: .02em; }
+h1 span { color: var(--accent); }
+.settings { display: grid; grid-template-columns: 240px 1fr 90px 1.6fr; gap: 8px; padding-bottom: 12px; }
+label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; text-transform: uppercase;
+        letter-spacing: .06em; color: var(--muted); }
+input, select, button { font: 13px var(--mono); padding: 6px 8px; border: 1px solid var(--line);
+        border-radius: 4px; background: var(--bg); color: var(--ink); min-width: 0; }
+button { cursor: pointer; background: var(--accent); color: #fff; border-color: var(--accent);
+         font-family: var(--sans); font-weight: 600; }
+button.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+nav { display: flex; gap: 2px; }
+nav a { padding: 8px 14px; color: var(--muted); text-decoration: none; border-bottom: 2px solid transparent; }
+nav a.active { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
+main { padding: 18px 20px 60px; max-width: 1200px; }
+.query { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 16px; }
+.query label { flex: 1 1 260px; }
+.query label.small { flex: 0 0 140px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px;
+        margin-bottom: 14px; }
+.card h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.card h2 .mono { text-transform: none; letter-spacing: 0; color: var(--ink); }
+.verdict { font-size: 16px; font-weight: 700; display: flex; gap: 10px; align-items: center; }
+.verdict.ok { color: var(--ok); } .verdict.bad { color: var(--bad); } .verdict.warn { color: var(--warn); }
+.badge { font-size: 11px; padding: 1px 6px; border-radius: 3px; margin-left: 6px; text-transform: none; letter-spacing: 0; }
+.badge.warn { background: var(--warn); color: #fff; } .badge.ok { background: var(--ok); color: #fff; }
+table { width: 100%; border-collapse: collapse; }
+td, th { text-align: left; padding: 4px 8px 4px 0; vertical-align: top; border-bottom: 1px solid var(--line); }
+th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+td.k { color: var(--muted); white-space: nowrap; width: 1%; padding-right: 18px; }
+.mono, td.v { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+.steps li { list-style: none; display: grid; grid-template-columns: 22px 230px 1fr; gap: 6px; padding: 3px 0; }
+.steps { padding: 0; margin: 0; }
+.mark.ok { color: var(--ok); } .mark.bad { color: var(--bad); } .mark.info { color: var(--info); }
+.err { color: var(--bad); font-family: var(--mono); white-space: pre-wrap; }
+a.ref, button.ref { color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
+button.ref { background: none; border: 0; padding: 0; font: inherit; font-weight: inherit; }
+a:focus-visible, button:focus-visible, .copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.copy { cursor: copy; }
+.copy:hover { background: var(--code); }
+pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height: 260px; overflow: auto;
+          font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-all; margin: 0; }
+.muted { color: var(--muted); }
+.radio { display: flex; gap: 14px; margin-bottom: 10px; font-size: 13px; }
+.radio label { flex-direction: row; text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--ink); align-items: center; }
+.hidden { display: none !important; }
+.spinner { color: var(--muted); font-style: italic; }
+@media (max-width: 760px) { .settings { grid-template-columns: 1fr 1fr; } .steps li { grid-template-columns: 22px 1fr; } .steps li span:last-child { grid-column: 2; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Swarm <span>Inspector</span> <small class="muted" style="font-weight:400">eth2swarm</small>
+    <button type="button" class="ghost" id="reset" style="float:right;font-size:12px;padding:3px 8px" title="Reset node, owner, chain ID and anchor to the values ethswarm serve was started with">reset settings</button></h1>
+  <div class="settings">
+    <label>Node<select id="node"></select></label>
+    <label>SOC owner<input id="owner" placeholder="0x… importer address" spellcheck="false"></label>
+    <label>Chain ID<input id="chain" type="number" min="0"></label>
+    <label>Trust anchor (blank = owner's published anchor)<input id="anchor" placeholder="0x… pinned anchor" spellcheck="false"></label>
+  </div>
+  <nav>
+    <a href="#block" data-tab="block">Block</a><a href="#epoch" data-tab="epoch">Epoch</a><a href="#soc" data-tab="soc">SOC</a><a href="#bytes" data-tab="bytes">Bytes</a>
+  </nav>
+</header>
+<main>
+  <section id="tab-block">
+    <form class="query" data-run="block">
+      <label class="small">Block number<input id="blockN" type="number" min="0" value="0"></label>
+      <button type="button" class="ghost" id="prev">◀</button>
+      <button type="button" class="ghost" id="next">▶</button>
+      <button>Fetch &amp; verify</button>
+    </form>
+    <div id="out-block"></div>
+  </section>
+  <section id="tab-epoch" class="hidden">
+    <form class="query" data-run="epoch">
+      <label class="small">Epoch<input id="epochK" type="number" min="0" value="0"></label>
+      <button>Fetch &amp; verify</button>
+    </form>
+    <div id="out-epoch"></div>
+  </section>
+  <section id="tab-soc" class="hidden">
+    <div class="radio">
+      <label><input type="radio" name="socmode" value="idstr" checked> owner + identifier string</label>
+      <label><input type="radio" name="socmode" value="id"> owner + identifier (hex)</label>
+      <label><input type="radio" name="socmode" value="addr"> SOC address</label>
+    </div>
+    <form class="query" data-run="soc">
+      <label id="socInputLabel">Identifier string<input id="socInput" spellcheck="false" placeholder="eth:1:0x…:hdr:0"></label>
+      <button>Fetch &amp; decode</button>
+    </form>
+    <div class="muted" style="margin:-8px 0 14px;font-size:12px">Templates:
+      <button type="button" class="ref" data-tpl="hdr">hdr:&lt;n&gt;</button> ·
+      <button type="button" class="ref" data-tpl="epoch">epoch:&lt;k&gt;</button> ·
+      <button type="button" class="ref" data-tpl="accumulator">accumulator</button>
+      — identifier = keccak256(string), address = keccak256(identifier ‖ owner)</div>
+    <div id="out-soc"></div>
+  </section>
+  <section id="tab-bytes" class="hidden">
+    <form class="query" data-run="bytes">
+      <label>Bytes reference (/bytes)<input id="bytesRef" spellcheck="false" placeholder="64 hex chars"></label>
+      <button>Fetch &amp; decode</button>
+    </form>
+    <div id="out-bytes"></div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const store = { get(k) { try { return localStorage.getItem('swi.' + k); } catch { return null; } },
+                set(k, v) { try { localStorage.setItem('swi.' + k, v); } catch {} } };
+const settings = ['node', 'owner', 'chain', 'anchor'];
+
+function hash(v) { return v == null ? '<span class="muted">—</span>' : `<span class="mono copy" tabindex="0" role="button" title="click or press Enter to copy">${esc(v)}</span>`; }
+function refLink(v, tab) { return v == null ? hash(v) : `<a class="ref mono" href="#${tab}/${esc(encodeURIComponent(v))}">${esc(v)}</a>`; }
+function blockLink(n, text) { return `<a class="ref" href="#block/${Number(n)}">${esc(text)}</a>`; }
+function kv(rows) {
+  return '<table>' + rows.filter(r => r).map(([k, v]) => `<tr><td class="k">${esc(k)}</td><td class="v">${v}</td></tr>`).join('') + '</table>';
+}
+function card(title, html, titleHash) {
+  const t = esc(title) + (titleHash ? ` <span class="mono">${esc(titleHash)}</span>` : '');
+  return `<div class="card"><h2>${t}</h2>${html}</div>`;
+}
+function cardB(title, badgeHtml, html) { return `<div class="card"><h2>${esc(title)}${badgeHtml}</h2>${html}</div>`; }
+function errCard(msg) { return `<div class="card"><div class="err">${esc(msg)}</div></div>`; }
+function verdict(ok, text, pinned = true) {
+  if (ok && !pinned) return `<div class="card"><div class="verdict warn">⚠ ${esc(text)} — but only against the owner's <em>published</em> anchor (not pinned): this trusts the publisher</div></div>`;
+  return `<div class="card"><div class="verdict ${ok ? 'ok' : 'bad'}">${ok ? '✓' : '✗'} ${esc(text)}</div></div>`;
+}
+function steps(list) {
+  if (!list || !list.length) return '';
+  return card('Verification', '<ul class="steps">' + list.map(s => {
+    const cls = s.ok === true ? 'ok' : s.ok === false ? 'bad' : 'info';
+    const mark = s.ok === true ? '✓' : s.ok === false ? '✗' : 'i';
+    return `<li><span class="mark ${cls}">${mark}</span><span>${esc(s.step)}</span><span class="mono">${esc(s.detail)}</span></li>`;
+  }).join('') + '</ul>');
+}
+function bool(b) { return b == null ? '<span class="muted">n/a</span>' : b ? '<span class="mark ok">✓ yes</span>' : '<span class="mark bad">✗ no</span>'; }
+
+function headerCard(h, blockHash, title = 'Header') {
+  if (!h) return '';
+  if (h.error) return errCard('header: ' + h.error);
+  const ts = h.timestamp ? new Date(h.timestamp * 1000).toISOString().replace('.000', '') : '';
+  return card(`${title} #${h.number}`, kv([
+    ['block hash', hash(blockHash)],
+    ['parent hash', h.number > 0 ? `<a class="ref mono" href="#block/${Number(h.number) - 1}">${esc(h.parentHash)}</a>` : hash(h.parentHash)],
+    ['timestamp', `${h.timestamp} <span class="muted">(${ts})</span>`],
+    ['beneficiary', hash(h.beneficiary)],
+    ['state root', hash(h.stateRoot)],
+    ['transactions root', hash(h.transactionsRoot)],
+    ['receipts root', hash(h.receiptsRoot)],
+    ['ommers hash', hash(h.ommersHash)],
+    ['difficulty', esc(h.difficulty)],
+    ['gas used / limit', `${h.gasUsed} / ${h.gasLimit}`],
+    ['extra data', esc(h.extraData) + (h.extraDataText ? ` <span class="muted">“${esc(h.extraDataText)}”</span>` : '')],
+    ['mix hash', hash(h.mixHash)],
+    ['nonce', hash(h.nonce)],
+    h.baseFeePerGas != null && ['base fee', esc(h.baseFeePerGas)],
+    h.withdrawalsRoot != null && ['withdrawals root', hash(h.withdrawalsRoot)],
+    h.blobGasUsed != null && ['blob gas used / excess', `${h.blobGasUsed} / ${h.excessBlobGas}`],
+    h.parentBeaconBlockRoot != null && ['parent beacon root', hash(h.parentBeaconBlockRoot)],
+    h.requestsHash != null && ['requests hash', hash(h.requestsHash)],
+    ['fields', `${h.fieldCount} <span class="muted">(15 pre-London · 16 London · 17 Shanghai · 20 Cancun · 21 Prague)</span>`],
+  ]));
+}
+function bodyCard(b) {
+  if (!b) return '';
+  let html = '';
+  if (b.transactions.length) {
+    html += `<table><tr><th>#</th><th>hash</th><th>type</th><th>from → to</th><th>value (wei)</th><th>nonce</th><th>gas</th><th>input</th></tr>` +
+      b.transactions.map((t, i) => `<tr><td>${i}</td><td class="mono copy" tabindex="0" role="button" title="click or press Enter to copy">${esc(t.hash)}</td><td>${t.type}</td>
+        <td class="mono">${esc(t.from ?? '?')}<br>→ ${esc(t.to ?? '(contract creation)')}</td>
+        <td class="mono">${esc(t.value)}</td><td>${t.nonce}</td><td>${t.gasLimit}</td><td>${t.inputLength} B</td></tr>`).join('') + '</table>';
+  } else html += '<div class="muted">No transactions.</div>';
+  if (b.ommers.length) html += '<h2 style="margin-top:12px">Ommers (uncles)</h2><table>' +
+    b.ommers.map(o => `<tr><td class="k">#${o.number}</td><td class="v">${esc(o.hash)} <span class="muted">miner ${esc(o.beneficiary)}</span></td></tr>`).join('') + '</table>';
+  if (b.withdrawals != null) html += `<div style="margin-top:8px">Withdrawals: ${b.withdrawals}</div>`;
+  return card(`Body — ${b.transactions.length} txs, ${b.ommers.length} ommers`, html);
+}
+function proofList(p) { return (p || []).map((h, i) => `<div><span class="muted">${i}</span> ${esc(h)}</div>`).join('') || '<span class="muted">(empty)</span>'; }
+function recordCard(r, verified) {
+  if (!r) return '';
+  const badge = verified === false ? ' <span class="badge warn">unverified — signer check failed or owner not given</span>' : verified === true ? ' <span class="badge ok">signed by owner</span>' : '';
+  if (r.kind === 'header') return cardB('Record: header', badge, kv([
+      ['geometry', `${r.geometry.numEpochs} epochs × ${r.geometry.epochSize} = ${r.geometry.blocks} blocks`],
+      ['block hash (keccak of header RLP)', hash(r.blockHash)],
+      ['header RLP', `${r.headerRlpLength} bytes`],
+      ['body ref', refLink(r.bodyRef, 'bytes')],
+      ['epoch proof', proofList(r.epochProof)],
+      ['master proof', proofList(r.masterProof)],
+    ])) + headerCard(r.header, r.blockHash, 'Decoded header');
+  if (r.kind === 'epoch') return cardB('Record: epoch', badge, kv([
+      ['geometry', `${r.geometry.numEpochs} epochs × ${r.geometry.epochSize} = ${r.geometry.blocks} blocks`],
+      ['epoch root', hash(r.epochRoot)],
+      ['headers file', refLink(r.headersRef, 'bytes')],
+      ['master proof', proofList(r.masterProof)],
+    ]));
+  if (r.kind === 'anchor') return cardB('Record: published anchor', badge, kv([
+      ['geometry', `${r.geometry.numEpochs} epochs × ${r.geometry.epochSize} = ${r.geometry.blocks} blocks`],
+      ['anchor', hash(r.anchor) + ' <button type="button" class="ref" data-pin="' + esc(r.anchor) + '">pin as trust anchor</button>'],
+    ]));
+  return card('Record', '<span class="muted">Payload is not an eth2swarm record.</span>');
+}
+function socCard(soc) {
+  if (!soc) return '';
+  return card('SOC location', kv([
+    soc.identifierString && ['identifier string', esc(soc.identifierString)],
+    ['identifier', hash(soc.identifier)],
+    ['SOC address', hash(soc.address)],
+  ]));
+}
+
+function params(extra, node) {
+  return new URLSearchParams({ node, ...extra });
+}
+async function api(path, p) {
+  const r = await fetch(`/api/${path}?${p}`);
+  const body = await r.text();
+  try { return JSON.parse(body); }
+  catch { return { error: `HTTP ${r.status}: ${body}` }; }
+}
+function common() {
+  const o = { owner: $('owner').value.trim(), chain: $('chain').value };
+  if ($('anchor').value.trim()) o.anchor = $('anchor').value.trim();
+  return o;
+}
+function busy(out) { $(out).innerHTML = '<div class="spinner">fetching…</div>'; }
+// Which node a result came from: the node each lookup captured when it started, so
+// switching the node afterwards cannot pass an old result off as the new node's.
+function source(node) { return `<div class="muted" style="margin-bottom:8px">from node ${esc(node)}</div>`; }
+
+const runners = {
+  async block(stale, node) {
+    const n = $('blockN').value; setHash('block', n); busy('out-block');
+    const d = await api('block', params({ ...common(), n }, node));
+    if (stale()) return;
+    let html = source(node);
+    if (d.verified !== undefined) html += verdict(d.verified, d.verified ? `Block #${n} verified` : `Block #${n} NOT verified`, d.anchorPinned !== false);
+    if (d.error) html += errCard(d.error);
+    html += steps(d.steps) + socCard(d.soc);
+    if (d.record) html += recordCard(d.record);
+    html += bodyCard(d.body);
+    $('out-block').innerHTML = html;
+  },
+  async epoch(stale, node) {
+    const k = $('epochK').value; setHash('epoch', k); busy('out-epoch');
+    const d = await api('epoch', params({ ...common(), k }, node));
+    if (stale()) return;
+    let html = source(node);
+    if (d.verified !== undefined) html += verdict(d.verified, d.verified ? `Epoch ${k} verified (${d.headers.length} headers)` : `Epoch ${k} NOT verified`, d.anchorPinned !== false);
+    if (d.error) html += errCard(d.error);
+    html += steps(d.steps) + socCard(d.soc) + recordCard(d.record, d.recordVerified);
+    if (d.headers) html += card('Headers', '<table><tr><th>#</th><th>hash</th><th>timestamp</th><th>gas used</th><th>body</th></tr>' +
+      d.headers.map(h => `<tr><td>${blockLink(h.number, h.number)}</td><td class="mono copy" tabindex="0" role="button" title="click or press Enter to copy">${esc(h.hash)}</td>
+        <td>${h.timestamp}</td><td>${h.gasUsed}</td><td>${h.bodyContents.length ? esc(h.bodyContents.join(', ')) : '<span class="muted">empty</span>'}</td></tr>`).join('') + '</table>');
+    $('out-epoch').innerHTML = html;
+  },
+  async soc(stale, node) {
+    const mode = document.querySelector('input[name=socmode]:checked').value;
+    const v = $('socInput').value.trim(); setHash('soc', mode + ':' + v); busy('out-soc');
+    const p = mode === 'addr' ? params({ addr: v, owner: $('owner').value.trim() }, node)
+            : params({ owner: $('owner').value.trim(), [mode]: v }, node);
+    const d = await api('soc', p);
+    if (stale()) return;
+    let html = source(node);
+    if (d.derivation && d.derivation.ownerError) html += errCard(d.derivation.ownerError);
+    if (d.derivation && d.derivation.address) html += card('Address derivation', kv([
+      d.derivation.identifierString && ['identifier string', esc(d.derivation.identifierString)],
+      ['identifier', hash(d.derivation.identifier)],
+      ['owner', hash(d.derivation.owner)],
+      ['SOC address', hash(d.derivation.address)],
+    ]));
+    if (d.error) html += errCard(d.error);
+    if (d.soc) html += card(`Chunk (${d.rawLength} bytes)`, kv([
+      ['identifier', hash(d.soc.identifier)],
+      ['signature', hash(d.soc.signature)],
+      ['span', `${d.soc.span} bytes`],
+      ['signed CAC address', hash(d.soc.cacAddress)],
+      ['recovered signer', hash(d.soc.signer)],
+      ['address = keccak(id ‖ signer)', bool(d.soc.signerMatchesAddress)],
+      ['signer = configured owner', bool(d.soc.signerMatchesOwner)],
+    ]) + `<h2 style="margin-top:12px">Payload (${d.soc.payloadLength} bytes)</h2><pre class="hex">${esc(d.soc.payloadHex)}</pre>`, d.address);
+    if (d.rawHex) html += card('Raw chunk', `<pre class="hex">${esc(d.rawHex)}</pre>`);
+    html += recordCard(d.record, d.recordVerified);
+    $('out-soc').innerHTML = html;
+  },
+  async bytes(stale, node) {
+    const ref = $('bytesRef').value.trim(); setHash('bytes', ref); busy('out-bytes');
+    const d = await api('bytes', params({ ref }, node));
+    if (stale()) return;
+    let html = source(node);
+    if (d.error) html += errCard(d.error);
+    if (d.length !== undefined) html += card('Reference', kv([
+      ['size', `${d.length} bytes (${d.chunks} data chunk${d.chunks > 1 ? 's' : ''})`],
+      ['decoded as', esc(d.decodedAs ?? 'unknown')],
+    ]), d.reference);
+    if (d.body) html += bodyCard(d.body);
+    if (d.headers) html += card(`Headers (${d.headers.length})`, '<table><tr><th>#</th><th>hash</th><th>timestamp</th></tr>' +
+      d.headers.map(h => `<tr><td>${blockLink(h.number, h.number)}</td><td class="mono copy" tabindex="0" role="button" title="click or press Enter to copy">${esc(h.hash)}</td><td>${h.timestamp}</td></tr>`).join('') + '</table>');
+    if (d.text) html += card('Text' + (d.textTruncated ? ' (first 64 KiB)' : ''), `<pre class="hex">${esc(d.text)}</pre>`);
+    if (d.hexPreview) html += card('Hex' + (d.truncated ? ' (first 2048 bytes)' : ''), `<pre class="hex">${esc(d.hexPreview)}</pre>`);
+    $('out-bytes').innerHTML = html;
+  },
+};
+
+function show(tab) {
+  document.querySelectorAll('nav a').forEach(a => a.classList.toggle('active', a.dataset.tab === tab));
+  document.querySelectorAll('main > section').forEach(s => s.classList.toggle('hidden', s.id !== 'tab-' + tab));
+}
+// The last lookup of each tab, so a tab link returns to it instead of to an empty view.
+const lastHash = {};
+// True while a lookup restored from the URL starts: it may only normalise the fragment.
+let fromUrl = false;
+function setHash(tab, val) {
+  const h = `#${tab}/${encodeURIComponent(val)}`;
+  lastHash[tab] = h;
+  if (location.hash === h) return;
+  // A lookup restored from the URL (Back/Forward, a pasted or typed link) rewrites its own
+  // entry into the canonical form; pushing would trap Back on that entry and drop the
+  // Forward ones. A new lookup (form, ◀ ▶) adds an entry.
+  if (fromUrl) history.replaceState(null, '', h); else history.pushState(null, '', h);
+}
+const generation = {};
+async function run(tab) {
+  show(tab);
+  const id = generation[tab] = (generation[tab] || 0) + 1;
+  const stale = () => generation[tab] !== id;
+  const node = $('node').value;
+  try { await runners[tab](stale, node); }
+  catch (e) { if (!stale()) $('out-' + tab).innerHTML = errCard(String(e)); }
+}
+function fromHash() {
+  const slash = location.hash.indexOf('/');
+  const tab = location.hash.slice(1, slash < 0 ? undefined : slash);
+  const raw = slash < 0 ? '' : location.hash.slice(slash + 1);
+  if (!runners[tab]) { show('block'); return; }
+  if (slash < 0) {
+    // A bare tab link: switch tabs without touching the tab's input or output, and put
+    // its last lookup back into the URL so a reload or a shared link reproduces it.
+    show(tab);
+    if (lastHash[tab]) history.replaceState(null, '', lastHash[tab]);
+    return;
+  }
+  let val;
+  try { val = decodeURIComponent(raw); } catch { val = raw; }
+  if (tab === 'block') $('blockN').value = val || 0;
+  if (tab === 'epoch') $('epochK').value = val || 0;
+  if (tab === 'bytes') $('bytesRef').value = val;
+  if (tab === 'soc') {
+    const i = val.indexOf(':');
+    const mode = i > 0 ? val.slice(0, i) : '';
+    if (['idstr', 'id', 'addr'].includes(mode)) {
+      document.querySelector(`input[name=socmode][value="${mode}"]`).checked = true; socMode();
+      $('socInput').value = val.slice(i + 1);
+    } else { $('socInput').value = val; }
+  }
+  if (!val) { show(tab); return; }
+  fromUrl = true;
+  try { run(tab); } finally { fromUrl = false; }
+}
+function socMode() {
+  const mode = document.querySelector('input[name=socmode]:checked').value;
+  $('socInputLabel').firstChild.textContent = { idstr: 'Identifier string', id: 'Identifier (32-byte hex)', addr: 'SOC address' }[mode];
+}
+
+document.addEventListener('click', (e) => {
+  const t = e.target.closest('[data-pin],[data-tpl],.copy');
+  if (!t) return;
+  if (t.dataset.pin) { $('anchor').value = t.dataset.pin; $('anchor').dispatchEvent(new Event('change')); return; }
+  if (t.dataset.tpl) {
+    const c = $('chain').value || 1, a = $('anchor').value.trim().toLowerCase() || '<anchor>';
+    document.querySelector('input[name=socmode][value=idstr]').checked = true; socMode();
+    $('socInput').value = t.dataset.tpl === 'accumulator' ? `eth:${c}:accumulator` : `eth:${c}:${a}:${t.dataset.tpl}:0`;
+    $('socInput').focus(); return;
+  }
+  if (t.classList.contains('copy')) { navigator.clipboard?.writeText(t.textContent.trim()); }
+});
+document.addEventListener('keydown', (e) => {
+  const t = e.target.closest?.('.copy');
+  if (t && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); navigator.clipboard?.writeText(t.textContent.trim()); }
+});
+document.querySelectorAll('form[data-run]').forEach(f => f.addEventListener('submit', (e) => { e.preventDefault(); run(f.dataset.run); }));
+document.querySelectorAll('input[name=socmode]').forEach(r => r.addEventListener('change', socMode));
+$('prev').onclick = () => { $('blockN').value = Math.max(0, +$('blockN').value - 1); run('block'); };
+$('next').onclick = () => { $('blockN').value = +$('blockN').value + 1; run('block'); };
+// hashchange covers link clicks, edits of the URL fragment and Back/Forward between
+// lookups; pushState (setHash) fires nothing, so a lookup never re-triggers itself.
+window.addEventListener('hashchange', fromHash);
+// A click on a link to the fragment already shown changes nothing and fires no event:
+// re-run it.
+document.addEventListener('click', (e) => {
+  if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  const a = e.target.closest('a[href^="#"]');
+  if (a && a.getAttribute('href') === location.hash) { e.preventDefault(); fromHash(); }
+});
+
+(async () => {
+  const cfg = await (await fetch('/api/config')).json();
+  $('node').innerHTML = cfg.nodes.map(n => `<option value="${esc(n.name)}">${esc(n.name)} — ${esc(n.url)}</option>`).join('');
+  const defaults = { node: cfg.nodes[0]?.name, owner: cfg.owner ?? '', chain: cfg.chainId, anchor: cfg.anchor ?? '' };
+  for (const k of settings) {
+    // A saved value only wins while the server default it overrode is unchanged, so a
+    // restart with a new --owner / ETH2SWARM_ANCHOR takes effect.
+    const def = String(defaults[k] ?? '');
+    const saved = store.get(k);
+    $(k).value = saved !== null && store.get('default.' + k) === def ? saved : def;
+    if (k === 'node' && !$(k).value) $(k).value = defaults.node;
+    $(k).addEventListener('change', () => { store.set(k, $(k).value); store.set('default.' + k, def); });
+  }
+  $('reset').onclick = () => { for (const k of settings) { $(k).value = String(defaults[k] ?? ''); store.set(k, $(k).value); store.set('default.' + k, $(k).value); } };
+  try { fromHash(); } catch (e) { show('block'); }
+})();
+</script>
+</body>
+</html>

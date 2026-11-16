@@ -7,6 +7,13 @@ Importer of Ethereum blocks into Ethereum Swarm.
   over Tailscale); override with `$ETH2SWARM_RPC` or `--rpc`
   (e.g. `http://localhost:8546` for the patched bee-factory Anvil).
 
+- Blocks are stored as Single Owner Chunks with a header accumulator, so a client can
+  verify any block from a single trust anchor — see
+  [docs/soc-block-store.md](docs/soc-block-store.md) (`import`, `get`, `verify-epoch`,
+  `header-stats`).
+- `ethswarm serve` — local web UI to inspect SOCs, blocks, epochs and references on the
+  Swarm nodes; see [docs/inspector.md](docs/inspector.md).
+
 ## Development environment
 
 The local Swarm dev stack (5 Bee nodes + Anvil + Swarm contracts) is managed by
