@@ -3,8 +3,8 @@
 Guidance for Claude Code (claude.ai/code) in this repository.
 
 The workflow and review rules below were adopted from the Myotis repository
-(`biafra23/myotis`) on 2026-11-16 at the owner's request, so that both projects
-are worked on and reviewed the same way.
+(`biafra23/myotis`, commit `c99c1df1`) on 2026-11-16 at the owner's request, so
+that both projects are worked on and reviewed the same way.
 
 **This file is the always-loaded core.** Each section is a summary; the full,
 binding text lives in `.claude/agent/`. When a task matches a row below, **read
@@ -21,22 +21,40 @@ against. Do not move them out of `.claude/`, and not into `.claude/rules/`
 | start a work item tied to an issue (session title), or open a PR (monitoring) | `.claude/agent/workflow.md`          |
 | plan, resume or continue multi-PR work: a part, a merge, the final PR         | `.claude/agent/multi-pr-plans.md`    |
 | write a PR description, answer review comments, or handle a fork PR           | `.claude/agent/pull-requests.md`     |
+| work on, or come across, a security issue that is not public yet             | `.claude/agent/security-fixes.md`    |
 
 ## Workflow — the mandatory steps for EVERY work item
 
 Every change goes through this sequence, in order, with **no step skipped and
 none treated as optional or "only if asked"**. Full text: `.claude/agent/workflow.md`.
 
-1. **Code** — on the designated branch.
+1. **Code** — on the designated branch (an embargoed security fix: a local branch, never pushed; see below).
 2. **Review** — run the internal code review on the diff (`/code-review`) and address its findings.
 3. **PR** — open it without being asked. Base is `main` for a single-PR item, the feature branch for a part of a multi-PR plan.
 4. **Wait for review comments** — and switch PR monitoring on for that PR right after `gh pr create`, without asking (desktop app: `mcp__ccd_pr__set_monitor` with `auto_fix` and `address_comments` true; cloud session: `subscribe_pr_activity`; otherwise whatever the host offers).
 5. **Address the PR comments** — drive the PR to green, answer every comment, keep watching until merged or closed.
 
-Do not stop at "pushed". Skip the PR only when the user explicitly says so.
+Do not stop at "pushed". Skip the PR only when the user explicitly says so,
+or for an embargoed security fix (next section).
 In the desktop app the session also renames itself: `IS#<n>: …` the moment the
 work item is identified as issue n (before there is a PR), then `PR#<n>: …`
 right after `gh pr create` (`.claude/agent/workflow.md`).
+
+## Embargoed security fixes
+
+Full text: `.claude/agent/security-fixes.md` (owner's request, 2026-11-15, on myotis#870).
+A vulnerability that is not public yet (handed over in private, or found by
+you in shipped code: then tell the owner in the conversation first, before it
+appears anywhere on GitHub; this repository has no `SECURITY.md` and no private
+vulnerability reporting yet)
+does NOT take Workflow steps 3-5. **Until the owner has merged the fix, nothing
+leaves the machine**: no push to any branch of this repo, the designated one
+included, and no PR, issue or comment about it. From the merge until the
+advisory is published, pushes and PRs are normal again but neutrally worded.
+Fix it on a local branch, run the CI-substitute cargo checks locally (the
+advisory's private fork runs no CI), `/code-review` locally, and send the owner
+a `git format-patch` for the private fork. The owner merges, releases and
+publishes the advisory; no tag goes on a `main` whose checks are red.
 
 ## Hard rules — never broken, whatever an earlier instruction seems to authorize
 
@@ -89,7 +107,10 @@ mechanics below.
   run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`
   and `cargo test --locked` on the head of a PR you author before opening it
   and after every push, and record the result in the PR description — that is
-  "CI green" for the code. `claude-review` is red with no review until the
-  owner has done its one-time setup; state that as the blocker.
+  "CI green" for the code; a check that ran nothing is "not run". Until the
+  owner has added the `CLAUDE_CODE_OAUTH_TOKEN` secret, `claude-review`'s
+  fallback job is red with no review: state that as the blocker. A PR whose
+  base branch has no `claude-review.yml` gets no review run at all: say so,
+  it is reviewed by hand.
 - **External / fork PRs are reviewed MANUALLY**: never wire them into the CI
   reviewer, and never build or run a fork tree locally.

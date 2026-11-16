@@ -1,10 +1,10 @@
 # Workflow — the mandatory steps, in full
 
-> Adopted from the Myotis repository (`biafra23/myotis`, `.claude/agent/workflow.md`) on
-> 2026-11-16 at the owner's request, with only what is specific to that
-> repository (its builds, releases and artifact workflows) removed. The owner
-> rulings cited with a date were made there and carry over; `myotis#<n>` is an
-> issue or PR of that repository.
+> Adopted from the Myotis repository (`biafra23/myotis`, `.claude/agent/workflow.md`
+> at commit `c99c1df1`) on 2026-11-16 at the owner's request, with what is
+> specific to that repository (its builds, releases and artifact workflows)
+> removed. The owner rulings cited with a date were made there and
+> carry over; `myotis#<n>` is an issue or PR of that repository.
 > `CLAUDE.md` (the always-loaded core) keeps a summary and points here.
 > "Next section" in this text means `multi-pr-plans.md`; "the rules below" / "PR-description rules" mean `pull-requests.md`.
 
@@ -13,7 +13,8 @@
 Every change to this repository goes through this sequence, in order, with **no
 step skipped and none treated as optional or "only if asked"**:
 
-1. **Code** — make the change on the designated branch.
+1. **Code** — make the change on the designated branch (an embargoed security
+   fix: a local branch, never pushed; `security-fixes.md`).
 2. **Review** — run the internal code review on the diff (the `code-review`
    skill / `/code-review`) and address what it finds before going further.
 3. **PR** — open a pull request. This is the default next step after review, not
@@ -55,6 +56,9 @@ Short form: **code → review → PR → wait for review comments → address th
 Do not stop at "pushed" and do not ask whether to open the PR or run the review —
 they are part of the work item. The only time to skip the PR is when the user
 explicitly says not to open one.
+An embargoed security fix (a vulnerability that is not public yet) takes
+`security-fixes.md` instead of steps 3 to 5: no PR and no push before the
+owner has merged the fix.
 
 ### The session title carries the issue and the PR number
 

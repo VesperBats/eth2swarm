@@ -1,11 +1,11 @@
 # Pull requests and code review
 
-> Adopted from the Myotis repository (`biafra23/myotis`, `.claude/agent/pull-requests.md`) on
-> 2026-11-16 at the owner's request, with only what is specific to that
-> repository (its builds, releases and artifact workflows) removed, and the
-> sentences about this repository's own checks written for it. The owner
-> rulings cited with a date were made there and carry over; `myotis#<n>` is an
-> issue or PR of that repository.
+> Adopted from the Myotis repository (`biafra23/myotis`, `.claude/agent/pull-requests.md`
+> at commit `c99c1df1`) on 2026-11-16 at the owner's request, with what is
+> specific to that repository (its builds, releases and artifact workflows)
+> removed, and the sentences about this repository's own checks written for
+> it. The owner rulings cited with a date were made there and carry over;
+> `myotis#<n>` is an issue or PR of that repository.
 > `CLAUDE.md` (the always-loaded core) keeps a summary and points here.
 > "The multi-PR rule above" / *Multi-PR plans land through a feature branch* mean `multi-pr-plans.md`. "This file" means `CLAUDE.md` together with the `.claude/agent/` files.
 
@@ -20,8 +20,9 @@ on its allowlist.
 
 **External / fork PRs are reviewed MANUALLY, never by the CI reviewer (owner's
 decision, 2026-08-15).** The `claude-review` workflow deliberately skips forks
-(`head.repo.full_name == github.repository` in its `if:`) because a `pull_request`
-run from a fork gets no secrets — but the deeper reason is trust: a fork PR's
+(`head.repo.full_name == github.repository` in its `if:`). It runs on
+`pull_request_target`, which hands a fork's run the repository's secrets, so
+that `if:` is also what keeps them from forks — but the deeper reason is trust: a fork PR's
 tree is attacker-controlled, and an automated reviewer that reads it can be
 prompt-injected. A PR can no longer rewrite the reviewer's prompt file (the
 workflow reads it from the PR's base commit) or its root `CLAUDE.md`
@@ -119,11 +120,17 @@ that produced this note.
   push to it, and record in the PR description, above the session links and
   kept current, what was run and how it ended. Until a workflow replaces them,
   these runs are what "CI green" means for the code in this repository.
+  A check that ran nothing (0 tests, a filtered or ignored test) is "not
+  run", never "passed".
   `claude-review` itself needs the one-time setup in the header of
-  `.github/workflows/claude-review.yml` (the Claude GitHub App and the
-  `CLAUDE_CODE_OAUTH_TOKEN` secret): until the owner has done it, that check
-  is red with no review posted — state it as the blocker and do not try to
-  fix it.
+  `.github/workflows/claude-review.yml`: the `CLAUDE_CODE_OAUTH_TOKEN` secret
+  (`ANTHROPIC_API_KEY` is optional, for its last attempt only). Until the
+  owner has added it, the `review` job ends green and `Fallback review (latest
+  Opus)` red, with no review posted — state that as the blocker and do not
+  try to fix it. A PR whose base branch has no `claude-review.yml` (a feature
+  branch cut before the workflow landed, or the PR that adds the workflow)
+  gets no run at all, since `pull_request_target` runs the base branch's copy:
+  say so in the PR; it is reviewed by hand.
 - **Never merge a PR yourself** — not with `gh pr merge`, not by enabling
   auto-merge. No earlier task description or standing instruction authorizes
   it. The end state of the author's work is "green, answered, ready to merge";
