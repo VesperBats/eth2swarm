@@ -211,13 +211,25 @@ The head uses Bee's sequence-feed identifier scheme, so Bee's feed lookup can fi
 latest update. Every unit gets exactly one head update, also while the importer catches up
 after downtime, so `N − n` is constant (`N0`, from update 0).
 
-A client must not probe for an update that cannot exist yet (a miss is a timeout). It
-caches the last head it read and asks for update `n + 1` no earlier than
-`last_block_timestamp + 2·U·12 s` (one more unit, plus the finality delay). After a longer
-pause it computes the update to read from the elapsed time, 12 seconds per block, and
-corrects with the `units` field of what it gets. A miss then only happens when the importer
-is behind; it costs one timeout in the background while the client keeps showing what it
-has.
+A client avoids asking for an update that does not exist yet (a miss is a timeout), and
+bounds the misses it cannot avoid. It caches the last head it read (`n`, `N`,
+`last_block_timestamp`):
+
+- **Best:** if the client knows the latest finalized block number `F` from elsewhere (a
+  beacon light client, an RPC), the newest update that can exist is `⌊(F + 1) / U⌋ − N0` (update `n` announces
+  `N0 + n` units).
+  A miss then means the importer is behind.
+- **Otherwise, from the time.** Twelve seconds is the slot time; a missed slot has no block,
+  so time only gives an *upper* bound on the blocks produced. The client aims low: it does
+  not ask for `n + 1` before `last_block_timestamp + 2·U·12 s` (one more unit, plus the
+  finality delay), and after a longer pause it targets
+  `n + ⌊0.95 · (elapsed seconds − U·12) / (U·12)⌋`, 5 % below the slot count.
+- **On a miss** it halves the jump towards `n` and tries again, so a jump of `d` updates
+  costs at most `log2(d)` misses. Once the jump is down to `n + 1`, further misses back off
+  exponentially (2, 4, 8 … minutes, at most 30). The first update it does get gives the
+  exact `units`, and with it the right index for the next step.
+
+All of this runs in the background; the client keeps showing what it has.
 
 Unlike the block store, the identifiers are **not** namespaced by a trust anchor: the index
 grows incrementally. Each slice binds to the chain through the hash of its last block.
@@ -226,7 +238,14 @@ grows incrementally. Each slice binds to the chain through the hash of its last 
 
 All records start with `MAGIC ‖ VERSION ‖ kind` as in `src/layout.rs` (`"E2S"`, `1`).
 Integers are big-endian unless they are varints. A **varint** is unsigned LEB128 (7 bits
-per byte, low group first, high bit set on all but the last byte).
+per byte, low group first, high bit set on all but the last byte), always in its shortest
+form.
+
+Encodings are canonical: the same appearances must give byte-identical records, spill files
+and therefore Swarm references, or independent importers cannot be compared. Besides
+shortest varints that means the orderings given below, greedy spill pages, zero padding, and
+spill files uploaded with Bee's default chunker, unencrypted and without erasure coding
+(redundancy level 0), since encryption and redundancy change the reference.
 
 ### `SliceRecord` (kind 4), 111 bytes
 
@@ -249,8 +268,19 @@ per byte, low group first, high bit set on all but the last byte).
 zero-padded to the next power of two). It is there for reproducibility: two independent
 importers can compare slices by this root alone.
 
-The importer chooses `B = ⌈(sum of address-record bytes) / T⌉`, computed with the 256-byte
-spill threshold only, before the overflow spills described under `BucketRecord`.
+`B` is chosen deterministically, so that honest importers produce identical slices:
+
+1. Start with `B = ⌈(sum of address-record bytes) / T⌉`, the records encoded with the
+   256-byte spill threshold.
+2. Assign the addresses to buckets. In every bucket over 4096 bytes, spill records whose
+   spilling saves bytes (inline entries longer than 32 bytes, the size of a `spill_ref`),
+   the largest first (ties: the smaller fingerprint), until it fits.
+3. If a bucket still does not fit, set `B = B + 1` and go back to step 2 with the records as
+   they were after step 1.
+
+This terminates: the more buckets, the fewer records each one holds, and a single record is
+at most about 270 bytes. Step 3 should practically never run: the measured overflows were
+at most 350 bytes over at `T = 2816`, less than two spillable records.
 
 ### `BucketRecord` (kind 5)
 
@@ -289,11 +319,10 @@ two of them can share 64 bits of their hash. The importer keeps records with the
 fingerprint next to each other; a client reads every record with its fingerprint and the
 verification step (below) drops entries that are not about its address.
 
-A bucket must fit one chunk (4096 bytes of payload). If it does not, the importer spills
-more records: it spills the address with the largest inline entries (ties: the smaller
-fingerprint) until the bucket fits. At `T = 2816` that is needed for 0–0.03 % of buckets,
-depending on slice length (measured), and one or two spills suffice. So every bucket is a
-plain single-chunk SOC, which is also what `src/swarm/soc.rs` accepts.
+A bucket always fits one chunk (4096 bytes of payload), by the choice of `B` under
+`SliceRecord`. At `T = 2816` extra spills were needed for 0–0.03 % of buckets, depending on
+slice length (measured). So every bucket is a plain single-chunk SOC, which is also what
+`src/swarm/soc.rs` accepts.
 
 ### Spill file
 
@@ -305,7 +334,10 @@ file, so a client fetches any page on its own:
 | `count` | u16 | entries in this page |
 | `first_block` | u32 | block of the first entry |
 | entries | | as in the bucket; the first `block_delta` is relative to `first_block` (so 0) |
-| padding | | zero bytes to 4096, except in the last page |
+| padding | | zero bytes to 4096, except in the last page, which has none |
+
+Pages are filled greedily: an entry goes into the current page if it fits, else it starts
+the next page. No page is empty.
 
 The client learns the number of pages from the file's span (`⌈span / 4096⌉`), reads the
 last page for the newest entries, and binary-searches pages by `first_block` for a block
@@ -343,9 +375,17 @@ Oldest first is the same in the opposite order.
 
 ## Verification
 
-- **Each entry can be checked.** Fetch the header of the block from the block store
-  (verified against the trust anchor), then the transaction, and confirm that `A` occurs in
-  it with the claimed role. A `TOPIC`, `EMITTER` or log `WORD` role needs the receipt.
+- **Most entries can be checked.** Fetch the header of the block from the block store
+  (verified against the trust anchor), then the evidence for the role:
+  - `FROM`, `TO` (call), input `WORD`, `AUTH`: the transaction (sender and authorities by
+    signature recovery).
+  - `TO` (creation), `EMITTER`, `TOPIC`, log `WORD`: the receipt.
+  - `BLOCK` (slot 0): the header itself (beneficiary) or the body (withdrawals, uncles),
+    checked against the header's roots.
+  - `TRACE`: cannot be checked from the block. Internal calls are not recorded in the
+    transaction or the receipt; checking one needs re-execution with the state, or an
+    execution proof. A client trusts the importer for `TRACE` entries, or compares
+    importers.
 - **Checking one transaction is cheap only if the block store supports it.** Today's block
   store, like devp2p, delivers only whole bodies (164 KB on average at the tip), and the
   client recomputes `transactionsRoot` from all of them. To read one transaction, the block
@@ -363,12 +403,15 @@ Oldest first is the same in the opposite order.
   - *Attribution.* A signed bucket that lacks an appearance the chain shows is permanent
     evidence against its owner.
   - *Independent importers.* If several parties build the index under their own keys, a
-    client reads the same bucket `k` of the same slice from each of them and compares the
-    bucket payloads (or their keccak256). If they agree, the list is complete unless all
-    of them omit the same entries. Comparing only `buckets_root` from the `SliceRecord`s is
-    not enough: a bucket carries no proof against that root, so a dishonest importer could
-    copy an honest root and serve a different bucket. This costs one more bucket per slice
-    and importer, and it requires the detection rules above to be followed exactly.
+    client first compares their `SliceRecord`s for the slice. They must match in
+    `bucket_count`, `roles`, `addresses`, `appearances` and `buckets_root`. Importers that detect different roles (one has
+    traces, one has not) are not comparable. If the descriptors match, the client reads
+    the same bucket `k` from each importer and compares the bucket payloads (or their
+    keccak256). If they agree, the list is complete unless all of them omit the same
+    entries. Comparing only `buckets_root` is not enough: a bucket carries no proof against
+    that root, so a dishonest importer could copy an honest root and serve a different
+    bucket. This costs one more descriptor and bucket per slice and importer, and it
+    requires the detection rules and canonical encodings above to be followed exactly.
   - Real proofs need an index committed by the protocol itself, or zero-knowledge proofs
     that a slice was built correctly from the blocks. Both are out of scope.
 
