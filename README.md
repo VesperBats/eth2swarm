@@ -11,6 +11,9 @@ Importer of Ethereum blocks into Ethereum Swarm.
   verify any block from a single trust anchor — see
   [docs/soc-block-store.md](docs/soc-block-store.md) (`import`, `get`, `verify-epoch`,
   `header-stats`).
+- Address → transaction index (design, not implemented): a mobile-friendly index on Swarm
+  from an address to the transactions it appears in — see
+  [docs/address-index.md](docs/address-index.md).
 - `ethswarm serve` — local web UI to inspect SOCs, blocks, epochs and references on the
   Swarm nodes; see [docs/inspector.md](docs/inspector.md).
 
