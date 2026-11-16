@@ -1,1 +1,5 @@
 /target
+
+# Claude Code: per-machine settings and session worktrees
+/.claude/settings.local.json
+/.claude/worktrees/
