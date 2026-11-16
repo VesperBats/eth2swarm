@@ -52,18 +52,55 @@ miner) and `txIndex + 1` for an appearance in a transaction.
 | `0x01` | `FROM` | sender of the transaction |
 | `0x02` | `TO` | recipient, or the contract the transaction created |
 | `0x04` | `EMITTER` | address of a log the transaction emitted |
-| `0x08` | `TOPIC` | address-shaped indexed topic of a log (ERC-20/721/1155 `from`/`to`, …) |
+| `0x08` | `TOPIC` | address in an indexed log topic (ERC-20/721/1155 `from`/`to`, …) |
 | `0x10` | `WORD` | address-shaped 32-byte word in the input data or in log data |
-| `0x20` | `TRACE` | from/to of an internal call or value transfer (requires traces) |
-| `0x40` | `BLOCK` | block-level: fee recipient, withdrawal recipient, uncle miner |
-| `0x80` | — | reserved, must be 0 |
+| `0x20` | `TRACE` | address in an internal call (requires traces) |
+| `0x40` | `BLOCK` | block-level: fee recipient, uncle miner, withdrawal recipient |
+| `0x80` | `AUTH` | authority of an EIP-7702 authorization |
 
-*Address-shaped* means 12 zero bytes followed by 20 bytes whose numeric value is at least
-2^128. This approximates TrueBlocks' heuristic: it skips small integers, but also vanity
-addresses with four or more leading zero bytes.
+### Detection rules
 
-A wallet that only wants transfers it took part in filters on `FROM | TO | TOPIC | TRACE
-| BLOCK`. `WORD` keeps the index close to TrueBlocks' coverage and gives spam filters
+Independent importers must produce identical slices (see *Verification*), so these rules
+are normative.
+
+- *Address-shaped*: a 32-byte word whose first 12 bytes are zero and whose last 20 bytes,
+  read as a number, are at least 2^128. This approximates TrueBlocks' heuristic: it skips
+  small integers, but also vanity addresses with four or more leading zero bytes.
+- **The zero address is never indexed.**
+- `FROM`: the transaction's sender. `TO`: its `to`, or the `contractAddress` of its receipt
+  for a contract creation. Failed transactions keep `FROM`, `TO` and their input `WORD`s;
+  they have no logs.
+- `EMITTER`: the `address` of every log of the transaction.
+- `TOPIC`, known events: for a log whose `topic0` is the keccak256 of one of the signatures
+  below, the listed topics are addresses, taken whatever their value (so vanity addresses,
+  Permit2 or Seaport are not lost):
+
+  | Event signature | Address topics |
+  |---|---|
+  | `Transfer(address,address,uint256)` (ERC-20 and ERC-721) | 1, 2 |
+  | `Approval(address,address,uint256)` | 1, 2 |
+  | `ApprovalForAll(address,address,bool)` | 1, 2 |
+  | `TransferSingle(address,address,address,uint256,uint256)` | 1, 2, 3 |
+  | `TransferBatch(address,address,address,uint256[],uint256[])` | 1, 2, 3 |
+  | `Deposit(address,uint256)`, `Withdrawal(address,uint256)` (WETH) | 1 |
+
+  A listed topic whose first 12 bytes are not zero is not an address and is skipped.
+- `TOPIC`, everything else: every address-shaped topic at index 1–3 that the known-event
+  rule did not classify. `topic0` is never scanned.
+- `WORD`: the address-shaped words of the input data of a call at byte offsets `4 + 32·k`
+  (after the selector), and of every log's data at offsets `32·k`. Contract-creation init
+  code is not scanned. The code address of an EIP-7702 authorization is a `WORD` as well.
+- `AUTH`: the authority of every entry in the authorization list of a type-4 transaction,
+  recovered from the entry's signature. Every recoverable entry counts, whether the
+  authorization took effect or not (deciding that needs state).
+- `BLOCK` (slot 0): the header's beneficiary, the beneficiary of every uncle, and the
+  address of every withdrawal.
+- `TRACE`: from and to of every internal call frame, created contracts and self-destruct
+  beneficiaries, from a call tracer. Only importers with a tracing source set it; the
+  slice's `roles` byte says which roles were detected.
+
+A wallet that only wants transfers it took part in filters on `FROM | TO | TOPIC | TRACE |
+BLOCK | AUTH`. `WORD` keeps the index close to TrueBlocks' coverage and gives spam filters
 something to work with; it is cheap: 1–10 % of all appearances, measured.
 
 The appearances of one address at one (block, slot) are merged into one entry whose role
@@ -127,6 +164,12 @@ publishes the head (below) with `N`. A lower level `L` gets a slice for one unit
 `2^(L+1)`. Over its life a block is uploaded about 9 times: in about half of levels 0–15,
 and once at level 16.
 
+**Initial import (backfill).** Starting at `N0` complete units, the importer writes only
+what a cover can still reference: the top-level slices `(L_max, j)` for `j < N0 >> L_max`
+and the lower slices of the cover of `[0, N0)`. Every other lower slice of the past would be
+dead on arrival and is skipped. Then it publishes head update 0 with `N0`, and from then on
+one slice and one head update per unit.
+
 **Incremental sync.** A client that has read everything up to unit `M` takes the cover of
 `[0, N)` and reads only its slices that end after unit `M`. A slice that starts before `M`
 is read whole and the entries before unit `M` are dropped: since a bucket is about one
@@ -137,8 +180,16 @@ it replaces.
 **Lifetime.** A lower slice `(L, i)` is in the cover of the head while `N` is in
 `[(i + 1)·2^L, (i + 2)·2^L)`, i.e. for `2^L·U` blocks, plus a grace period for clients that
 still hold an older head. Top-level slices are permanent. Only the slices in the current
-cover must stay, and together they hold one copy of the history. The importer stamps the
-lower levels with a separate, short-lived postage batch and lets them expire.
+cover must stay, and together they hold one copy of the history.
+
+The lower levels are not small, though. On average the live lower slices hold half a
+top-level slice of data (2^15 units), just before a top slice is written almost a whole one,
+and postage stamps cannot be freed chunk by chunk: a batch pays for every chunk written into
+it until the batch expires. The importer therefore stamps the lower levels separately from
+the permanent top level, grouped by lifetime (level `L` lives `2^L·U` blocks; level 15 about
+291 days) so that each batch expires soon after its slices are dead. A mutable batch does
+not help here: it evicts the oldest stamps first, and the oldest live lower slices are the
+long-lived ones. See *Full history and cost* for the size.
 
 The cap is what keeps the history from being rewritten: without it, the whole history
 would be merged into one new top slice every time `N` reaches a power of two, briefly
@@ -157,8 +208,16 @@ string; `<chain>` is the decimal chain ID; all numbers in identifiers are decima
 | Spill file | Swarm file (`/bytes`), referenced from a bucket | spill pages |
 
 The head uses Bee's sequence-feed identifier scheme, so Bee's feed lookup can find the
-latest update. Update `n` announces `N = n + 1` complete units: a client that knows the
-latest finalized block from anywhere else can compute `n` directly and never searches.
+latest update. Every unit gets exactly one head update, also while the importer catches up
+after downtime, so `N − n` is constant (`N0`, from update 0).
+
+A client must not probe for an update that cannot exist yet (a miss is a timeout). It
+caches the last head it read and asks for update `n + 1` no earlier than
+`last_block_timestamp + 2·U·12 s` (one more unit, plus the finality delay). After a longer
+pause it computes the update to read from the elapsed time, 12 seconds per block, and
+corrects with the `units` field of what it gets. A miss then only happens when the importer
+is behind; it costs one timeout in the background while the client keeps showing what it
+has.
 
 Unlike the block store, the identifiers are **not** namespaced by a trust anchor: the index
 grows incrementally. Each slice binds to the chain through the hash of its last block.
@@ -190,7 +249,8 @@ per byte, low group first, high bit set on all but the last byte).
 zero-padded to the next power of two). It is there for reproducibility: two independent
 importers can compare slices by this root alone.
 
-The importer chooses `B = ⌈(sum of address-record bytes) / T⌉`.
+The importer chooses `B = ⌈(sum of address-record bytes) / T⌉`, computed with the 256-byte
+spill threshold only, before the overflow spills described under `BucketRecord`.
 
 ### `BucketRecord` (kind 5)
 
@@ -229,10 +289,11 @@ two of them can share 64 bits of their hash. The importer keeps records with the
 fingerprint next to each other; a client reads every record with its fingerprint and the
 verification step (below) drops entries that are not about its address.
 
-A bucket whose payload exceeds 4096 bytes is stored as a Swarm file whose root chunk is the
-CAC wrapped by the SOC (the way Bee's feeds wrap content). The identifier stays the same;
-the client reads it with the usual file joiner, at the cost of a second round trip. At
-`T = 2816` that happened to 0–0.03 % of buckets, depending on slice length (measured).
+A bucket must fit one chunk (4096 bytes of payload). If it does not, the importer spills
+more records: it spills the address with the largest inline entries (ties: the smaller
+fingerprint) until the bucket fits. At `T = 2816` that is needed for 0–0.03 % of buckets,
+depending on slice length (measured), and one or two spills suffice. So every bucket is a
+plain single-chunk SOC, which is also what `src/swarm/soc.rs` accepts.
 
 ### Spill file
 
@@ -250,7 +311,7 @@ The client learns the number of pages from the file's span (`⌈span / 4096⌉`)
 last page for the newest entries, and binary-searches pages by `first_block` for a block
 range. `u32` block numbers last until block 2^32, more than 1600 years of 12-second slots.
 
-### `HeadRecord` (kind 6), 53 bytes
+### `HeadRecord` (kind 6), 61 bytes
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -258,6 +319,7 @@ range. `u32` block numbers last until block 2^32, more than 1600 years of 12-sec
 | `units` | u64 | `N`, the number of complete units |
 | `last_block` | u64 | `N·U − 1` |
 | `last_block_hash` | 32 bytes | hash of `last_block` |
+| `last_block_timestamp` | u64 | timestamp of `last_block` (seconds) |
 
 ## Client lookup
 
@@ -266,9 +328,12 @@ Newest first, for address `A`:
 1. Read the head (cached index + 1, or Bee's feed lookup) → `N`.
 2. Compute the cover of `[0, N)`, or only its slices after unit `M` for an incremental sync.
 3. For each slice, newest first: read the `SliceRecord` (immutable, cached forever), compute
-   `k` and `fp`, read bucket `k`, binary-search `fp`.
-4. For a spilled address, read the spill file's root chunk and its last page, then earlier
-   pages as the user scrolls.
+   `k` and `fp`, read bucket `k`, and scan it for `fp` (records have variable length, so the
+   2.8 KB are read front to back).
+4. For a spilled address, walk the spill file's tree from its root chunk to the last page,
+   then earlier pages as the user scrolls. Each tree level is one chunk and one round
+   trip: root and page for up to 128 pages, one intermediate level more up to 16,384 pages
+   (≈ 16 million entries). A binary search over pages costs such a path per probe.
 5. Stop when the screen is full; continue with older slices on demand.
 
 Descriptors of all slices in the cover can be fetched in parallel, then all buckets in
@@ -298,19 +363,24 @@ Oldest first is the same in the opposite order.
   - *Attribution.* A signed bucket that lacks an appearance the chain shows is permanent
     evidence against its owner.
   - *Independent importers.* If several parties build the index under their own keys, a
-    client fetches each one's `SliceRecord` (111 bytes) and compares `buckets_root`. If
-    they agree, the list is complete unless all of them omit the same entries. This is
-    cheap on the client and is the practical answer; it requires the build rules,
-    including the role detection, to be fully deterministic.
+    client reads the same bucket `k` of the same slice from each of them and compares the
+    bucket payloads (or their keccak256). If they agree, the list is complete unless all
+    of them omit the same entries. Comparing only `buckets_root` from the `SliceRecord`s is
+    not enough: a bucket carries no proof against that root, so a dishonest importer could
+    copy an honest root and serve a different bucket. This costs one more bucket per slice
+    and importer, and it requires the detection rules above to be followed exactly.
   - Real proofs need an index committed by the protocol itself, or zero-knowledge proofs
     that a slice was built correctly from the blocks. Both are out of scope.
 
 ## Measurements
 
 Measured on 2026-11-16 against mainnet (the zbox geth node: full history, no traces, so no
-`TRACE` role) with throwaway scripts that encode the sampled appearances exactly as specified
-above. Bucket assignment used sha256 instead of keccak256, which gives the same size
-distribution for a uniform hash. A later `ethswarm addr-stats` subcommand built on the real
+`TRACE` role) with throwaway scripts that encode the sampled appearances in the record formats above.
+Three simplifications: the address-shaped test was applied to all topics (no known-event
+rule), `AUTH` and uncle beneficiaries were not detected, and an overflowing bucket was
+counted as a two-chunk file instead of spilling more records. Each changes the totals by a
+fraction of a percent. Bucket assignment used sha256 instead of keccak256, which gives the
+same size distribution for a uniform hash. A later `ethswarm addr-stats` subcommand built on the real
 encoder should replace the scripts and make the numbers reproducible.
 
 Sampled: 2,048 consecutive blocks at each of 1M, 4M, …, 22M; the 16,384 blocks from
@@ -362,9 +432,15 @@ leaves one overflow in 32,648 buckets.
 | Postage batch | depth 26: 55.7 M chunks effective, about 2 years of headroom |
 | Postage price on 2026-11-16 | 205,492 PLUR per chunk per Gnosis block (`lastPrice()` of the PostageStamp contract) |
 | Monthly cost of the depth-26 batch | 2^26 × 205,492 × 518,400 blocks ≈ 715 BZZ ≈ $48 at $0.067 per BZZ |
+| Lower levels, live | data of 2^15 units on average (≈ 2.1 M blocks × 1,505 × 3.0 per 1000 ≈ 10 M chunks), up to twice that just before a top slice is written |
+| Lower levels, written | each block about 8 times: ≈ 8.5 M chunks per month |
+| Lower levels, postage | stamps cover written chunks until their batch expires; with batches grouped by lifetime, about 20–30 M slots at any time, one more depth-25 batch: ≈ 357 BZZ ≈ $24 per month, up to twice that if lifetimes are matched poorly |
+| **Total** | **≈ $72–96 per month** at today's prices |
 
-The short-lived lower levels need a small extra batch (a few percent). Postage prices and the
-BZZ exchange rate move; the chunk counts are what to recompute against.
+Postage prices and the BZZ exchange rate move; the chunk counts are what to recompute
+against. A lower `L_max` makes the lower levels cheaper (they hold up to one top slice) and
+cold lookups more expensive (one bucket per top slice): `L_max = 14` would cut the lower
+levels to a quarter and need 25 top slices today instead of 6.
 
 ### Client
 
@@ -372,7 +448,7 @@ BZZ exchange rate move; the chunk counts are what to recompute against.
 |---|---|
 | Cold full-history lookup, typical address (13 slices today, at most 22 until late 2027) | 13–22 buckets of ≈ 2.8 KB + as many 111-byte descriptors: ≈ 40–65 KB |
 | Incremental sync | 1–3 buckets: ≈ 3–9 KB |
-| Spilled address | per slice + spill-file root chunk and its last page (≈ 1,000 newest entries) |
+| Spilled address | per slice, the path from the spill file's root to its last page (2–3 chunks) for the ≈ 1,000 newest entries |
 | Storage on the phone | the results for its own addresses; descriptors are cached forever |
 
 ### Verification data (block store, per block)
