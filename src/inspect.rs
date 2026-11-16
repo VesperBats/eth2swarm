@@ -664,8 +664,7 @@ async fn epoch_inspect(st: &AppState, q: EpochQuery) -> Result<Value> {
                         "timestamp": h.timestamp,
                         "gasUsed": h.gas_used,
                         "beneficiary": h.beneficiary,
-                        "emptyBody": h.transactions_root == alloy::consensus::EMPTY_ROOT_HASH
-                            && h.ommers_hash == alloy::consensus::EMPTY_OMMER_ROOT_HASH,
+                        "bodyContents": body_contents(h),
                     }))
                     .collect::<Vec<_>>()
             );
@@ -680,6 +679,23 @@ async fn epoch_inspect(st: &AppState, q: EpochQuery) -> Result<Value> {
     }
     out["steps"] = json!(steps.0);
     Ok(out)
+}
+
+/// What a header says its body holds, from its roots alone (empty list = empty body).
+fn body_contents(h: &Header) -> Vec<&'static str> {
+    use alloy::consensus::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
+    let mut parts = Vec::new();
+    if h.transactions_root != EMPTY_ROOT_HASH {
+        parts.push("txs");
+    }
+    if h.ommers_hash != EMPTY_OMMER_ROOT_HASH {
+        parts.push("uncles");
+    }
+    // Post-Shanghai: a block with no transactions can still carry withdrawals.
+    if h.withdrawals_root.is_some_and(|r| r != EMPTY_ROOT_HASH) {
+        parts.push("withdrawals");
+    }
+    parts
 }
 
 // ---------------------------------------------------------------------------------------
@@ -745,4 +761,40 @@ async fn bytes_inspect(st: &AppState, q: BytesQuery) -> Result<Value> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::consensus::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
+
+    fn header() -> Header {
+        Header {
+            transactions_root: EMPTY_ROOT_HASH,
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn body_contents_from_roots() {
+        assert!(
+            body_contents(&header()).is_empty(),
+            "pre-Shanghai empty body"
+        );
+
+        let mut h = header();
+        h.withdrawals_root = Some(EMPTY_ROOT_HASH);
+        assert!(
+            body_contents(&h).is_empty(),
+            "post-Shanghai, no withdrawals"
+        );
+
+        h.withdrawals_root = Some(keccak256(b"withdrawals"));
+        assert_eq!(body_contents(&h), ["withdrawals"], "withdrawals only");
+
+        h.transactions_root = keccak256(b"txs");
+        h.ommers_hash = keccak256(b"uncles");
+        assert_eq!(body_contents(&h), ["txs", "uncles", "withdrawals"]);
+    }
 }

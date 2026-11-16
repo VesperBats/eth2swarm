@@ -52,7 +52,9 @@ td.k { color: var(--muted); white-space: nowrap; width: 1%; padding-right: 18px;
 .steps { padding: 0; margin: 0; }
 .mark.ok { color: var(--ok); } .mark.bad { color: var(--bad); } .mark.info { color: var(--info); }
 .err { color: var(--bad); font-family: var(--mono); white-space: pre-wrap; }
-a.ref { color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
+a.ref, button.ref { color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
+button.ref { background: none; border: 0; padding: 0; font: inherit; font-weight: inherit; }
+a:focus-visible, button:focus-visible, .copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .copy { cursor: copy; }
 .copy:hover { background: var(--code); }
 pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height: 260px; overflow: auto;
@@ -76,7 +78,7 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
     <label>Trust anchor (blank = owner's published anchor)<input id="anchor" placeholder="0x… pinned anchor" spellcheck="false"></label>
   </div>
   <nav>
-    <a data-tab="block">Block</a><a data-tab="epoch">Epoch</a><a data-tab="soc">SOC</a><a data-tab="bytes">Bytes</a>
+    <a href="#block" data-tab="block">Block</a><a href="#epoch" data-tab="epoch">Epoch</a><a href="#soc" data-tab="soc">SOC</a><a href="#bytes" data-tab="bytes">Bytes</a>
   </nav>
 </header>
 <main>
@@ -107,9 +109,9 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
       <button>Fetch &amp; decode</button>
     </form>
     <div class="muted" style="margin:-8px 0 14px;font-size:12px">Templates:
-      <a class="ref" data-tpl="hdr">hdr:&lt;n&gt;</a> ·
-      <a class="ref" data-tpl="epoch">epoch:&lt;k&gt;</a> ·
-      <a class="ref" data-tpl="accumulator">accumulator</a>
+      <button type="button" class="ref" data-tpl="hdr">hdr:&lt;n&gt;</button> ·
+      <button type="button" class="ref" data-tpl="epoch">epoch:&lt;k&gt;</button> ·
+      <button type="button" class="ref" data-tpl="accumulator">accumulator</button>
       — identifier = keccak256(string), address = keccak256(identifier ‖ owner)</div>
     <div id="out-soc"></div>
   </section>
@@ -128,8 +130,9 @@ const store = { get(k) { try { return localStorage.getItem('swi.' + k); } catch 
                 set(k, v) { try { localStorage.setItem('swi.' + k, v); } catch {} } };
 const settings = ['node', 'owner', 'chain', 'anchor'];
 
-function hash(v) { return v == null ? '<span class="muted">—</span>' : `<span class="mono copy" title="click to copy">${esc(v)}</span>`; }
-function refLink(v, tab) { return v == null ? hash(v) : `<a class="ref mono" data-goto="${tab}" data-val="${esc(v)}">${esc(v)}</a>`; }
+function hash(v) { return v == null ? '<span class="muted">—</span>' : `<span class="mono copy" tabindex="0" role="button" title="click or press Enter to copy">${esc(v)}</span>`; }
+function refLink(v, tab) { return v == null ? hash(v) : `<a class="ref mono" href="#${tab}/${esc(encodeURIComponent(v))}">${esc(v)}</a>`; }
+function blockLink(n, text) { return `<a class="ref" href="#block/${Number(n)}">${esc(text)}</a>`; }
 function kv(rows) {
   return '<table>' + rows.filter(r => r).map(([k, v]) => `<tr><td class="k">${esc(k)}</td><td class="v">${v}</td></tr>`).join('') + '</table>';
 }
@@ -159,7 +162,7 @@ function headerCard(h, blockHash, title = 'Header') {
   const ts = h.timestamp ? new Date(h.timestamp * 1000).toISOString().replace('.000', '') : '';
   return card(`${title} #${h.number}`, kv([
     ['block hash', hash(blockHash)],
-    ['parent hash', h.number > 0 ? `<a class="ref mono" data-block="${h.number - 1}">${esc(h.parentHash)}</a>` : hash(h.parentHash)],
+    ['parent hash', h.number > 0 ? `<a class="ref mono" href="#block/${Number(h.number) - 1}">${esc(h.parentHash)}</a>` : hash(h.parentHash)],
     ['timestamp', `${h.timestamp} <span class="muted">(${ts})</span>`],
     ['beneficiary', hash(h.beneficiary)],
     ['state root', hash(h.stateRoot)],
@@ -184,7 +187,7 @@ function bodyCard(b) {
   let html = '';
   if (b.transactions.length) {
     html += `<table><tr><th>#</th><th>hash</th><th>type</th><th>from → to</th><th>value (wei)</th><th>nonce</th><th>gas</th><th>input</th></tr>` +
-      b.transactions.map((t, i) => `<tr><td>${i}</td><td class="mono copy">${esc(t.hash)}</td><td>${t.type}</td>
+      b.transactions.map((t, i) => `<tr><td>${i}</td><td class="mono copy" tabindex="0" role="button" title="click or press Enter to copy">${esc(t.hash)}</td><td>${t.type}</td>
         <td class="mono">${esc(t.from ?? '?')}<br>→ ${esc(t.to ?? '(contract creation)')}</td>
         <td class="mono">${esc(t.value)}</td><td>${t.nonce}</td><td>${t.gasLimit}</td><td>${t.inputLength} B</td></tr>`).join('') + '</table>';
   } else html += '<div class="muted">No transactions.</div>';
@@ -213,7 +216,7 @@ function recordCard(r, verified) {
     ]));
   if (r.kind === 'anchor') return cardB('Record: published anchor', badge, kv([
       ['geometry', `${r.geometry.numEpochs} epochs × ${r.geometry.epochSize} = ${r.geometry.blocks} blocks`],
-      ['anchor', hash(r.anchor) + ' <a class="ref" data-pin="' + esc(r.anchor) + '">pin as trust anchor</a>'],
+      ['anchor', hash(r.anchor) + ' <button type="button" class="ref" data-pin="' + esc(r.anchor) + '">pin as trust anchor</button>'],
     ]));
   return card('Record', '<span class="muted">Payload is not an eth2swarm record.</span>');
 }
@@ -226,9 +229,8 @@ function socCard(soc) {
   ]));
 }
 
-function params(extra) {
-  const p = new URLSearchParams({ node: $('node').value, ...extra });
-  return p;
+function params(extra, node) {
+  return new URLSearchParams({ node, ...extra });
 }
 async function api(path, p) {
   const r = await fetch(`/api/${path}?${p}`);
@@ -242,12 +244,16 @@ function common() {
   return o;
 }
 function busy(out) { $(out).innerHTML = '<div class="spinner">fetching…</div>'; }
+// Which node a result came from: the node each lookup captured when it started, so
+// switching the node afterwards cannot pass an old result off as the new node's.
+function source(node) { return `<div class="muted" style="margin-bottom:8px">from node ${esc(node)}</div>`; }
 
 const runners = {
-  async block() {
+  async block(stale, node) {
     const n = $('blockN').value; setHash('block', n); busy('out-block');
-    const d = await api('block', params({ ...common(), n }));
-    let html = '';
+    const d = await api('block', params({ ...common(), n }, node));
+    if (stale()) return;
+    let html = source(node);
     if (d.verified !== undefined) html += verdict(d.verified, d.verified ? `Block #${n} verified` : `Block #${n} NOT verified`, d.anchorPinned !== false);
     if (d.error) html += errCard(d.error);
     html += steps(d.steps) + socCard(d.soc);
@@ -255,25 +261,27 @@ const runners = {
     html += bodyCard(d.body);
     $('out-block').innerHTML = html;
   },
-  async epoch() {
+  async epoch(stale, node) {
     const k = $('epochK').value; setHash('epoch', k); busy('out-epoch');
-    const d = await api('epoch', params({ ...common(), k }));
-    let html = '';
+    const d = await api('epoch', params({ ...common(), k }, node));
+    if (stale()) return;
+    let html = source(node);
     if (d.verified !== undefined) html += verdict(d.verified, d.verified ? `Epoch ${k} verified (${d.headers.length} headers)` : `Epoch ${k} NOT verified`, d.anchorPinned !== false);
     if (d.error) html += errCard(d.error);
     html += steps(d.steps) + socCard(d.soc) + recordCard(d.record, d.recordVerified);
     if (d.headers) html += card('Headers', '<table><tr><th>#</th><th>hash</th><th>timestamp</th><th>gas used</th><th>body</th></tr>' +
-      d.headers.map(h => `<tr><td><a class="ref" data-block="${h.number}">${h.number}</a></td><td class="mono copy">${esc(h.hash)}</td>
-        <td>${h.timestamp}</td><td>${h.gasUsed}</td><td>${h.emptyBody ? '<span class="muted">empty</span>' : 'txs/uncles'}</td></tr>`).join('') + '</table>');
+      d.headers.map(h => `<tr><td>${blockLink(h.number, h.number)}</td><td class="mono copy" tabindex="0" role="button" title="click or press Enter to copy">${esc(h.hash)}</td>
+        <td>${h.timestamp}</td><td>${h.gasUsed}</td><td>${h.bodyContents.length ? esc(h.bodyContents.join(', ')) : '<span class="muted">empty</span>'}</td></tr>`).join('') + '</table>');
     $('out-epoch').innerHTML = html;
   },
-  async soc() {
+  async soc(stale, node) {
     const mode = document.querySelector('input[name=socmode]:checked').value;
     const v = $('socInput').value.trim(); setHash('soc', mode + ':' + v); busy('out-soc');
-    const p = mode === 'addr' ? params({ addr: v, owner: $('owner').value.trim() })
-            : params({ owner: $('owner').value.trim(), [mode]: v });
+    const p = mode === 'addr' ? params({ addr: v, owner: $('owner').value.trim() }, node)
+            : params({ owner: $('owner').value.trim(), [mode]: v }, node);
     const d = await api('soc', p);
-    let html = '';
+    if (stale()) return;
+    let html = source(node);
     if (d.derivation && d.derivation.ownerError) html += errCard(d.derivation.ownerError);
     if (d.derivation && d.derivation.address) html += card('Address derivation', kv([
       d.derivation.identifierString && ['identifier string', esc(d.derivation.identifierString)],
@@ -295,10 +303,11 @@ const runners = {
     html += recordCard(d.record, d.recordVerified);
     $('out-soc').innerHTML = html;
   },
-  async bytes() {
+  async bytes(stale, node) {
     const ref = $('bytesRef').value.trim(); setHash('bytes', ref); busy('out-bytes');
-    const d = await api('bytes', params({ ref }));
-    let html = '';
+    const d = await api('bytes', params({ ref }, node));
+    if (stale()) return;
+    let html = source(node);
     if (d.error) html += errCard(d.error);
     if (d.length !== undefined) html += card('Reference', kv([
       ['size', `${d.length} bytes (${d.chunks} data chunk${d.chunks > 1 ? 's' : ''})`],
@@ -306,7 +315,7 @@ const runners = {
     ]), d.reference);
     if (d.body) html += bodyCard(d.body);
     if (d.headers) html += card(`Headers (${d.headers.length})`, '<table><tr><th>#</th><th>hash</th><th>timestamp</th></tr>' +
-      d.headers.map(h => `<tr><td><a class="ref" data-block="${h.number}">${h.number}</a></td><td class="mono copy">${esc(h.hash)}</td><td>${h.timestamp}</td></tr>`).join('') + '</table>');
+      d.headers.map(h => `<tr><td>${blockLink(h.number, h.number)}</td><td class="mono copy" tabindex="0" role="button" title="click or press Enter to copy">${esc(h.hash)}</td><td>${h.timestamp}</td></tr>`).join('') + '</table>');
     if (d.text) html += card('Text' + (d.textTruncated ? ' (first 64 KiB)' : ''), `<pre class="hex">${esc(d.text)}</pre>`);
     if (d.hexPreview) html += card('Hex' + (d.truncated ? ' (first 2048 bytes)' : ''), `<pre class="hex">${esc(d.hexPreview)}</pre>`);
     $('out-bytes').innerHTML = html;
@@ -317,20 +326,42 @@ function show(tab) {
   document.querySelectorAll('nav a').forEach(a => a.classList.toggle('active', a.dataset.tab === tab));
   document.querySelectorAll('main > section').forEach(s => s.classList.toggle('hidden', s.id !== 'tab-' + tab));
 }
+// The last lookup of each tab, so a tab link returns to it instead of to an empty view.
+const lastHash = {};
+// True while a lookup restored from the URL starts: it may only normalise the fragment.
+let fromUrl = false;
 function setHash(tab, val) {
-  // pushState fires no event, so a lookup doesn't re-trigger itself; Back/Forward and edits
-  // of the URL fragment fire popstate.
-  history.pushState(null, '', `#${tab}/${encodeURIComponent(val)}`);
+  const h = `#${tab}/${encodeURIComponent(val)}`;
+  lastHash[tab] = h;
+  if (location.hash === h) return;
+  // A lookup restored from the URL (Back/Forward, a pasted or typed link) rewrites its own
+  // entry into the canonical form; pushing would trap Back on that entry and drop the
+  // Forward ones. A new lookup (form, ◀ ▶) adds an entry.
+  if (fromUrl) history.replaceState(null, '', h); else history.pushState(null, '', h);
 }
+const generation = {};
 async function run(tab) {
   show(tab);
-  try { await runners[tab](); }
-  catch (e) { $('out-' + tab).innerHTML = errCard(String(e)); }
+  const id = generation[tab] = (generation[tab] || 0) + 1;
+  const stale = () => generation[tab] !== id;
+  const node = $('node').value;
+  try { await runners[tab](stale, node); }
+  catch (e) { if (!stale()) $('out-' + tab).innerHTML = errCard(String(e)); }
 }
 function fromHash() {
-  const [tab, raw] = location.hash.slice(1).split('/');
+  const slash = location.hash.indexOf('/');
+  const tab = location.hash.slice(1, slash < 0 ? undefined : slash);
+  const raw = slash < 0 ? '' : location.hash.slice(slash + 1);
   if (!runners[tab]) { show('block'); return; }
-  const val = decodeURIComponent(raw || '');
+  if (slash < 0) {
+    // A bare tab link: switch tabs without touching the tab's input or output, and put
+    // its last lookup back into the URL so a reload or a shared link reproduces it.
+    show(tab);
+    if (lastHash[tab]) history.replaceState(null, '', lastHash[tab]);
+    return;
+  }
+  let val;
+  try { val = decodeURIComponent(raw); } catch { val = raw; }
   if (tab === 'block') $('blockN').value = val || 0;
   if (tab === 'epoch') $('epochK').value = val || 0;
   if (tab === 'bytes') $('bytesRef').value = val;
@@ -342,7 +373,9 @@ function fromHash() {
       $('socInput').value = val.slice(i + 1);
     } else { $('socInput').value = val; }
   }
-  if (val) run(tab); else show(tab);
+  if (!val) { show(tab); return; }
+  fromUrl = true;
+  try { run(tab); } finally { fromUrl = false; }
 }
 function socMode() {
   const mode = document.querySelector('input[name=socmode]:checked').value;
@@ -350,11 +383,8 @@ function socMode() {
 }
 
 document.addEventListener('click', (e) => {
-  const t = e.target.closest('[data-tab],[data-goto],[data-block],[data-pin],[data-tpl],.copy');
+  const t = e.target.closest('[data-pin],[data-tpl],.copy');
   if (!t) return;
-  if (t.dataset.tab) { show(t.dataset.tab); return; }
-  if (t.dataset.goto === 'bytes') { $('bytesRef').value = t.dataset.val; run('bytes'); return; }
-  if (t.dataset.block !== undefined) { $('blockN').value = t.dataset.block; run('block'); return; }
   if (t.dataset.pin) { $('anchor').value = t.dataset.pin; $('anchor').dispatchEvent(new Event('change')); return; }
   if (t.dataset.tpl) {
     const c = $('chain').value || 1, a = $('anchor').value.trim().toLowerCase() || '<anchor>';
@@ -364,11 +394,24 @@ document.addEventListener('click', (e) => {
   }
   if (t.classList.contains('copy')) { navigator.clipboard?.writeText(t.textContent.trim()); }
 });
+document.addEventListener('keydown', (e) => {
+  const t = e.target.closest?.('.copy');
+  if (t && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); navigator.clipboard?.writeText(t.textContent.trim()); }
+});
 document.querySelectorAll('form[data-run]').forEach(f => f.addEventListener('submit', (e) => { e.preventDefault(); run(f.dataset.run); }));
 document.querySelectorAll('input[name=socmode]').forEach(r => r.addEventListener('change', socMode));
 $('prev').onclick = () => { $('blockN').value = Math.max(0, +$('blockN').value - 1); run('block'); };
 $('next').onclick = () => { $('blockN').value = +$('blockN').value + 1; run('block'); };
-window.addEventListener('popstate', fromHash);
+// hashchange covers link clicks, edits of the URL fragment and Back/Forward between
+// lookups; pushState (setHash) fires nothing, so a lookup never re-triggers itself.
+window.addEventListener('hashchange', fromHash);
+// A click on a link to the fragment already shown changes nothing and fires no event:
+// re-run it.
+document.addEventListener('click', (e) => {
+  if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  const a = e.target.closest('a[href^="#"]');
+  if (a && a.getAttribute('href') === location.hash) { e.preventDefault(); fromHash(); }
+});
 
 (async () => {
   const cfg = await (await fetch('/api/config')).json();
