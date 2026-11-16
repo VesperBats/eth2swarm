@@ -33,11 +33,12 @@ export ETH2SWARM_RPC=${ETH2SWARM_RPC:-http://zbox.tail2ab6c8.ts.net:8561}
 export RUST_LOG=${RUST_LOG:-warn}
 cargo build -q --locked
 BIN=target/debug/ethswarm
-CHAIN_ID=$($BIN tip | awk '/Chain ID:/ {print $3}')
 LAST=$((EPOCH_SIZE * EPOCHS - 1))
 
 # A freshly started Anvil chain may not have the blocks yet (1 block per second). A
-# failed `tip` call is retried; output that has no numeric tip fails at once.
+# failed `tip` call is retried; output that has no numeric tip fails at once. This loop
+# is the first RPC access, so the chain ID is taken from its last output, not from a
+# separate, unretried call.
 TIP=-1
 for ((i = 0; i < 600; i++)); do
   if TIP_OUT=$($BIN tip 2>&1); then
@@ -49,6 +50,8 @@ for ((i = 0; i < 600; i++)); do
   sleep 1
 done
 [ "$TIP" -ge "$LAST" ] || { echo "FAIL: chain tip #$TIP never reached #$LAST"; exit 1; }
+CHAIN_ID=$(printf '%s\n' "$TIP_OUT" | awk '/Chain ID:/ {print $3}')
+[[ "$CHAIN_ID" =~ ^[0-9]+$ ]] || { echo "FAIL: no chain ID in: $TIP_OUT"; exit 1; }
 
 echo "== import $EPOCHS epochs × $EPOCH_SIZE blocks via $UPLOAD_BEE"
 OUT=$($BIN --bee "$UPLOAD_BEE" import --key "$KEY" --epoch-size "$EPOCH_SIZE" --epochs "$EPOCHS")
