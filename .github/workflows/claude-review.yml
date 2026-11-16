@@ -3,8 +3,22 @@
 # Adopted from biafra23/myotis (.github/workflows/claude-review.yml at commit
 # c99c1df1) on 2026-11-16, without the parts about that repository's build gate
 # (wait-for-claude-review.yml, which holds its artifact builds until the review
-# has finished). At adoption only comments differed from the original. The
-# dates and #numbers in the comments below are incidents in that repository.
+# has finished). The dates and #numbers in the comments below are incidents
+# in that repository.
+#
+# Deliberate differences from the original beyond comments (eth2swarm#3
+# review; candidates to port back to Myotis):
+#   - `--permission-mode default` on every attempt. Since claude-code-action
+#     #2004 (2026-11-12) the action runs Claude in auto mode by default, where
+#     `--allowedTools` only pre-approves the listed tools and any other call
+#     runs if a safety review passes it ("Auto mode is a review, not a
+#     boundary", its docs/security.md). The reviewer holds secrets and reads
+#     PR-controlled text, so its allowlist must be a strict list.
+#   - "Save the diff of the reviewed commit" in each job, and the prompt's
+#     CHECKOUT note pointing at it and pinning every inline comment's
+#     commit_id to the reviewed head. Without them the reviewer read
+#     `gh pr diff` (the PR's current diff) and its inline comments attached
+#     to the current head, while its files were the event's head.
 #
 # Setup (one-time, repo admin):
 #   1. Nothing for GitHub itself: the action posts with this run's own
@@ -223,7 +237,7 @@ jobs:
       # The PR's files, for reading only, outside the working directory and
       # without any file Claude Code would take instructions or config from
       # (see "Where the reviewer's instructions come from" above). The
-      # reviewer sees the PR's changes to those files in `gh pr diff`. Keep
+      # reviewer sees the PR's changes to those files in the saved diff. Keep
       # the three jobs' copies of these two steps identical. The prompt names
       # this path as the review job resolved it, and the fallback and api
       # jobs pass their own to --add-dir: the same while all three run on
@@ -244,6 +258,24 @@ jobs:
           find "$RUNNER_TEMP/pr-head" -type l -delete
           find "$RUNNER_TEMP/pr-head" \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude \
             -o -name .mcp.json -o -name .claude.json \) -prune -exec rm -rf {} +
+      # The diff of exactly the commit under review (eth2swarm addition, see
+      # this file's header): `gh pr diff` is the PR's CURRENT diff, so a push
+      # during or before a review would pair the files above with newer hunks.
+      # The compare API's three-dot form diffs from the merge base, as a PR's
+      # diff does. Keep the three jobs' copies identical.
+      - name: Save the diff of the reviewed commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Unexpected base or head SHA: '$BASE_SHA' '$HEAD_SHA'"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/pr-diff"
+          gh api -H 'Accept: application/vnd.github.diff' \
+            "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/pr-diff/pr.diff"
+          echo "Saved $(wc -l < "$RUNNER_TEMP/pr-diff/pr.diff") diff lines for $BASE_SHA...$HEAD_SHA"
 
       # Both attempts send the identical prompt, so it lives in one file and is
       # assembled once here; the fallback job receives it through this job's
@@ -297,9 +329,15 @@ jobs:
             echo "- The PR's own files (head $HEAD_SHA) are in $RUNNER_TEMP/pr-head."
             echo "  Read the code under review there. Its CLAUDE.md, CLAUDE.local.md,"
             echo "  .claude/, .mcp.json and .claude.json files were removed: read the"
-            echo "  PR's changes to those in \`gh pr diff\`."
-            echo "- Inline comments take paths relative to the repository root, as"
-            echo "  \`gh pr diff\` shows them, never with the $RUNNER_TEMP/pr-head prefix."
+            echo "  PR's changes to those in the diff below."
+            echo "- The diff under review is $RUNNER_TEMP/pr-diff/pr.diff: the PR's changes"
+            echo "  up to head $HEAD_SHA, fixed when this review started. Read it, not"
+            echo "  \`gh pr diff\`, which shows the PR's current head and may already"
+            echo "  include later pushes."
+            echo "- Inline comments take paths relative to the repository root, as the"
+            echo "  diff shows them, never with the $RUNNER_TEMP/pr-head prefix, and pass"
+            echo "  commit_id $HEAD_SHA on every one, so each is anchored to the commit"
+            echo "  reviewed. Name that commit in the summary."
             echo 'CLAUDE_PROMPT_EOF'
           } >> "$GITHUB_OUTPUT"
 
@@ -355,6 +393,8 @@ jobs:
             --model fable
             --effort max
             --add-dir ${{ runner.temp }}/pr-head
+            --add-dir ${{ runner.temp }}/pr-diff
+            --permission-mode default
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       # What the attempt was refused, and how it ended. The action keeps the
@@ -511,7 +551,7 @@ jobs:
       # The PR's files, for reading only, outside the working directory and
       # without any file Claude Code would take instructions or config from
       # (see "Where the reviewer's instructions come from" above). The
-      # reviewer sees the PR's changes to those files in `gh pr diff`. Keep
+      # reviewer sees the PR's changes to those files in the saved diff. Keep
       # the three jobs' copies of these two steps identical. The prompt names
       # this path as the review job resolved it, and the fallback and api
       # jobs pass their own to --add-dir: the same while all three run on
@@ -532,6 +572,24 @@ jobs:
           find "$RUNNER_TEMP/pr-head" -type l -delete
           find "$RUNNER_TEMP/pr-head" \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude \
             -o -name .mcp.json -o -name .claude.json \) -prune -exec rm -rf {} +
+      # The diff of exactly the commit under review (eth2swarm addition, see
+      # this file's header): `gh pr diff` is the PR's CURRENT diff, so a push
+      # during or before a review would pair the files above with newer hunks.
+      # The compare API's three-dot form diffs from the merge base, as a PR's
+      # diff does. Keep the three jobs' copies identical.
+      - name: Save the diff of the reviewed commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Unexpected base or head SHA: '$BASE_SHA' '$HEAD_SHA'"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/pr-diff"
+          gh api -H 'Accept: application/vnd.github.diff' \
+            "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/pr-diff/pr.diff"
+          echo "Saved $(wc -l < "$RUNNER_TEMP/pr-diff/pr.diff") diff lines for $BASE_SHA...$HEAD_SHA"
 
       # As in the review job, but this job's own start: the review job's
       # would credit a re-run of this job with what an earlier run posted.
@@ -564,6 +622,8 @@ jobs:
             --model opus
             --effort max
             --add-dir ${{ runner.temp }}/pr-head
+            --add-dir ${{ runner.temp }}/pr-diff
+            --permission-mode default
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       # The review job's report, for this attempt; keep the copies identical.
@@ -705,7 +765,7 @@ jobs:
       # The PR's files, for reading only, outside the working directory and
       # without any file Claude Code would take instructions or config from
       # (see "Where the reviewer's instructions come from" above). The
-      # reviewer sees the PR's changes to those files in `gh pr diff`. Keep
+      # reviewer sees the PR's changes to those files in the saved diff. Keep
       # the three jobs' copies of these two steps identical. The prompt names
       # this path as the review job resolved it, and the fallback and api
       # jobs pass their own to --add-dir: the same while all three run on
@@ -726,6 +786,24 @@ jobs:
           find "$RUNNER_TEMP/pr-head" -type l -delete
           find "$RUNNER_TEMP/pr-head" \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name .claude \
             -o -name .mcp.json -o -name .claude.json \) -prune -exec rm -rf {} +
+      # The diff of exactly the commit under review (eth2swarm addition, see
+      # this file's header): `gh pr diff` is the PR's CURRENT diff, so a push
+      # during or before a review would pair the files above with newer hunks.
+      # The compare API's three-dot form diffs from the merge base, as a PR's
+      # diff does. Keep the three jobs' copies identical.
+      - name: Save the diff of the reviewed commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::Unexpected base or head SHA: '$BASE_SHA' '$HEAD_SHA'"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/pr-diff"
+          gh api -H 'Accept: application/vnd.github.diff' \
+            "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/pr-diff/pr.diff"
+          echo "Saved $(wc -l < "$RUNNER_TEMP/pr-diff/pr.diff") diff lines for $BASE_SHA...$HEAD_SHA"
 
       # A missing secret would otherwise surface as the action's generic
       # "no credentials" error.
@@ -760,6 +838,8 @@ jobs:
             --effort high
             --max-budget-usd 15
             --add-dir ${{ runner.temp }}/pr-head
+            --add-dir ${{ runner.temp }}/pr-diff
+            --permission-mode default
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
       # The review job's report, for this attempt; keep the copies identical.
