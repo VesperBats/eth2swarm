@@ -51,8 +51,9 @@ does NOT take Workflow steps 3-5. **Until the owner has merged the fix, nothing
 leaves the machine**: no push to any branch of this repo, the designated one
 included, and no PR, issue or comment about it. From the merge until the
 advisory is published, pushes and PRs are normal again but neutrally worded.
-Fix it on a local branch, run the CI-substitute cargo checks locally (the
-advisory's private fork runs no CI), `/code-review` locally, and send the owner
+Fix it on a local branch, run CI's checks locally, and the end-to-end test for a
+fix inside its paths (the advisory's private fork runs no CI), `/code-review`
+locally, and send the owner
 a `git format-patch` for the private fork. The owner merges, releases and
 publishes the advisory; no tag goes on a `main` whose checks are red.
 
@@ -102,12 +103,11 @@ mechanics below.
 - Fix review comments on the PR's own branch, never through a separate PR
   (one exception, on a feature branch: a bug in code `main` also carries is
   fixed by its own PR into `main`).
-- Drive CI to green, or state the blocker explicitly. No workflow builds or
-  tests the code yet (`claude-review` is the only PR check): until one does,
-  run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`
-  and `cargo test --locked` on the head of a PR you author before opening it
-  and after every push, and record the result in the PR description — that is
-  "CI green" for the code; a check that ran nothing is "not run". Until the
+- Drive CI to green, or state the blocker explicitly. The checks: `CI`
+  (rustfmt, clippy `-D warnings`, tests, all `--locked`; zero tests run fails
+  it), `integration` (the bee-factory end-to-end test, path-filtered: run the
+  script by hand for a PR it skips that can still change that behaviour) and
+  `claude-review`. Run the cargo checks locally before opening a PR too. Until the
   owner has added the `CLAUDE_CODE_OAUTH_TOKEN` secret, `claude-review`'s
   fallback job is red with no review: state that as the blocker. A PR whose
   base branch has no `claude-review.yml` gets no review run at all: say so,

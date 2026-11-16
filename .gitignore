@@ -3,3 +3,6 @@
 # Claude Code: per-machine settings and session worktrees
 /.claude/settings.local.json
 /.claude/worktrees/
+
+# Installed by the integration workflow (npm ci in ci/bee-factory)
+/ci/bee-factory/node_modules/

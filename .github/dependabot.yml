@@ -1,0 +1,66 @@
+# Dependency updates as reviewed PRs, adapted from Myotis's dependabot.yml. Every
+# pin here is exact — actions by commit SHA, crates by Cargo.lock, bee-factory by
+# ci/bee-factory/package-lock.json — so nothing moves on its own; this is how the
+# pins move ON PURPOSE. Review a PR's lockfile diff like code.
+#
+# Not covered by any entry, so bumped by hand in a reviewed PR: rust-toolchain.toml,
+# the runner image labels, the Node major in integration.yml, bee-factory's Docker
+# images (pinned by digest in integration.yml), and dtolnay/rust-toolchain's commit
+# in .github/actions/rust-toolchain (an untagged master commit, which a version
+# update does not move).
+#
+# Cooldown: a version update waits until its release is 7 days old (Myotis's
+# owner decision of 2026-11-12, after the Ethersphere bee-js / Swarm Desktop
+# supply-chain attack of 2026-11-09: a malicious release with valid provenance,
+# pulled within hours). Such releases are usually yanked within days. The cooldown
+# does not delay SECURITY updates. It filters the version Dependabot proposes, not
+# the transitives a lock regeneration picks that day (the lock diff is the check
+# for those). A hand bump of a tree no entry covers waits the same 7 days.
+#
+# One routine group per ecosystem holds what should not break; an update that may
+# break comes as a PR of its own, so one migration never waits on another. Cargo
+# treats a 0.x minor (0.11 -> 0.12) as breaking, so Cargo groups patches only.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    # claude-review.yml is kept identical to Myotis's copy apart from its
+    # documented differences, and its actions float on purpose
+    # (claude-code-action@v1); it is moved by hand, in a PR of its own.
+    exclude-paths:
+      - ".github/workflows/claude-review.yml"
+    ignore:
+      - dependency-name: "anthropics/claude-code-action"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    # Minors and majors stay ungrouped: Dependabot then opens one PR per crate.
+    groups:
+      cargo-patch:
+        update-types: ["patch"]
+
+  # The bee-factory the integration workflow runs. A test tool, not shipped: one
+  # monthly group is enough, and its lock is resolved the same way (7 days old).
+  - package-ecosystem: npm
+    directory: "/ci/bee-factory"
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      bee-factory:
+        patterns: ["*"]

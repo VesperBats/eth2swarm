@@ -76,10 +76,13 @@ again (steps 7 to 9 need them), but every one of them stays neutral:
 3. **Run what CI would run, locally.** GitHub runs no CI and no status
    checks in an advisory's temporary private fork, and no integration (the
    CI reviewer among them) can reach it. Run:
-   - The checks that stand in for CI in this repository
-     (`.claude/agent/pull-requests.md`, "Drive CI to green"): `cargo fmt
-     --check`, `cargo clippy --locked --all-targets -- -D warnings` and
-     `cargo test --locked`.
+   - What `ci.yml` runs (`.claude/agent/pull-requests.md`, "Drive CI to
+     green"): `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D
+     warnings` and `cargo test --locked`.
+   - What `integration.yml` runs, for a fix inside its paths: start a local
+     bee-factory and run `EPOCH_SIZE=16 EPOCHS=4 scripts/e2e-bee-factory.sh`
+     with `ETH2SWARM_RPC` and the Bee URLs of your stack (the script's header;
+     `http://localhost:8545` and the default Bee ports without the port patch).
    - A check that ran nothing (0 tests, a filtered or ignored test) is "not
      run" in the report, never "passed".
    - A test that fails without the fix and passes with it. That test is the
@@ -115,9 +118,9 @@ again (steps 7 to 9 need them), but every one of them stays neutral:
    the release can follow directly. The timing is the owner's.
 7. **After the merge, before the release.** The fix is public from the merge
    on. The owner, or a session the owner asks, checks every workflow run on
-   the merge commit, and runs the checks of step 3 again on the merged
-   `main` (no workflow here builds or tests the code yet, so nothing else
-   does). A red result is fixed at once by a normal PR into
+   the merge commit (`CI`, and `integration` where the fix is inside its
+   paths; a push to `main` runs both, like a PR). A red result is fixed at
+   once by a normal PR into
    `main`, in the neutral wording above. No `v*` tag goes on a commit whose
    checks are red.
 8. **Release.** This repository has made no release yet, so what counts as
@@ -136,8 +139,9 @@ again (steps 7 to 9 need them), but every one of them stays neutral:
 
 - The advisory's temporary private fork is the one private place GitHub
   offers for the fix, and nothing automated runs there. The local checks of
-  step 3 and the post-merge checks of step 7 stand in for CI and keep the
-  release gate: no fixed release is tagged on an unchecked `main`.
+  step 3 stand in for CI until the merge, and the CI runs on the merge commit
+  (step 7) keep the release gate: no fixed release is tagged on an unchecked
+  `main`.
 - `main` must be releasable at every commit, the advisory merge included.
   With no CI before that merge, the local checks of step 3 are what keep it
   so: they are not optional, and a check that could not run is named in the

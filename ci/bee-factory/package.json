@@ -1,0 +1,8 @@
+{
+  "name": "eth2swarm-ci-bee-factory",
+  "private": true,
+  "description": "The bee-factory version the integration workflow runs, installed with `npm ci --ignore-scripts` from the lock beside this file. See .github/workflows/integration.yml.",
+  "dependencies": {
+    "@ethersphere/bee-factory": "1.1.2"
+  }
+}
