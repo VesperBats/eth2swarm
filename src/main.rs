@@ -2,6 +2,7 @@ mod accumulator;
 mod chain;
 mod client;
 mod import;
+mod inspect;
 mod layout;
 mod swarm;
 
@@ -103,6 +104,25 @@ enum Command {
         #[command(flatten)]
         source: Source,
     },
+    /// Local web UI to inspect SOCs, blocks, epochs and raw references on Swarm nodes.
+    Serve {
+        /// Address to listen on (keep it on loopback: the UI has no authentication).
+        #[arg(long, default_value = "127.0.0.1:8090")]
+        listen: std::net::SocketAddr,
+        /// Nodes to read from, as `name=url` (repeatable). Defaults to antd on :1733 and the
+        /// bee-factory nodes.
+        #[arg(long = "node", value_parser = inspect::parse_node)]
+        nodes: Vec<inspect::Node>,
+        /// Default SOC owner shown in the UI.
+        #[arg(long, env = "ETH2SWARM_OWNER")]
+        owner: Option<Address>,
+        /// Default chain ID shown in the UI.
+        #[arg(long, env = "ETH2SWARM_CHAIN_ID", default_value_t = 1)]
+        chain_id: u64,
+        /// Default pinned trust anchor shown in the UI.
+        #[arg(long, env = "ETH2SWARM_ANCHOR")]
+        anchor: Option<B256>,
+    },
 }
 
 #[tokio::main]
@@ -184,6 +204,35 @@ async fn main() -> Result<()> {
                 headers.first().map_or(0, |h| h.number),
                 headers.last().map_or(0, |h| h.number)
             );
+        }
+        Command::Serve {
+            listen,
+            nodes,
+            owner,
+            chain_id,
+            anchor,
+        } => {
+            let nodes = if nodes.is_empty() {
+                [
+                    "antd=http://localhost:1733",
+                    "queen=http://localhost:1633",
+                    "worker1=http://localhost:1635",
+                    "worker2=http://localhost:1637",
+                    "worker3=http://localhost:1639",
+                    "worker4=http://localhost:1641",
+                ]
+                .iter()
+                .map(|s| inspect::parse_node(s).map_err(anyhow::Error::msg))
+                .collect::<Result<_>>()?
+            } else {
+                nodes
+            };
+            let defaults = inspect::Defaults {
+                owner,
+                chain_id,
+                anchor,
+            };
+            inspect::serve(listen, nodes, defaults).await?;
         }
     }
     Ok(())

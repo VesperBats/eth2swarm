@@ -19,6 +19,7 @@ async fn backoff(attempt: u32) {
 pub struct Bee {
     base: Url,
     http: reqwest::Client,
+    retries: u32,
 }
 
 #[derive(Deserialize)]
@@ -50,7 +51,17 @@ impl Bee {
             .timeout(Duration::from_secs(120))
             .build()
             .context("building HTTP client")?;
-        Ok(Self { base, http })
+        Ok(Self {
+            base,
+            http,
+            retries: RETRIES,
+        })
+    }
+
+    /// Number of attempts for reads (default 5). Interactive tools use 1 to fail fast.
+    pub fn with_retries(mut self, retries: u32) -> Self {
+        self.retries = retries.max(1);
+        self
     }
 
     fn url(&self, path: &str) -> Result<Url> {
@@ -138,7 +149,7 @@ impl Bee {
     async fn get_with_retry(&self, path: &str, max_len: usize) -> Result<Vec<u8>> {
         let url = self.url(path)?;
         let mut last = String::new();
-        for attempt in 0..RETRIES {
+        for attempt in 0..self.retries {
             backoff(attempt).await;
             let mut resp = match self.http.get(url.clone()).send().await {
                 Ok(r) => r,
