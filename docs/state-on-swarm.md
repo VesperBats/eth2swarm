@@ -212,8 +212,8 @@ published before their blocks are final.
 
 One record per published block, found by the **block hash**: it lists the generation,
 its cut depths and the cover (level, index, last block hash and bucket counts of each
-live slice, and the pending merges). A reader that holds a verified header fetches the record for its hash
-and can then compute every other address.
+live slice, and the pending merges). A reader that holds a verified header fetches the
+record for its hash and can then compute every other address.
 
 The record is a hint like the rest. A record that names the wrong slices leads to a read
 that fails.
