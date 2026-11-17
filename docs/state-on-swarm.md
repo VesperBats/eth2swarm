@@ -151,7 +151,7 @@ A *generation* `g` starts with a base: the complete flat state at one finalized 
 |---|---|---|
 | Leaf bucket | generation, 23-bit key prefix | the accounts below the prefix, at block `S` |
 | Path chunk | generation, 5-nibble key prefix | the four hash groups on that path, at block `S` (2,048 bytes) |
-| Crown | generation | the 256 depth-2 hashes at block `S` (two chunks) |
+| Crown | generation | the 256 depth-2 hashes at block `S` (8,192 bytes; three chunks with their record headers) |
 | Companion bucket | generation, 23-bit key prefix | the whole storage of every small contract below the prefix |
 | Storage bucket, storage path chunk | generation, account hash, slot-key prefix | the same as the first two rows, for one large storage trie |
 | Code | code hash | the code |
@@ -243,6 +243,21 @@ file.
 
 Buckets of old slices never change, so a reader keeps them. A repeat read of the same key
 one block later fetches only the newest slice's buckets.
+
+### What a read reveals
+
+Whoever serves a chunk learns its address, and the addresses are computed from the key:
+
+- A base leaf bucket hides an account among the others below its prefix: about 53 on
+  mainnet, fewer in a split bucket.
+- A slice bucket covers a wider key range, the wider the smaller the slice.
+- The address of a storage bucket of a large trie contains the account hash, so it names
+  the contract, and its prefix narrows the slot.
+
+A storer neighbourhood sees one of these. The Bee node or gateway a reader uses sees all
+of them and can intersect them down to one base bucket. That is less than a snap request
+shows a peer (the exact key), and more than a head read from BALs shows (nothing). A
+reader that cares runs its own Bee node, as with the address index.
 
 ### Reads at the head
 
@@ -413,7 +428,7 @@ batches grouped by lifetime as in the address index.
 
 A slice costs 2 buckets up to roughly 2,000 blocks, 3 up to roughly 64,000 and 4 above
 (the limits move with how much merged slices shrink). The average assumes that half of the
-20 levels are present. The base adds a path chunk and a leaf bucket, the crown two
+20 levels are present. The base adds a path chunk and a leaf bucket, the crown three
 chunks. The byte figures assume about 2 KB per chunk: buckets with leaf entries near
 2.8 KB, buckets with only hash groups about 1 KB. All of them assume buckets that are
 not split.
