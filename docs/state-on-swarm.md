@@ -10,9 +10,11 @@ which reads state over devp2p snap today.
 
 This builds on Myotis's research note
 [state-on-swarm.md](https://github.com/biafra23/myotis/blob/a88a36f440845d928adc9a880d471d9c7f892206/docs/ideas/state-on-swarm.md)
-(2026-11-05, "the note" below). The note measured what a block rewrites and proposed one
-Swarm chunk per trie node, found by the node's hash. This document proposes a different
-layout for the same job and compares the two.
+(2026-11-05, "the note" below). The note measured what a block rewrites and proposed
+*pages*: one Swarm chunk per interior trie node, found by the node's hash, which also
+carries the node's leaf children. A *jump table* per published root returns the top four
+levels in one fetch. This document proposes a different layout for the same job and
+compares the two.
 
 The design in one paragraph: the state is stored **flat**. Only the leaves (accounts and
 slots) are kept, in **buckets** that each hold the leaves below a fixed key prefix, so a
@@ -78,11 +80,11 @@ block and the optimistic head, as Myotis's `ExecAnchor` holds them today.
 
 ### Cutting the trie
 
-A node's *depth* is the number of nibbles on its path, so the root is at depth 0. On
-mainnet every node of the account trie down to depth 5 is a full branch node with 16
-children: *measured* on 499 random paths, below. With about 26 accounts below every
-depth-6 node, an empty one is practically impossible. The account trie is cut at fixed
-depths:
+A node's *depth* is the number of nibbles on its path, so the root is at depth 0. The
+account trie is cut at fixed depths, which needs a branch node at every cut depth. On
+mainnet every node down to depth 5 is a full branch node with 16 children: *measured* on
+499 random paths, below. With about 26 accounts below every depth-6 node, a depth-5 node
+that is not a branch is practically impossible. The cut for mainnet today:
 
 | Tier | What it holds | How it changes |
 |---|---|---|
@@ -95,13 +97,34 @@ depths:
 A reader needs one group of 16 hashes per level on its key's path, four groups in all,
 plus the crown and one leaf bucket.
 
-**A bucket that does not fit in a chunk is paged**, like a bucket of the address index:
-its chunk then holds only a count and the reference of a Swarm file with the entries. The
-reader learns this from the bucket itself, so it never asks for a chunk that may not
-exist. Paging must be part of the format, because overflow can be forced: an address
-whose hash falls below a chosen 23-bit prefix costs about 2^23 hashes, and a few dozen
-such accounts, each sent a little ether, overfill a bucket. The same rule covers companion
-buckets and the buckets of a slice.
+**The depths are parameters of a chain and a generation**, and the head record names
+them. Sepolia's account trie has full branch nodes down to depth 5 as well, but only
+about 10 accounts below a depth-6 node (*measured*, below), so its buckets take a 22-bit
+prefix. On mainnet a bucket holds about 53 accounts and a chunk takes about 87, so about
+2 % of the buckets would be split once the account count has grown by a third. A later
+generation then cuts at 24 bits: every base is written anew anyway.
+
+**A bucket that does not fit in a chunk is split, not paged.** Its chunk then holds the
+hash group of the next level in place of the leaves, and the leaves go to sub-buckets
+with a longer prefix, which are split again if they must be. The reader learns this
+from the chunk it fetched, so it never asks for one that may not exist, and pays one more
+fetch per extra level.
+
+Paging, as in the address index, would keep such a bucket writable but would not bound
+what a reader pays. A reader has to hold every leaf of the subtree it rebuilds, and anyone
+can force an overflow: an address whose hash falls below a chosen 23-bit prefix costs
+about 2^23 hashes and a transfer of 1 wei (21,000 gas). In a paged bucket, 10,000 such
+accounts would add about 470 KB to every read below that prefix, and nobody could remove
+them. In a split bucket they add two or three levels, because every further level costs
+the attacker 16 times more hashes. The trie itself answers the same attack the same way,
+with a longer path.
+
+The same rule covers companion and storage buckets, where slot keys can be ground through
+token transfers to chosen addresses. A bucket that overflows within a generation is split
+in the slices: the slice carries the hash group of the new level, and a reader then takes
+only the leaf entries below its own sub-prefix. The buckets of a slice cover a key range
+and can overflow too. Those are paged, sorted by key, and the reader finds its narrow
+range by binary search.
 
 Accounts are stored in snap's slim form (an empty `storageRoot` or `codeHash` is left out)
 with the key bytes that the prefix does not already give. Interior trie nodes are stored
@@ -175,7 +198,7 @@ Large merges run in the background while readers keep using the slices they repl
 
 **Handover.** When the last block of a generation is final, the top slice, of all 2^20
 blocks, is merged with the base into the base of the next generation, at `S + 2^20`.
-Uploading it takes days: 3 at 200 chunks a second, 10 at 60. Until it is complete,
+Uploading it takes days: 3 at 200 chunks a second, 19 at 30. Until it is complete,
 head records keep naming the old base, and the cover is the top slice plus the slices
 after it: up to 21, and more buckets per read than the estimates below assume. The
 first head record after that names the new base and drops the top slice. The slices
@@ -187,9 +210,9 @@ published before their blocks are final.
 
 ### Head record
 
-One record per published block, found by the **block hash**: it lists the generation and
-the cover (level, index, last block hash and bucket counts of each live slice, and the
-pending merges). A reader that holds a verified header fetches the record for its hash
+One record per published block, found by the **block hash**: it lists the generation,
+its cut depths and the cover (level, index, last block hash and bucket counts of each
+live slice, and the pending merges). A reader that holds a verified header fetches the record for its hash
 and can then compute every other address.
 
 The record is a hint like the rest. A record that names the wrong slices leads to a read
@@ -307,6 +330,20 @@ the nodes on the path of a random key (500 requests, one timed out).
   accounts: 49 have code, 11 have storage. In slim form they take 4–68 bytes, 16.1 on
   average, against 107 bytes for the full leaf node.
 
+The same script on Sepolia, on 2026-11-17 at blocks 12,155,236 and following, through a
+public RPC endpoint, 300 paths:
+
+| Depth | Paths with a branch node there | Occupied child slots, mean | Node size, mean |
+|---|---|---|---|
+| 0–5 | 300 of 300 | 16.00 of 16 (every node full) | 532 B |
+| 6 | 300 of 300 | 7.20 | 250 B |
+| 7 | 33 | 2.15 | 88 B |
+
+- 7.20 of 16 slots occupied means about 0.6 accounts per slot: about 10 accounts below a
+  depth-6 node and about 160 M in all.
+- 98 paths ended at an account leaf: 60 have code, 12 have storage; 29.9 bytes in slim
+  form on average.
+
 Inputs taken from the note (measured there on 2026-11-05, or cited from ethPandaOps):
 
 | | Mainnet |
@@ -344,24 +381,26 @@ storage tries are guesses; the account figures follow from the sample above.
 | Part | Derivation | Size |
 |---|---|---|
 | Account entries | 494 × about 60 bytes | 30 KB |
-| Slot entries | 913 × about 50 bytes | 50 KB |
+| Slot entries | 913 × about 50 bytes | 46 KB |
 | Account-trie hash entries | about 1,940 changed nodes below the crown × 35 bytes | 68 KB |
 | Storage-trie hash entries | very rough: about 1,500 × 40 bytes | 60 KB |
 | Crown | | 8 KB |
-| **Total** | | **about 220 KB, 90 chunks** |
+| **Total** | | **about 210 KB, 85 chunks** |
 
-The chunk count assumes the address index's bucket target of 2.8 KB (79 chunks) and a
+The chunk count assumes the address index's bucket target of 2.8 KB (76 chunks) and a
 partly filled last bucket in each section.
 
-**Upload.** 90 chunks per block are 0.65 M chunks a day at the leaves. With binary
-merging every entry is written again at each level, and merged slices shrink where writes
-repeat. How much is not measured for this layout. The note's nearest figures are for 32
-blocks: the distinct changed accounts are about 52 % of the per-block changes summed, the
-new trie nodes 57 %. Assuming slices shrink to about half at 32 blocks, a fifth at one
-day and a twentieth at a generation, the total is about 8 times the leaves: **about 5 M
-chunks a day**, 60 a second. The base adds 45–55 M chunks once per generation, in a burst
-(see *Handover*). Only the cover is live, so old slices expire, in postage batches
-grouped by lifetime as in the address index.
+**Upload.** 85 chunks per block are 0.61 M chunks a day at the leaves. Above them the
+publisher writes what the address index writes: only the slice a cover gains, so a block
+is rewritten in about half of the levels, not in all of them. Merged slices also shrink
+where writes repeat. How much is not measured for this layout. The note's nearest
+figures are for 32 blocks: the distinct changed accounts are about 52 % of the per-block
+changes summed, the new trie nodes 57 %. Assuming slices shrink to about half at 32
+blocks, a fifth at one day and a twentieth at a generation, the merges add about 3.3
+times the leaves. With every block's own slice uploaded first, the total is **about
+2.6 M chunks a day**, 30 a second. The base adds 45–55 M chunks once per generation, in
+a burst (see *Handover*). Only the cover is live, so old slices expire, in postage
+batches grouped by lifetime as in the address index.
 
 **Read.**
 
@@ -376,7 +415,8 @@ A slice costs 2 buckets up to roughly 2,000 blocks, 3 up to roughly 64,000 and 4
 (the limits move with how much merged slices shrink). The average assumes that half of the
 20 levels are present. The base adds a path chunk and a leaf bucket, the crown two
 chunks. The byte figures assume about 2 KB per chunk: buckets with leaf entries near
-2.8 KB, buckets with only hash groups about 1 KB.
+2.8 KB, buckets with only hash groups about 1 KB. All of them assume buckets that are
+not split.
 
 ### Compared with the note's layout
 
@@ -384,11 +424,12 @@ chunks. The byte figures assume about 2 KB per chunk: buckets with leaf entries 
 |---|---|---|
 | Verified against | state root | state root |
 | Base snapshot | 0.76 B chunks, 18 % of Swarm | about 45–55 M chunks, a little over 1 % |
-| Upload | 24.7 M chunks a day (per epoch) | about 5 M chunks a day (per block) |
-| Stored over time | grows with every published root that is kept | base plus live slices; the rest expires |
+| Upload | 24.7 M chunks a day (per epoch) | about 2.6 M chunks a day (per block) |
+| Stored over time | grows with every published root that is kept | one base plus the live slices; the rest expires |
 | Account read, cold | about 5 fetches, one after another | about 30 chunks in 2 round trips |
 | ERC-20 balance, cold | about 8 fetches, one after another | about 60 chunks in 3 round trips |
-| Historical state | every published root that is kept | generation boundaries only, unless inner slices are kept |
+| Keys ground into one subtree | the path grows by a node per 16-fold attacker effort | the same, with split buckets: one fetch per extra level |
+| Historical state | every published root that is kept | none, unless old bases and inner slices are kept (see *Options*) |
 | Publisher needs | a node with proofs or a full trie copy | headers and BALs, from Amsterdam on |
 
 This layout spends reader bandwidth to save network capacity and round trips.
@@ -402,13 +443,15 @@ and on how much a reader keeps cached, both unmeasured.
 - **Fewer slices per read.** Merging four or eight slices at a time, or keeping one slice
   per level and rewriting it as it grows, shortens the cover and raises the upload. A
   shorter generation does the same. These are parameters, to be set from measurements.
-- **Historical state.** A read at an old block `X` needs the cover of `(S, X]`, which is
-  the set of peaks as they were at `X`. Keeping every slice above a chosen length, instead
-  of only the current peaks, keeps the state readable at that granularity: every epoch,
-  every day. The cost is the kept slices, at most 0.65 M chunks a day for each level
-  kept. The old header must then be verified through the beacon chain's accumulators,
-  which is the [block store](soc-block-store.md)'s job; proofs for it can be stored on
-  Swarm as hints.
+- **Historical state.** As described, nothing older than the live cover can be read: an
+  old base expires with the slices it belonged to. A read at an old block `X` needs the
+  base of `X`'s generation and the cover of `(S, X]`, which is the set of peaks as they
+  were at `X`. Keeping every base, and every slice above a chosen length instead of only
+  the current peaks, keeps the state readable at that granularity: every epoch, every
+  day. The cost is one base per generation (45–55 M chunks every 146 days, about 3 % of
+  Swarm a year) plus the kept slices, at most 0.3 M chunks a day for each level kept. The
+  old header must then be verified through the beacon chain's accumulators, which is the
+  [block store](soc-block-store.md)'s job; proofs for it can be stored on Swarm as hints.
 - **BAL archive.** Storing the BALs themselves costs about 23 chunks per block, 60 M a
   year, and keeps slices rebuildable after execution peers have dropped them. How long
   peers keep BALs is not checked here.
@@ -434,6 +477,9 @@ and on how much a reader keeps cached, both unmeasured.
 - **Reader cost.** A cold `eth_call` is far more expensive than with pages (above).
   Fewer slices per read, a warm cache and BAL following for watched accounts reduce it;
   by how much is open.
+- **Split buckets.** The rule is stated, not specified: the record for a split in the
+  base and in a slice, and what a reader pays below a prefix someone has ground keys
+  into, are still to be written down.
 - **Measure before building:**
   1. Entry sizes and bucket fill, from a full flat-state dump: accounts, slots, and the
      size distribution of storage tries.
