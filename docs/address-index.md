@@ -1,7 +1,8 @@
 # Address index (design)
 
-Status: **design; implementation in progress** (#8). Detection is implemented in
-`src/addr/detect.rs`; the formats, importer and client are not yet. Design issue: #5.
+Status: **design; implementation in progress** (#8). Implemented: detection
+(`src/addr/detect.rs`), the record formats (`src/addr/layout.rs`), slice building and the
+cover math (`src/addr/slice.rs`). Not yet: the importer and the client. Design issue: #5.
 
 An index from an **address** to the transactions it **appears in**, stored on Swarm next to
 the [SOC block store](soc-block-store.md). A mobile wallet uses it to list an address's
@@ -338,7 +339,11 @@ Encodings are canonical: the same appearances must give byte-identical records, 
 and therefore Swarm references, or independent importers cannot be compared. Besides
 shortest varints that means the orderings given below, greedy spill pages, zero padding, and
 spill files uploaded with Bee's default chunker, unencrypted and without erasure coding
-(redundancy level 0), since encryption and redundancy change the reference.
+(redundancy level 0), since encryption and redundancy change the reference. Bee 2.8.3
+erasure-codes `POST /bytes` unless the request sets `Swarm-Redundancy-Level: 0`, so the
+importer sets it. With it, the reference can be computed before uploading
+(`src/swarm/file.rs`, checked against Bee at every level boundary), which is how a bucket
+names its spill and pages files.
 
 ### `SliceRecord` (kind 4), 111 bytes
 

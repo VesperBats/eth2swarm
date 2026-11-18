@@ -120,6 +120,7 @@ pub async fn fetch_block_data(
 
     Ok(BlockData {
         number,
+        hash,
         beneficiary: block.header.beneficiary,
         uncle_beneficiaries,
         withdrawal_recipients: block

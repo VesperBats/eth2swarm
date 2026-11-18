@@ -67,6 +67,16 @@ enum Command {
         /// Block number.
         number: u64,
     },
+    /// Build one address-index slice in memory and print its sizes (nothing is uploaded).
+    AddrSlice {
+        /// Slice level (0 = one unit of 64 blocks).
+        level: u8,
+        /// Slice index at that level.
+        index: u32,
+        /// Also read `trace_block` (see `appearances`).
+        #[arg(long)]
+        traces: bool,
+    },
     /// List the address appearances in a block (docs/address-index.md, detection rules).
     Appearances {
         /// Block number.
@@ -175,6 +185,13 @@ async fn main() -> Result<()> {
             println!("Timestamp:  {}", block.header.timestamp);
             println!("Txs:        {}", block.transactions.len());
             println!("Gas used:   {}", block.header.gas_used);
+        }
+        Command::AddrSlice {
+            level,
+            index,
+            traces,
+        } => {
+            addr_slice(&provider, level, index, traces).await?;
         }
         Command::Appearances { number, traces } => {
             let data = addr::fetch::fetch_block_data(&provider, number, traces).await?;
@@ -324,5 +341,62 @@ async fn header_stats(
             4096 / max
         );
     }
+    Ok(())
+}
+
+/// `addr-slice`: detect and build one slice, report its sizes.
+async fn addr_slice(provider: &impl Provider, level: u8, index: u32, traces: bool) -> Result<()> {
+    use addr::detect::{detect, role};
+    use addr::layout::{BucketBody, BucketRecord, PAGE_SIZE, first_block, last_block};
+
+    let (first, last) = (first_block(level, index), last_block(level, index));
+    let mut apps = Vec::new();
+    let mut last_hash = B256::ZERO;
+    for n in first..=last {
+        let data = addr::fetch::fetch_block_data(provider, n, traces).await?;
+        apps.extend(detect(&data));
+        last_hash = data.hash;
+    }
+    let roles = if traces { 0xff } else { !role::TRACE };
+    let built = addr::slice::build_slice((level, index), &apps, last_hash, roles)?;
+    let r = &built.record;
+    let paged = built
+        .buckets
+        .iter()
+        .filter(|b| {
+            matches!(
+                BucketRecord::decode(b).map(|b| b.body),
+                Ok(BucketBody::Paged { .. })
+            )
+        })
+        .count();
+    let file_bytes: usize = built.files.iter().map(Vec::len).sum();
+    let file_chunks: usize = built
+        .files
+        .iter()
+        .map(|f| f.len().div_ceil(PAGE_SIZE))
+        .sum();
+    let bucket_bytes: usize = built.buckets.iter().map(Vec::len).sum();
+    println!("Slice ({level}, {index}): blocks {first}..={last}");
+    println!("  appearances: {}", r.appearances);
+    println!("  addresses:   {}", r.addresses);
+    println!(
+        "  buckets:     {} ({} paged), {} bytes, largest {} bytes",
+        r.bucket_count,
+        paged,
+        bucket_bytes,
+        built.buckets.iter().map(Vec::len).max().unwrap_or(0)
+    );
+    println!(
+        "  files:       {} (spill and pages), {} bytes, {} data chunks",
+        built.files.len(),
+        file_bytes,
+        file_chunks
+    );
+    println!(
+        "  bytes per appearance: {:.2}",
+        (bucket_bytes + file_bytes) as f64 / r.appearances.max(1) as f64
+    );
+    println!("  buckets root: {}", r.buckets_root);
     Ok(())
 }

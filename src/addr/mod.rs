@@ -2,3 +2,5 @@
 
 pub mod detect;
 pub mod fetch;
+pub mod layout;
+pub mod slice;
