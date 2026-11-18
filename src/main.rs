@@ -345,18 +345,18 @@ async fn header_stats(
 }
 
 /// `addr-slice`: detect and build one slice, report its sizes.
-async fn addr_slice(provider: &impl Provider, level: u8, index: u32, traces: bool) -> Result<()> {
+async fn addr_slice<P>(provider: &P, level: u8, index: u32, traces: bool) -> Result<()>
+where
+    P: Provider + Clone + 'static,
+{
     use addr::detect::{detect, role};
-    use addr::layout::{BucketBody, BucketRecord, PAGE_SIZE, first_block, last_block};
+    use addr::layout::{BucketBody, BucketRecord, L_MAX, PAGE_SIZE, first_block, last_block};
 
+    ensure!(level <= L_MAX, "slice level {level} above {L_MAX}");
     let (first, last) = (first_block(level, index), last_block(level, index));
-    let mut apps = Vec::new();
-    let mut last_hash = B256::ZERO;
-    for n in first..=last {
-        let data = addr::fetch::fetch_block_data(provider, n, traces).await?;
-        apps.extend(detect(&data));
-        last_hash = data.hash;
-    }
+    let blocks = addr::fetch::fetch_range(provider, first..=last, traces, 16).await?;
+    let last_hash = blocks.last().map(|b| b.hash).unwrap_or_default();
+    let apps: Vec<_> = blocks.iter().flat_map(detect).collect();
     let roles = if traces { 0xff } else { !role::TRACE };
     let built = addr::slice::build_slice((level, index), &apps, last_hash, roles)?;
     let r = &built.record;

@@ -135,6 +135,11 @@ fn build(
     let mut by_address: BTreeMap<Address, BTreeMap<(u64, u32), u8>> = BTreeMap::new();
     for a in appearances {
         ensure!(
+            a.roles != 0 && a.roles & !roles == 0,
+            "appearance with roles {:#04x} outside the slice's {roles:#04x}",
+            a.roles
+        );
+        ensure!(
             (first..=last).contains(&a.block),
             "appearance in block {} outside slice ({level}, {index}), blocks {first}..={last}",
             a.block
@@ -192,12 +197,11 @@ fn build(
             b.1,
         ))
     });
-    let mut grouped: Vec<Vec<AddressRecord>> = vec![Vec::new(); bucket_count as usize];
-    for (h, _, rec, _) in records.iter() {
-        grouped[bucket_of(h, bucket_count) as usize].push(rec.clone());
-    }
     let address_count = u32::try_from(records.len())?;
-    drop(records);
+    let mut grouped: Vec<Vec<AddressRecord>> = vec![Vec::new(); bucket_count as usize];
+    for (h, _, rec, _) in records {
+        grouped[bucket_of(&h, bucket_count) as usize].push(rec);
+    }
 
     let mut buckets = Vec::with_capacity(grouped.len());
     for (k, recs) in grouped.into_iter().enumerate() {
@@ -379,8 +383,10 @@ mod tests {
             ])
         );
         assert_eq!(built.record.buckets_root, keccak256(&built.buckets[0]));
-        // Outside the slice.
-        assert!(build_slice(slice, &[app(base + 64, 1, 1, 1)], B256::ZERO, 0).is_err());
+        // Outside the slice, no roles, or a role the slice does not detect.
+        assert!(build_slice(slice, &[app(base + 64, 1, 1, 1)], B256::ZERO, 0xff).is_err());
+        assert!(build_slice(slice, &[app(base, 1, 1, 0)], B256::ZERO, 0xff).is_err());
+        assert!(build_slice(slice, &[app(base, 1, 1, 0x20)], B256::ZERO, 0xdf).is_err());
         // An empty slice still has one bucket.
         let empty = build_slice((0, 0), &[], B256::ZERO, 0).unwrap();
         assert_eq!(empty.record.bucket_count, 1);
@@ -395,7 +401,7 @@ mod tests {
         for b in 0..400 {
             apps.push(app(b, 1, 0xaa, 1));
         }
-        // 340 addresses sharing nothing in particular; one entry each.
+        // 2000 more addresses with one entry each.
         for i in 0..2000u32 {
             apps.push(Appearance {
                 block: (i % 1024) as u64,
@@ -404,7 +410,7 @@ mod tests {
                 roles: 0x10,
             });
         }
-        let built = build_slice(slice, &apps, B256::ZERO, 0x10).unwrap();
+        let built = build_slice(slice, &apps, B256::ZERO, 0x11).unwrap();
         assert_eq!(built.record.addresses, 2001);
         // Every bucket is at most one chunk.
         assert!(built.buckets.iter().all(|b| b.len() <= PAGE_SIZE));
@@ -433,7 +439,7 @@ mod tests {
         assert_eq!(entries[399].block, 399);
 
         // Deterministic: building again gives identical bytes.
-        let again = build_slice(slice, &apps, B256::ZERO, 0x10).unwrap();
+        let again = build_slice(slice, &apps, B256::ZERO, 0x11).unwrap();
         assert_eq!(again.buckets, built.buckets);
         assert_eq!(again.files, built.files);
         assert_eq!(again.record, built.record);

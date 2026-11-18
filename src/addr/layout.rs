@@ -2,8 +2,11 @@
 //! (`docs/address-index.md`, "Identifiers" and "Record formats").
 //!
 //! Encodings are canonical: the same appearances give byte-identical records and pages, so
-//! independent importers can be compared. Decoders reject anything an encoder would not
-//! produce (non-shortest varints, unsorted entries, empty roles, non-zero padding).
+//! independent importers can be compared. Decoders reject what an encoder would not produce
+//! as far as one record or page shows it: non-shortest varints, unsorted entries or records,
+//! empty roles, an inline record that should have been spilled, an inline bucket that should
+//! have been paged, empty spill or paged counts, non-zero padding. Whether a spill or pages
+//! file's content is canonical shows only when it is read.
 
 // The importer and client that use all of this follow in parts 4 and 5 of #8.
 #![cfg_attr(not(test), allow(dead_code))]
@@ -192,6 +195,7 @@ impl AddressRecord {
         let tag = get_varint(buf)?;
         let n = tag >> 1;
         let entries = if tag & 1 == 1 {
+            ensure!(n > 0, "spilled address record without entries");
             ensure!(buf.len() >= 32, "spill reference truncated");
             let spill_ref = B256::from_slice(&buf[..32]);
             *buf = &buf[32..];
@@ -201,10 +205,25 @@ impl AddressRecord {
             }
         } else {
             ensure!(n > 0, "address record without entries");
-            Entries::Inline(get_entries(buf, n, base)?)
+            let entries = get_entries(buf, n, base)?;
+            ensure!(
+                entries_len(&entries, base) <= SPILL_INLINE_MAX,
+                "inline entries over {SPILL_INLINE_MAX} bytes (should be spilled)"
+            );
+            Entries::Inline(entries)
         };
         Ok(Self { fp, entries })
     }
+}
+
+/// Records must be ascending by fingerprint (records with equal fingerprints are ordered by
+/// address, which a reader cannot see).
+fn check_fp_order(records: &[AddressRecord]) -> Result<()> {
+    ensure!(
+        records.windows(2).all(|w| w[0].fp <= w[1].fp),
+        "address records not ascending by fingerprint"
+    );
+    Ok(())
 }
 
 /// Appends one page (`count (u16) ‖ body`) to `file`, zero-padded to [`PAGE_SIZE`] unless it
@@ -218,7 +237,8 @@ fn flush_page(file: &mut Vec<u8>, body: &[u8], count: u16, last: bool) {
     }
 }
 
-/// Splits a pages file into pages and checks that only the last one is short.
+/// Splits a pages file into its pages; only the last one may be shorter than
+/// [`PAGE_SIZE`]. The pages' content is checked when each is decoded.
 pub fn pages(file: &[u8]) -> Result<Vec<&[u8]>> {
     let pages: Vec<&[u8]> = file.chunks(PAGE_SIZE).collect();
     ensure!(!pages.is_empty(), "empty pages file");
@@ -247,11 +267,12 @@ pub fn spill_file(entries: &[Entry]) -> Vec<u8> {
     let mut count = 0u16;
     let mut prev = 0;
     for e in entries {
-        let mut enc = Vec::new();
-        if count > 0 {
-            put_entries(&mut enc, std::slice::from_ref(e), prev);
-        }
-        if count == 0 || 2 + body.len() + enc.len() > PAGE_SIZE {
+        let len = if count == 0 {
+            0
+        } else {
+            entries_len(std::slice::from_ref(e), prev)
+        };
+        if count == 0 || 2 + body.len() + len > PAGE_SIZE {
             if count > 0 {
                 flush_page(&mut file, &body, count, false);
             }
@@ -259,10 +280,9 @@ pub fn spill_file(entries: &[Entry]) -> Vec<u8> {
             count = 0;
             let first = u32::try_from(e.block).expect("block number beyond u32 in a spill page");
             body.extend(first.to_be_bytes());
-            enc.clear();
-            put_entries(&mut enc, std::slice::from_ref(e), e.block);
+            prev = e.block;
         }
-        body.extend(enc);
+        put_entries(&mut body, std::slice::from_ref(e), prev);
         count += 1;
         prev = e.block;
     }
@@ -324,6 +344,7 @@ pub fn decode_bucket_page(page: &[u8], base: u64) -> Result<Vec<AddressRecord>> 
     let records = (0..count)
         .map(|_| AddressRecord::decode(&mut rest, base))
         .collect::<Result<Vec<_>>>()?;
+    check_fp_order(&records)?;
     check_padding(rest, page.len())?;
     Ok(records)
 }
@@ -453,6 +474,11 @@ impl BucketRecord {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self> {
+        ensure!(
+            buf.len() <= PAGE_SIZE,
+            "bucket of {} bytes (should have been paged)",
+            buf.len()
+        );
         let mut r = Reader::new(buf, KIND_BUCKET)?;
         let level = r.u8()?;
         ensure!(level <= L_MAX, "bucket level {level} above {L_MAX}");
@@ -467,13 +493,21 @@ impl BucketRecord {
                     .map(|_| AddressRecord::decode(&mut rest, base))
                     .collect::<Result<Vec<_>>>()?;
                 r.0 = rest;
+                check_fp_order(&records)?;
                 BucketBody::Inline(records)
             }
-            1 => BucketBody::Paged {
-                count: r.u32()?,
-                pages: r.u32()?,
-                pages_ref: r.hash()?,
-            },
+            1 => {
+                let (count, pages) = (r.u32()?, r.u32()?);
+                ensure!(
+                    count > 0 && pages > 0,
+                    "paged bucket without records or pages"
+                );
+                BucketBody::Paged {
+                    count,
+                    pages,
+                    pages_ref: r.hash()?,
+                }
+            }
             p => bail!("bucket paged flag {p}"),
         };
         r.finish()?;
@@ -503,6 +537,7 @@ impl HeadRecord {
     }
 
     pub fn encode(&self) -> Vec<u8> {
+        assert!(self.units >= 1, "head without units");
         let mut w = Writer::new(KIND_HEAD);
         w.u64(self.units);
         w.u64(self.last_block());
@@ -522,14 +557,22 @@ impl HeadRecord {
         ensure!(units >= 1, "head without units");
         let last = r.u64()?;
         ensure!(
-            units.checked_mul(UNIT_BLOCKS) == Some(last + 1),
+            units.checked_mul(UNIT_BLOCKS).map(|b| b - 1) == Some(last),
             "head for {units} units states last block {last}"
         );
         let last_block_hash = r.hash()?;
         let last_block_timestamp = r.u64()?;
         let n = r.u8()?;
         let pending = (0..n)
-            .map(|_| Ok((r.u8()?, r.u32()?)))
+            .map(|_| {
+                let (level, index) = (r.u8()?, r.u32()?);
+                // A deferred merge is at least level 1; a level-0 slice is never deferred.
+                ensure!(
+                    (1..=L_MAX).contains(&level),
+                    "pending merge at level {level}"
+                );
+                Ok((level, index))
+            })
             .collect::<Result<Vec<_>>>()?;
         ensure!(
             pending
@@ -700,6 +743,53 @@ mod tests {
         let mut enc = bucket(vec![rec(vec![e(1, 1, 1)])]).encode();
         enc.push(0);
         assert!(BucketRecord::decode(&enc).is_err());
+        // Records out of fingerprint order.
+        let mut a_rec = rec(vec![e(1, 1, 1)]);
+        a_rec.fp = [9; 8];
+        assert!(
+            BucketRecord::decode(&bucket(vec![a_rec, rec(vec![e(1, 1, 1)])]).encode()).is_err()
+        );
+        // An inline record that should have been spilled.
+        let long: Vec<Entry> = (0..100).map(|i| e(i * 200, 1, 1)).collect();
+        assert!(entries_len(&long, 0) > SPILL_INLINE_MAX);
+        assert!(BucketRecord::decode(&bucket(vec![rec(long)]).encode()).is_err());
+        // A spilled record with no entries; a paged bucket with no records.
+        let spilled0 = AddressRecord {
+            fp: [0; 8],
+            entries: Entries::Spilled {
+                count: 0,
+                spill_ref: B256::ZERO,
+            },
+        };
+        assert!(BucketRecord::decode(&bucket(vec![spilled0]).encode()).is_err());
+        let paged0 = BucketRecord {
+            level: 0,
+            index: 0,
+            bucket: 0,
+            body: BucketBody::Paged {
+                count: 0,
+                pages: 1,
+                pages_ref: B256::ZERO,
+            },
+        };
+        assert!(BucketRecord::decode(&paged0.encode()).is_err());
+        // An inline bucket over one chunk (it should have been paged).
+        let mut big = bucket(vec![rec(vec![e(1, 1, 1)])]).encode();
+        big.resize(PAGE_SIZE + 1, 0);
+        assert!(BucketRecord::decode(&big).is_err());
+        // A head with a level-0 or out-of-range pending merge.
+        for level in [0u8, 17, 200] {
+            let mut h = HeadRecord {
+                units: 10,
+                last_block_hash: B256::ZERO,
+                last_block_timestamp: 0,
+                pending: vec![(1, 0)],
+            }
+            .encode();
+            let n = h.len();
+            h[n - 5] = level;
+            assert!(HeadRecord::decode(&h).is_err(), "level {level}");
+        }
         // A slice record whose blocks do not match its level and index.
         let mut s = SliceRecord {
             level: 0,

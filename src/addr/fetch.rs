@@ -134,6 +134,41 @@ pub async fn fetch_block_data(
     })
 }
 
+/// [`fetch_block_data`] for every block in `blocks`, with up to `concurrency` blocks in
+/// flight, returned in block order.
+pub async fn fetch_range<P>(
+    provider: &P,
+    blocks: std::ops::RangeInclusive<u64>,
+    traces: bool,
+    concurrency: usize,
+) -> Result<Vec<BlockData>>
+where
+    P: Provider + Clone + 'static,
+{
+    let mut out: Vec<Option<BlockData>> = Vec::new();
+    out.resize_with(blocks.clone().count(), || None);
+    let first = *blocks.start();
+    let mut set = tokio::task::JoinSet::new();
+    let mut next = blocks.into_iter();
+    loop {
+        while set.len() < concurrency.max(1)
+            && let Some(n) = next.next()
+        {
+            let p = provider.clone();
+            set.spawn(async move { (n, fetch_block_data(&p, n, traces).await) });
+        }
+        let Some(done) = set.join_next().await else {
+            break;
+        };
+        let (n, data) = done.context("block fetch task panicked")?;
+        out[(n - first) as usize] = Some(data?);
+    }
+    Ok(out
+        .into_iter()
+        .map(|d| d.expect("every block fetched"))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
