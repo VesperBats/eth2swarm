@@ -118,6 +118,10 @@ enum Command {
         /// Number of `Transfer` calls.
         #[arg(long, default_value_t = 120)]
         transfers: usize,
+        /// Allow this chain ID besides the dev chains 1337 and 31337 (the command refuses
+        /// any other chain).
+        #[arg(long)]
+        allow_chain_id: Option<u64>,
     },
     /// Look an address up in the published address index (newest first).
     AddrLookup {
@@ -133,18 +137,16 @@ enum Command {
         #[arg(long)]
         units: Option<u64>,
         /// Incremental sync: only what is new after this many units.
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(0..=addr::layout::MAX_UNITS))]
         since: Option<u64>,
         /// Entries to print (all are counted).
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Compare with the address's appearances detected directly from --rpc over the same
-        /// blocks; exits with an error on any difference.
+        /// blocks (with traces if the index has them); exits with an error on any difference,
+        /// or if --rpc serves another chain.
         #[arg(long)]
         against_chain: bool,
-        /// With --against-chain: the index was built with traces.
-        #[arg(long)]
-        traces: bool,
     },
     /// Read the published address index back and check what one head makes a client read:
     /// every slice's buckets against its descriptor, every file against its reference, and
@@ -332,8 +334,17 @@ async fn main() -> Result<()> {
             authority_key,
             busy,
             transfers,
+            allow_chain_id,
         } => {
-            let a = devnet::run(cli.rpc.clone(), key, authority_key, busy, transfers).await?;
+            let a = devnet::run(
+                cli.rpc.clone(),
+                key,
+                authority_key,
+                busy,
+                transfers,
+                allow_chain_id,
+            )
+            .await?;
             println!(
                 "Activity in blocks {}..={}: {} transactions, emitter {}, busy {}, authority {}",
                 a.first_block,
@@ -352,7 +363,6 @@ async fn main() -> Result<()> {
             since,
             limit,
             against_chain,
-            traces,
         } => {
             addr_lookup(
                 &provider,
@@ -362,7 +372,6 @@ async fn main() -> Result<()> {
                 since,
                 limit,
                 against_chain,
-                traces,
             )
             .await?;
         }
@@ -661,7 +670,6 @@ where
 }
 
 /// `addr-lookup`: newest entries of an address, optionally checked against the chain.
-#[allow(clippy::too_many_arguments)]
 async fn addr_lookup<P>(
     provider: &P,
     bee: &Bee,
@@ -670,7 +678,6 @@ async fn addr_lookup<P>(
     since: Option<u64>,
     limit: usize,
     against_chain: bool,
-    traces: bool,
 ) -> Result<()>
 where
     P: Provider + Clone + 'static,
@@ -684,7 +691,7 @@ where
         chain_id,
     };
     let head = match units {
-        Some(u) => reader.head_at(u).await?.1,
+        Some(u) => reader.head_at(&reader.origin().await?, u).await?,
         None => {
             let finalized = provider
                 .get_block_by_number(alloy::eips::BlockNumberOrTag::Finalized)
@@ -692,12 +699,12 @@ where
                 .context("the node reports no finalized block")?
                 .header
                 .number;
-            let (head, older) = addr::lookup::latest_head(&reader, finalized).await?;
-            if older {
+            let (head, miss) = addr::lookup::latest_head(&reader, finalized).await?;
+            if let Some(reason) = miss {
                 eprintln!(
-                    "warning: the head for block {finalized} could not be read; using the \
-                     newest readable one ({} units). Bee answers a missing and an \
-                     unretrievable chunk alike, so this may be transient.",
+                    "note: using the newest readable head ({} units), not the one for block \
+                     {finalized}: {reason}. Usually the importer has not published it yet; \
+                     Bee answers a missing and an unretrievable chunk alike.",
                     head.units
                 );
             }
@@ -705,14 +712,13 @@ where
         }
     };
     let found = addr::lookup::lookup(&reader, address, &head, since).await?;
-    let entries = &found.entries;
-    for e in entries.iter().take(limit) {
+    for e in found.entries.iter().take(limit) {
         println!("{:>10}  {:>5}  {}", e.block, e.slot, role::names(e.roles));
     }
     println!(
         "{address}: {} appearances in the index up to block {} ({} units{}; {} slices, {} \
          files read)",
-        entries.len(),
+        found.entries.len(),
         head.last_block(),
         head.units,
         since.map_or(String::new(), |m| format!(", new since unit {m}")),
@@ -721,8 +727,8 @@ where
     );
     if against_chain {
         let from = since.map_or(0, |m| m * UNIT_BLOCKS);
-        let c = addr::lookup::against_chain(provider, address, entries, head.units, from, traces)
-            .await?;
+        let c =
+            addr::lookup::against_chain(provider, address, &found, &head, chain_id, from).await?;
         ensure!(
             c.not_on_chain.is_empty() && c.missing.is_empty(),
             "index and chain differ for {address}: {} entries not on the chain {:?}, {} \

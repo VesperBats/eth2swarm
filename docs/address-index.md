@@ -4,8 +4,11 @@ Status: **implemented on a dev chain; mainnet scale in progress** (#8). Detectio
 (`src/addr/detect.rs`, `ethswarm appearances`), the record formats (`src/addr/layout.rs`),
 slice building and the cover math (`src/addr/slice.rs`), measuring (`ethswarm addr-stats`),
 the importer (`ethswarm addr-import`) with a full read-back check (`ethswarm addr-verify`),
-and a client (`ethswarm addr-lookup`, head discovery, incremental sync, and a check against
-the chain). `ethswarm devnet-activity` generates test traffic on a dev chain. Still open:
+and a client (`ethswarm addr-lookup`, head discovery from a finalized block, incremental
+sync, and a check against the chain). `ethswarm devnet-activity` generates test traffic on
+a dev chain. The client reads every slice and whole spill and pages files; steps 3–5 of
+*Client lookup* (page search, last page first, stopping when the screen is full) and the
+time-based head estimate are not implemented. Still open:
 building the large levels of a mainnet import from disk (the importer builds in memory up to
 `--max-level`, 8 by default), postage batches grouped by lifetime (*Lifetime* below; one
 `--batch` so far), and re-measuring with traces. Design issue: #5.

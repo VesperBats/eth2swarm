@@ -190,9 +190,8 @@ impl IndexReader {
         Ok(entries)
     }
 
-    /// The origin, and the head announcing exactly `units` units.
-    pub async fn head_at(&self, units: u64) -> Result<(HeadRecord, HeadRecord)> {
-        let origin = self.origin().await?;
+    /// The head announcing exactly `units` units, given the origin.
+    pub async fn head_at(&self, origin: &HeadRecord, units: u64) -> Result<HeadRecord> {
         ensure!(
             units >= origin.units,
             "head with {units} units requested, but the index starts at {}",
@@ -205,7 +204,32 @@ impl IndexReader {
             units - origin.units,
             head.units
         );
-        Ok((origin, head))
+        Ok(head)
+    }
+
+    /// Head update `n` if it can be retrieved. A failed retrieval is `Ok(Err(reason))`: Bee
+    /// 2.8.3 answers a missing chunk and an unretrievable one alike, so it may also be
+    /// transient. A chunk that is retrieved but fails its signature, decoding or the unit
+    /// count `N0 + n` is an error.
+    pub async fn probe_head(
+        &self,
+        origin: &HeadRecord,
+        n: u64,
+    ) -> Result<std::result::Result<HeadRecord, String>> {
+        let address = soc_address(&head_id(self.chain_id, n), &self.owner);
+        let raw = match self.bee.get_chunk(&address).await {
+            Ok(raw) => raw,
+            Err(e) => return Ok(Err(format!("{e:#}"))),
+        };
+        let head = HeadRecord::decode(&soc::verify(&raw, &address, &self.owner)?)
+            .with_context(|| format!("head update {n}"))?;
+        ensure!(
+            head.units == origin.units + n,
+            "head update {n} announces {} units, expected {}",
+            head.units,
+            origin.units + n
+        );
+        Ok(Ok(head))
     }
 }
 
@@ -265,11 +289,9 @@ async fn check_bucket(r: IndexReader, s: SliceId, k: u32) -> Result<BucketCheck>
 /// roles, and the head's last block is the newest slice's. [`check_chain`] compares the
 /// slices with the chain.
 pub async fn verify_published(r: &IndexReader, units: Option<u64>) -> Result<Report> {
-    let units = match units {
-        Some(u) => u,
-        None => r.origin().await?.units,
-    };
-    let (origin, head) = r.head_at(units).await?;
+    let origin = r.origin().await?;
+    let units = units.unwrap_or(origin.units);
+    let head = r.head_at(&origin, units).await?;
     // The origin is a copy of head update 0.
     let head0 = if units == origin.units {
         head.clone()

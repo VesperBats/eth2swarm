@@ -49,18 +49,30 @@ pub struct Activity {
 
 /// Sends the activity from `sender`; `authority` signs an EIP-7702 authorization that
 /// `sender` submits. `transfers` is the number of `Transfer` calls.
+/// Chain IDs of local dev chains (Anvil, Hardhat, bee-factory). Anything else needs an
+/// explicit `allow_chain_id`.
+pub const DEV_CHAINS: [u64; 2] = [1337, 31337];
+
 pub async fn run(
     rpc: Url,
     sender: PrivateKeySigner,
     authority: PrivateKeySigner,
     busy: Address,
     transfers: usize,
+    allow_chain_id: Option<u64>,
 ) -> Result<Activity> {
     let from = sender.address();
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(sender))
         .connect_http(rpc);
     let chain_id = provider.get_chain_id().await?;
+    // This sends real transactions and leaves an EIP-7702 delegation on the authority's
+    // account: only on a dev chain, or on the one chain the caller names.
+    ensure!(
+        DEV_CHAINS.contains(&chain_id) || allow_chain_id == Some(chain_id),
+        "chain {chain_id} is not a dev chain ({DEV_CHAINS:?}); devnet-activity sends \
+         transactions with the given keys. Pass --allow-chain-id {chain_id} if that is intended."
+    );
     let mut nonce = provider
         .get_transaction_count(from)
         .pending()
@@ -84,7 +96,9 @@ pub async fn run(
     let emitter = receipt
         .contract_address
         .context("no contract address in the deployment receipt")?;
-    let first_block = receipt.block_number.unwrap_or_default();
+    let first_block = receipt
+        .block_number
+        .context("receipt without a block number")?;
     info!(%emitter, "emitter deployed");
 
     // 2. Many transfers to the busy address, sent at once so that they share few blocks.
@@ -103,7 +117,7 @@ pub async fn run(
     for p in pending {
         let r = p.get_receipt().await?;
         ensure!(r.status(), "a Transfer call failed");
-        last_block = last_block.max(r.block_number.unwrap_or_default());
+        last_block = last_block.max(r.block_number.context("receipt without a block number")?);
     }
 
     // 3. Plain ETH transfers to the busy address.
@@ -114,7 +128,7 @@ pub async fn run(
             .get_receipt()
             .await?;
         nonce += 1;
-        last_block = last_block.max(r.block_number.unwrap_or_default());
+        last_block = last_block.max(r.block_number.context("receipt without a block number")?);
     }
 
     // 4. An EIP-7702 authorization by another key, delegating to the emitter.
@@ -132,7 +146,7 @@ pub async fn run(
     let authority_used = match provider.send_transaction(req).await {
         Ok(p) => {
             let r = p.get_receipt().await?;
-            last_block = last_block.max(r.block_number.unwrap_or_default());
+            last_block = last_block.max(r.block_number.context("receipt without a block number")?);
             Some(authority.address())
         }
         Err(e) => {
@@ -149,4 +163,26 @@ pub async fn run(
         transactions: transfers + 4 + usize::from(authority_used.is_some()),
         authority: authority_used,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The init code copies `RUNTIME` from right after itself and returns it: its length and
+    /// offset must match.
+    #[test]
+    fn init_code_matches_runtime() {
+        let init = hex::decode(INIT).unwrap();
+        let runtime = hex::decode(RUNTIME).unwrap();
+        // PUSH1 len (size of CODECOPY), PUSH1 offset, …, PUSH1 len (size of RETURN), …
+        assert_eq!(init[1] as usize, runtime.len());
+        assert_eq!(init[3] as usize, init.len());
+        assert_eq!(init[8] as usize, runtime.len());
+        // The topic is Transfer(address,address,uint256).
+        assert_eq!(
+            &runtime[12..44],
+            alloy::primitives::keccak256("Transfer(address,address,uint256)").as_slice()
+        );
+    }
 }
