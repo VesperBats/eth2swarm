@@ -67,6 +67,55 @@ enum Command {
         /// Block number.
         number: u64,
     },
+    /// Publish the address index to Swarm (docs/address-index.md): a backfill on the first
+    /// run, then one slice and one head update per finalized unit, resuming from --state.
+    AddrImport {
+        /// Private key of the SOC owner.
+        #[arg(long, env = "ETH2SWARM_KEY", hide_env_values = true)]
+        key: PrivateKeySigner,
+        /// Directory for the importer's state file.
+        #[arg(long)]
+        state: std::path::PathBuf,
+        /// Import up to this many units (default: every finalized unit).
+        #[arg(long)]
+        units: Option<u64>,
+        /// Keep importing newly finalized units until stopped. Without it, a run returns once
+        /// the target is published and the merges it started are built.
+        #[arg(long)]
+        follow: bool,
+        /// Start a new index (first run, no state yet). Refused if the key already has one.
+        #[arg(long)]
+        init: bool,
+        /// Also read `trace_block` (see `appearances`).
+        #[arg(long)]
+        traces: bool,
+        /// Postage batch ID. Defaults to the Bee node's first usable batch.
+        #[arg(long)]
+        batch: Option<B256>,
+        /// Merges of this level and above are built in the background.
+        #[arg(long, default_value_t = 6)]
+        defer_level: u8,
+        /// Highest slice level built in memory.
+        #[arg(long, default_value_t = 8)]
+        max_level: u8,
+        /// Blocks fetched, and chunks uploaded, in parallel.
+        #[arg(long, default_value_t = 16)]
+        concurrency: usize,
+    },
+    /// Read the published address index back and check what one head makes a client read:
+    /// every slice's buckets against its descriptor, every file against its reference, and
+    /// every slice's last block against the chain (--rpc).
+    AddrVerify {
+        /// Address of the SOC owner (the importer's key).
+        #[arg(long, env = "ETH2SWARM_OWNER")]
+        owner: Address,
+        /// Chain ID used in the SOC identifiers.
+        #[arg(long, env = "ETH2SWARM_CHAIN_ID", default_value_t = 1)]
+        chain_id: u64,
+        /// The head announcing this many units (default: the origin's).
+        #[arg(long)]
+        units: Option<u64>,
+    },
     /// Measure the address index with the real encoder: build every slice of levels
     /// 0..=LEVEL in the level-LEVEL window around each `--at` block and print the sizes per
     /// level as a Markdown table (nothing is uploaded).
@@ -204,6 +253,62 @@ async fn main() -> Result<()> {
             println!("Timestamp:  {}", block.header.timestamp);
             println!("Txs:        {}", block.transactions.len());
             println!("Gas used:   {}", block.header.gas_used);
+        }
+        Command::AddrImport {
+            key,
+            state,
+            units,
+            follow,
+            init,
+            traces,
+            batch,
+            defer_level,
+            max_level,
+            concurrency,
+        } => {
+            let opts = addr::import::ImportOptions {
+                state_dir: state,
+                units,
+                follow,
+                init,
+                traces,
+                batch,
+                defer_level,
+                max_level,
+                concurrency,
+            };
+            let s = addr::import::run(&provider, &bee, &key, opts).await?;
+            println!(
+                "Address index of owner {} on chain {}: {} units, head update {}",
+                s.owner, s.chain_id, s.units, s.head_index
+            );
+        }
+        Command::AddrVerify {
+            owner,
+            chain_id,
+            units,
+        } => {
+            let reader = addr::verify::IndexReader {
+                bee: bee.clone(),
+                owner,
+                chain_id,
+            };
+            let r = addr::verify::verify_published(&reader, units).await?;
+            addr::verify::check_chain(&provider, &r).await?;
+            for ((level, index), root, _) in &r.slices {
+                println!("  slice ({level}, {index}): buckets root {root}");
+            }
+            println!(
+                "Verified head for {} units (pending {:?}): {} slices, {} buckets, {} files, \
+                 {} addresses, {} appearances",
+                r.units,
+                r.pending,
+                r.slices.len(),
+                r.buckets,
+                r.files,
+                r.addresses,
+                r.appearances
+            );
         }
         Command::AddrStats {
             level,
@@ -376,22 +481,14 @@ async fn addr_slice<P>(provider: &P, level: u8, index: u32, traces: bool) -> Res
 where
     P: Provider + Clone + 'static,
 {
-    use addr::detect::role;
     use addr::layout::{L_MAX, first_block, last_block};
     use swarm::file::file_chunks;
 
     ensure!(level <= L_MAX, "slice level {level} above {L_MAX}");
     let (first, last) = (first_block(level, index), last_block(level, index));
-    let mut apps = Vec::new();
-    let mut last_hash = B256::ZERO;
-    addr::fetch::fetch_appearances(provider, first..=last, traces, 16, |b| {
-        apps.extend(b.appearances);
-        last_hash = b.hash;
-        Ok(())
-    })
-    .await?;
-    let roles = if traces { 0xff } else { !role::TRACE };
-    let built = addr::slice::build_slice((level, index), &apps, last_hash, roles)?;
+    let built = addr::fetch::fetch_slice(provider, (level, index), traces, 16, None)
+        .await?
+        .built;
     let r = &built.record;
     let file_bytes: usize = built.files.iter().map(|(_, f)| f.len()).sum();
     let chunks: usize = built.files.iter().map(|(_, f)| file_chunks(f.len())).sum();
@@ -443,7 +540,7 @@ where
         level <= MAX_WINDOW_LEVEL,
         "window level {level} above {MAX_WINDOW_LEVEL} (the window is held in memory)"
     );
-    let roles = if traces { 0xff } else { !role::TRACE };
+    let roles = role::mask(traces);
     let tip = provider
         .get_block_number()
         .await

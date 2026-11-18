@@ -35,9 +35,9 @@ export RUST_LOG=${RUST_LOG:-warn}
 cargo build -q --locked
 BIN=target/debug/ethswarm
 LAST=$((EPOCH_SIZE * EPOCHS - 1))
-# The address-index steps read blocks 0..=127 (the level-1 window at block 0), which may lie
-# beyond the imported range.
-NEED=$((LAST > 127 ? LAST : 127))
+# The address-index steps read blocks 0..=319 (five units), which must be finalized: the
+# Anvil node finalizes 64 blocks behind its tip. They may lie beyond the imported range.
+NEED=$((LAST > 383 ? LAST : 383))
 
 # A freshly started Anvil chain may not have the blocks yet (1 block per second). A
 # failed `tip` call is retried; output that has no numeric tip fails at once. This loop
@@ -122,6 +122,57 @@ STATS=$($BIN addr-stats --level 1 --at 0 "${TRACE_FLAG[@]}") || { echo "FAIL: ad
 ROWS=$(printf '%s\n' "$STATS" | grep -cE '^\| [01] \|' || true)
 [ "$ROWS" = 2 ] || { echo "FAIL: addr-stats printed $ROWS level rows, expected 2:"; echo "$STATS"; exit 1; }
 echo "ok: addr-stats"
+
+echo "== address index: import, resume with deferred merges, verify via $READ_BEE"
+# A fresh key per run: the origin and the heads are write-once SOCs, and a rerun against the
+# same stack must not collide with an earlier run's.
+ADDR_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+ADDR_STATE=$(mktemp -d)
+addr_import() {
+  $BIN --bee "$UPLOAD_BEE" addr-import --key "$ADDR_KEY" --state "$ADDR_STATE" \
+    --defer-level 1 "${TRACE_FLAG[@]}" "$@"
+}
+addr_verify() {
+  $BIN --bee "$READ_BEE" addr-verify --owner "$ADDR_OWNER" --chain-id "$CHAIN_ID" --units "$1"
+}
+OUT=$(addr_import --units 2 --init) || { echo "FAIL: addr-import (backfill)"; echo "$OUT"; exit 1; }
+ADDR_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
+[[ "$ADDR_OWNER" =~ ^0x[0-9a-fA-F]{40}$ ]] || { echo "FAIL: no owner in: $OUT"; exit 1; }
+# Another first run under the same key, from an empty state directory, must be refused: it
+# would write a second origin.
+OTHER_STATE=$(mktemp -d)
+if $BIN --bee "$UPLOAD_BEE" addr-import --key "$ADDR_KEY" --state "$OTHER_STATE" --init \
+    --units 2 >/dev/null 2>&1; then
+  echo "FAIL: a second --init under the same key was accepted"; exit 1
+fi
+rm -rf "$OTHER_STATE"
+echo "ok: a second backfill under the same key is refused"
+# Unit 4 completes slice (2, 0), which is deferred: head 4 lists it as pending.
+addr_import --units 4 >/dev/null || { echo "FAIL: addr-import (resume to 4 units)"; exit 1; }
+for u in 2 3 4; do
+  OUT=$(addr_verify "$u") || { echo "FAIL: addr-verify --units $u"; echo "$OUT"; exit 1; }
+  echo "$OUT" | tail -1
+done
+echo "$OUT" | grep -q 'pending \[(2, 0)\]' \
+  || { echo "FAIL: head 4 does not list the deferred merge (2, 0)"; exit 1; }
+# Unit 5, with two crashes: one between saving head 5 and uploading it, one after the upload
+# but before the state records it. Each next run must publish exactly the prepared head (the
+# second one uploads an identical SOC again). Head 5 drops the built merge (2, 0).
+for fp in before-head-upload after-head-upload; do
+  if ETH2SWARM_ADDR_FAILPOINT=$fp addr_import --units 5 >/dev/null 2>&1; then
+    echo "FAIL: failpoint $fp did not stop the run"; exit 1
+  fi
+done
+addr_import --units 5 >/dev/null || { echo "FAIL: addr-import (resume to 5 units after crashes)"; exit 1; }
+echo "ok: head 5 published after a crash before and one after its upload"
+OUT=$(addr_verify 5) || { echo "FAIL: addr-verify --units 5"; echo "$OUT"; exit 1; }
+echo "$OUT" | tail -1
+PUBLISHED=$(echo "$OUT" | awk '/slice \(2, 0\)/ {print $NF}')
+LOCAL=$($BIN addr-slice 2 0 "${TRACE_FLAG[@]}" | awk '/buckets root:/ {print $3}')
+[ -n "$PUBLISHED" ] && [ "$PUBLISHED" = "$LOCAL" ] \
+  || { echo "FAIL: published (2, 0) root '$PUBLISHED', local build '$LOCAL'"; exit 1; }
+rm -rf "$ADDR_STATE"
+echo "ok: address index published, resumed, merged and verified (slice (2, 0) root $LOCAL)"
 
 echo "== inspector (ethswarm serve) verifies a block via $READ_BEE"
 # INSPECTOR_ADDR is an IP:port (a socket address, not a host name). Refuse a port that

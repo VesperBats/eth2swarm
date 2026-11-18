@@ -8,9 +8,6 @@
 //! have been paged, empty spill or paged counts, non-zero padding. Whether a spill or pages
 //! file's content is canonical shows only when it is read.
 
-// The importer and client that use all of this follow in parts 4 and 5 of #8.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use alloy::primitives::{B256, keccak256};
 use anyhow::{Context, Result, bail, ensure};
 
@@ -373,6 +370,8 @@ pub struct SliceRecord {
 }
 
 impl SliceRecord {
+    // Format constant, checked by the tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const LEN: usize = 111;
 
     pub fn first_block(&self) -> u64 {
@@ -453,6 +452,7 @@ pub struct BucketRecord {
 impl BucketRecord {
     /// Header size of an inline bucket (`MAGIC ‖ VERSION ‖ kind ‖ level ‖ index ‖ bucket ‖
     /// paged ‖ count`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const INLINE_HEADER: usize = 19;
 
     pub fn encode(&self) -> Vec<u8> {
@@ -535,7 +535,7 @@ impl BucketRecord {
 }
 
 /// A head feed update, or the origin (kind 6, 62 + 5·p bytes).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeadRecord {
     /// `N`, the number of complete units.
     pub units: u64,
