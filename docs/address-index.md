@@ -1,6 +1,7 @@
 # Address index (design)
 
-Status: **design, not implemented.** Tracking issue: #5.
+Status: **design; implementation in progress** (#8). Detection is implemented in
+`src/addr/detect.rs`; the formats, importer and client are not yet. Design issue: #5.
 
 An index from an **address** to the transactions it **appears in**, stored on Swarm next to
 the [SOC block store](soc-block-store.md). A mobile wallet uses it to list an address's
@@ -87,7 +88,7 @@ exceptions:
 
 - *Address-shaped* (TrueBlocks' "implicit address"): a 32-byte word whose first 12 bytes
   are zero, whose value is at least 2^104 (one of bytes 12–18 is non-zero, so an address
-  may have up to seven leading zero bytes), and whose last four bytes are not all zero
+  may have up to six leading zero bytes), and whose last four bytes are not all zero
   (that is a round amount far more often than an address).
 - *Words of* some data at offset `o`: the 32-byte windows at byte offsets `o + 32·k` that
   fit completely; a shorter remainder is ignored.
@@ -138,9 +139,23 @@ exceptions:
   of a transaction, `action.from` and `action.to` (every call frame, including the
   top-level one and delegate and static calls), the created contract (`result.address` of a
   `create`), and for a `suicide` the destroyed contract (`action.address`) and its
-  beneficiary (`action.refundAddress`). Other trace types contribute nothing. Only
-  importers with a tracing source set it; the slice's `roles` byte says which roles were
-  detected.
+  beneficiary (`action.refundAddress`). Only importers with a tracing source set it; the
+  slice's `roles` byte says which roles were detected.
+
+  Traces cannot be verified without re-executing the block, so an importer that sets
+  `TRACE` checks the `trace_block` answer and **rejects the block** (publishes nothing for
+  it, and stops) unless:
+  - every trace has type `call`, `create`, `suicide` or `reward`, and this block's
+    `blockHash`;
+  - a `reward` names no transaction, and its `author` is the beneficiary of the block or
+    of an uncle;
+  - every other trace names an existing transaction by `transactionPosition` and
+    `transactionHash`;
+  - every transaction has exactly one root trace (empty `traceAddress`), which rules out
+    an empty or partial answer.
+
+  A trace of another type therefore stops the import instead of being skipped: skipping it
+  is exactly how two importers would end up with different slices.
 
 A wallet that only wants transfers it took part in filters on `FROM | TO | TOPIC | TRACE |
 BLOCK | AUTH`. `WORD` keeps the index as complete as TrueBlocks' and gives spam filters
@@ -510,6 +525,12 @@ Oldest first is the same in the opposite order.
 
 ## Measurements
 
+**These figures predate the current detection rules.** They were measured with the earlier
+rule set: the 2^128 word bound, no init code, no `topic0`, no traces. The current rules (the
+TrueBlocks superset) find more appearances, so the totals, sizes and costs below are lower
+bounds until `addr-stats` (part 3 of #8) measures again, with traces once a tracing node is
+available.
+
 Measured on 2026-11-16 against mainnet (the zbox geth node: full history, no traces, so no
 `TRACE` role) with throwaway scripts that encode the sampled appearances in the record formats above.
 Simplifications: the address-shaped test was applied to all topics (no known-event rule),
@@ -633,6 +654,13 @@ receipts on top for log roles.
 - **Block store.** Receipts, transaction offsets and trie nodes (above); moving the header
   accumulator to a Merkle Mountain Range (the same doubling scheme) would remove the
   "extending the range changes the anchor" limitation.
+- **Tracer-dependent edge cases.** `TRACE` and trace `WORD`s are defined by an RPC
+  format, not by the EVM, and Parity-style tracers differ at the edges. For example, a
+  reverted frame's revert data may or may not be in `result.output`. A call to a precompile
+  may get a frame only at top level or with value, and `ecrecover`'s output is an
+  address-shaped word. Identical slices across importers need these cases written into the
+  rules, or the tracer named as part of them. To be settled when the detection is compared
+  against TrueBlocks on an Erigon node.
 - **Genesis allocations.** TrueBlocks indexes the prefunded addresses of the genesis
   state at block 0 (about 8,900 on mainnet). Adding them needs the allocation list as an
   input (it is not in any block), and a convention for its slots.

@@ -6,7 +6,8 @@
 #
 # Reads Ethereum mainnet blocks from the zbox node (override with ETH2SWARM_RPC), imports them
 # via worker 1 (which holds the postage batch), then reads and verifies them through the queen
-# (proves p2p retrieval), checks that bad inputs are rejected, and checks that the inspector
+# (proves p2p retrieval), checks that bad inputs are rejected, lists the address appearances
+# of a block with a transaction, and checks that the inspector
 # (`ethswarm serve`) verifies a block too.
 #
 # Against the local Anvil chain instead (what the integration workflow does):
@@ -79,6 +80,32 @@ expect_fail "wrong anchor" $BIN --bee "$READ_BEE" get 3 --owner "$OWNER" \
 expect_fail "wrong owner" $BIN --bee "$READ_BEE" get 3 \
   --owner 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 --chain-id "$CHAIN_ID" --anchor "$ANCHOR"
 expect_fail "block outside accumulator" client get $((LAST + 1))
+
+echo "== address appearances (docs/address-index.md, detection rules)"
+# The first imported block with a transaction; with traces if the RPC serves trace_block
+# (Anvil, Erigon, Reth; not geth). The block, receipts and traces are verified on the way.
+TX_BLOCK=
+for ((n = 0; n <= LAST; n++)); do
+  TXS=$($BIN block "$n" | awk '/Txs:/ {print $2}')
+  [[ "$TXS" =~ ^[0-9]+$ ]] || { echo "FAIL: no transaction count for block $n"; exit 1; }
+  if [ "$TXS" -gt 0 ]; then TX_BLOCK=$n; break; fi
+done
+if [ -z "$TX_BLOCK" ]; then
+  echo "skip: no transaction in blocks 0..$LAST"
+else
+  TRACE_FLAG=()
+  $BIN appearances "$TX_BLOCK" --traces >/dev/null 2>&1 && TRACE_FLAG=(--traces)
+  APPS=$($BIN appearances "$TX_BLOCK" "${TRACE_FLAG[@]}") \
+    || { echo "FAIL: appearances of block $TX_BLOCK"; exit 1; }
+  echo "$APPS" | tail -1
+  echo "$APPS" | grep -Eq '[[:space:]]from(\||$)' \
+    || { echo "FAIL: block $TX_BLOCK has a transaction but no FROM appearance"; exit 1; }
+  if [ ${#TRACE_FLAG[@]} -gt 0 ]; then
+    echo "$APPS" | grep -q 'trace' \
+      || { echo "FAIL: block $TX_BLOCK traced, but no TRACE appearance"; exit 1; }
+  fi
+  echo "ok: appearances of block $TX_BLOCK${TRACE_FLAG:+ (with traces)}"
+fi
 
 echo "== inspector (ethswarm serve) verifies a block via $READ_BEE"
 # INSPECTOR_ADDR is an IP:port (a socket address, not a host name). Refuse a port that

@@ -10,6 +10,8 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::{Context, Result, bail, ensure};
+
 use alloy::eips::eip7702::SignedAuthorization;
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use serde::Deserialize;
@@ -114,6 +116,9 @@ pub struct Trace {
     pub transaction_hash: Option<B256>,
     #[serde(default)]
     pub block_hash: Option<B256>,
+    /// Path of the call frame below the transaction's root frame (`[]` for the root).
+    #[serde(default)]
+    pub trace_address: Vec<u64>,
     /// `call`, `create`, `suicide`, `reward`.
     #[serde(rename = "type", default)]
     pub kind: String,
@@ -139,6 +144,80 @@ pub struct TraceResult {
     /// Created contract.
     pub address: Option<Address>,
     pub output: Option<Bytes>,
+}
+
+/// Trace types detection understands. A block whose traces contain another type is
+/// rejected (see [`check_traces`]), so that an importer never silently disagrees with one
+/// that knows the type.
+pub const TRACE_KINDS: [&str; 4] = ["call", "create", "suicide", "reward"];
+
+/// Checks that `traces` are a complete `trace_block` answer for the verified block with hash
+/// `block_hash`, transactions `tx_hashes` and beneficiaries `beneficiaries` (header and
+/// uncles). Traces cannot be verified without re-execution; this rules out traces of another
+/// block, a partial or empty answer, and fields detection depends on being absent:
+///
+/// - every trace has a known type and this block's hash;
+/// - a `reward` names no transaction, and its author is the beneficiary of the block or of
+///   an uncle;
+/// - every other trace names an existing transaction by position and hash;
+/// - every transaction has exactly one root trace (empty `traceAddress`).
+pub fn check_traces(
+    traces: &[Trace],
+    block_hash: B256,
+    tx_hashes: &[B256],
+    beneficiaries: &[Address],
+) -> Result<()> {
+    let mut roots = vec![0usize; tx_hashes.len()];
+    for (k, t) in traces.iter().enumerate() {
+        if !TRACE_KINDS.contains(&t.kind.as_str()) {
+            bail!("trace {k} has unknown type {:?}", t.kind);
+        }
+        let h = t
+            .block_hash
+            .with_context(|| format!("trace {k} has no blockHash"))?;
+        ensure!(
+            h == block_hash,
+            "trace {k} is for block {h}, not {block_hash}"
+        );
+        if t.kind == "reward" {
+            ensure!(
+                t.transaction_position.is_none(),
+                "reward trace {k} names a transaction"
+            );
+            let author = t
+                .action
+                .author
+                .with_context(|| format!("reward trace {k} has no author"))?;
+            ensure!(
+                beneficiaries.contains(&author),
+                "reward trace {k}: author {author} is not a beneficiary of the block or an uncle"
+            );
+            continue;
+        }
+        let pos = t
+            .transaction_position
+            .with_context(|| format!("{} trace {k} names no transaction", t.kind))?;
+        let expected = tx_hashes
+            .get(pos as usize)
+            .with_context(|| format!("trace {k} names transaction {pos} of {}", tx_hashes.len()))?;
+        let h = t
+            .transaction_hash
+            .with_context(|| format!("trace {k} has no transactionHash"))?;
+        ensure!(
+            h == *expected,
+            "trace {k} names transaction {pos} with hash {h}, expected {expected}"
+        );
+        if t.trace_address.is_empty() {
+            roots[pos as usize] += 1;
+        }
+    }
+    if let Some(pos) = roots.iter().position(|n| *n != 1) {
+        bail!(
+            "transaction {pos} has {} root traces, expected 1 (incomplete trace_block answer?)",
+            roots[pos]
+        );
+    }
+    Ok(())
 }
 
 /// Addresses up to `0x…ffff` (the zero address, precompiles) are never indexed, as in
@@ -246,7 +325,8 @@ impl Collector {
     }
 }
 
-/// All appearances in a block, ascending by (slot, address).
+/// All appearances in a block, ascending by (slot, address). The traces, if any, must have
+/// passed [`check_traces`].
 pub fn detect(block: &BlockData) -> Vec<Appearance> {
     use role::*;
     let mut c = Collector {
@@ -329,8 +409,8 @@ pub fn detect(block: &BlockData) -> Vec<Appearance> {
                     c.add(a, slot, WORD);
                 }
             }
-            // Other types, or a transaction trace without a position: nothing (`fetch`
-            // rejects unknown types before detection runs).
+            // Other types, or a transaction trace without a position: nothing. Callers run
+            // [`check_traces`] first, which rejects both.
             _ => {}
         }
     }
@@ -581,6 +661,76 @@ mod tests {
             find(&apps, x("9999999999999999999999999999999999999999"), 0),
             Some(BLOCK)
         );
+    }
+
+    fn root_call(pos: u64, tx: B256, block: B256) -> Trace {
+        Trace {
+            kind: "call".into(),
+            transaction_position: Some(pos),
+            transaction_hash: Some(tx),
+            block_hash: Some(block),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trace_checks() {
+        let block = B256::repeat_byte(1);
+        let txs = [B256::repeat_byte(2), B256::repeat_byte(3)];
+        let miner = [B];
+        let good = vec![
+            root_call(0, txs[0], block),
+            Trace {
+                trace_address: vec![0],
+                ..root_call(0, txs[0], block)
+            },
+            root_call(1, txs[1], block),
+            Trace {
+                kind: "reward".into(),
+                transaction_position: None,
+                transaction_hash: None,
+                action: TraceAction {
+                    author: Some(B),
+                    ..Default::default()
+                },
+                ..root_call(0, txs[0], block)
+            },
+        ];
+        check_traces(&good, block, &txs, &miner).unwrap();
+
+        let fails = |traces: Vec<Trace>, what: &str| {
+            let err = check_traces(&traces, block, &txs, &miner).unwrap_err();
+            assert!(err.to_string().contains(what), "{what}: got {err}");
+        };
+        fails(vec![], "root traces");
+        fails(good[..2].to_vec(), "transaction 1 has 0 root traces");
+        let mut two_roots = good.clone();
+        two_roots.push(root_call(1, txs[1], block));
+        fails(two_roots, "transaction 1 has 2 root traces");
+        let mut other_block = good.clone();
+        other_block[2].block_hash = Some(B256::repeat_byte(9));
+        fails(other_block, "is for block");
+        let mut no_block_hash = good.clone();
+        no_block_hash[2].block_hash = None;
+        fails(no_block_hash, "no blockHash");
+        let mut no_tx_hash = good.clone();
+        no_tx_hash[2].transaction_hash = None;
+        fails(no_tx_hash, "no transactionHash");
+        let mut wrong_tx = good.clone();
+        wrong_tx[2].transaction_hash = Some(txs[0]);
+        fails(wrong_tx, "expected");
+        let mut no_pos = good.clone();
+        no_pos[2].transaction_position = None;
+        fails(no_pos, "names no transaction");
+        let mut out_of_range = good.clone();
+        out_of_range[2].transaction_position = Some(5);
+        fails(out_of_range, "transaction 5 of 2");
+        let mut unknown = good.clone();
+        unknown[1].kind = "selfdestruct".into();
+        fails(unknown, "unknown type");
+        let mut stranger = good.clone();
+        stranger[3].action.author = Some(A);
+        fails(stranger, "not a beneficiary");
     }
 
     #[test]

@@ -12,14 +12,20 @@ use alloy::consensus::transaction::SignerRecoverable as _;
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::network::ReceiptResponse as _;
 use alloy::providers::Provider;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
-use super::detect::{BlockData, LogData, Trace, TxData};
+use alloy::consensus::TxEnvelope;
+use alloy::primitives::Address;
+
+use super::detect::{BlockData, LogData, Trace, TxData, check_traces};
 use crate::chain::fetch_verified_block;
 
-/// Trace types detection understands; any other type fails the block, so that an importer
-/// never silently disagrees with one that knows the type.
-const TRACE_KINDS: [&str; 4] = ["call", "create", "suicide", "reward"];
+/// The sender of a transaction from a verified block. Recovery skips EIP-2's low-`s` rule:
+/// before Homestead a high `s` was valid (block 46170 has one), and from Homestead on
+/// consensus enforces it, so the block's match with `transactionsRoot` already covers it.
+fn sender(tx: &TxEnvelope) -> Result<Address> {
+    Ok(tx.recover_signer_unchecked()?)
+}
 
 /// Fetch block `number` with its receipts and uncles, and its `trace_block` traces if
 /// `traces` is set (Erigon, Reth, Anvil; not geth).
@@ -77,8 +83,7 @@ pub async fn fetch_block_data(
                 receipt.transaction_hash() == *tx.tx_hash(),
                 "block {number}: receipt {i} belongs to another transaction"
             );
-            let sender = tx
-                .recover_signer()
+            let sender = sender(tx)
                 .with_context(|| format!("block {number}: recovering the sender of tx {i}"))?;
             Ok(TxData {
                 sender,
@@ -104,38 +109,19 @@ pub async fn fetch_block_data(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let uncle_beneficiaries: Vec<_> = block.body.ommers.iter().map(|u| u.beneficiary).collect();
     if let Some(traces) = &traces {
-        for (k, t) in traces.iter().enumerate() {
-            if !TRACE_KINDS.contains(&t.kind.as_str()) {
-                bail!("block {number}: trace {k} has unknown type {:?}", t.kind);
-            }
-            if let Some(h) = t.block_hash {
-                ensure!(
-                    h == hash,
-                    "block {number}: trace {k} is for block {h}, not {hash}"
-                );
-            }
-            if let Some(pos) = t.transaction_position {
-                let tx = txs.get(pos as usize).with_context(|| {
-                    format!(
-                        "block {number}: trace {k} names transaction {pos} of {}",
-                        txs.len()
-                    )
-                })?;
-                if let Some(h) = t.transaction_hash {
-                    ensure!(
-                        h == *tx.tx_hash(),
-                        "block {number}: trace {k} names transaction {pos} with hash {h}"
-                    );
-                }
-            }
-        }
+        let tx_hashes: Vec<_> = txs.iter().map(|tx| *tx.tx_hash()).collect();
+        let mut beneficiaries = uncle_beneficiaries.clone();
+        beneficiaries.push(block.header.beneficiary);
+        check_traces(traces, hash, &tx_hashes, &beneficiaries)
+            .with_context(|| format!("block {number}: traces from trace_block"))?;
     }
 
     Ok(BlockData {
         number,
         beneficiary: block.header.beneficiary,
-        uncle_beneficiaries: block.body.ommers.iter().map(|u| u.beneficiary).collect(),
+        uncle_beneficiaries,
         withdrawal_recipients: block
             .body
             .withdrawals
@@ -145,4 +131,35 @@ pub async fn fetch_block_data(
         txs: tx_data,
         traces,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::consensus::{SignableTransaction, Signed, TxLegacy};
+    use alloy::primitives::{Signature, TxKind, U256};
+    use alloy::signers::SignerSync;
+    use alloy::signers::local::PrivateKeySigner;
+
+    #[test]
+    fn sender_accepts_a_high_s_signature() {
+        let key = PrivateKeySigner::random();
+        let tx = TxLegacy {
+            nonce: 1,
+            gas_price: 1,
+            gas_limit: 21_000,
+            to: TxKind::Call(Address::repeat_byte(0x11)),
+            ..Default::default()
+        };
+        let sig = key.sign_hash_sync(&tx.signature_hash()).unwrap();
+        // The other valid signature of the same message: s' = n − s, parity flipped. Pre-EIP-2
+        // transactions may carry it.
+        let n = U256::from_be_bytes(alloy::hex!(
+            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"
+        ));
+        let high = Signature::new(sig.r(), n - sig.s(), !sig.v());
+        let env = TxEnvelope::Legacy(Signed::new_unhashed(tx, high));
+        assert!(env.recover_signer().is_err(), "the EIP-2 check rejects it");
+        assert_eq!(sender(&env).unwrap(), key.address());
+    }
 }
