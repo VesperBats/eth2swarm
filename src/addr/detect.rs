@@ -110,6 +110,10 @@ pub struct Trace {
     /// Position of the transaction in the block; absent for block rewards.
     #[serde(default)]
     pub transaction_position: Option<u64>,
+    #[serde(default)]
+    pub transaction_hash: Option<B256>,
+    #[serde(default)]
+    pub block_hash: Option<B256>,
     /// `call`, `create`, `suicide`, `reward`.
     #[serde(rename = "type", default)]
     pub kind: String,
@@ -204,17 +208,14 @@ const SECP256K1_N: U256 = U256::from_be_slice(&[
 
 /// The authority of an EIP-7702 authorization entry, if the entry counts: `y_parity ∈ {0, 1}`,
 /// `0 < r < n`, `0 < s ≤ n/2`, and recovery succeeds. Chain ID and nonce are not checked.
+/// `recover_authority` checks the parity and `s ≤ n/2`; the range checks it leaves out are
+/// done here.
 pub fn authority(auth: &SignedAuthorization) -> Option<Address> {
     let (r, s) = (auth.r(), auth.s());
-    if auth.y_parity() > 1 || r.is_zero() || r >= SECP256K1_N || s.is_zero() {
+    if r.is_zero() || r >= SECP256K1_N || s.is_zero() {
         return None;
     }
-    if s > SECP256K1_N >> 1 {
-        return None;
-    }
-    let sig = auth.signature().ok()?;
-    sig.recover_address_from_prehash(&auth.signature_hash())
-        .ok()
+    auth.recover_authority().ok()
 }
 
 /// Collects appearances, merging roles per (address, slot).
@@ -296,35 +297,41 @@ pub fn detect(block: &BlockData) -> Vec<Appearance> {
     }
 
     for trace in block.traces.iter().flatten() {
-        let Some(pos) = trace.transaction_position else {
-            // Block and uncle rewards.
-            if trace.kind == "reward"
-                && let Some(a) = trace.action.author
-            {
-                c.add(a, 0, BLOCK);
-            }
-            continue;
-        };
-        let slot = pos as u32 + 1;
         let act = &trace.action;
-        for a in [act.from, act.to, act.address, act.refund_address]
-            .into_iter()
-            .flatten()
-        {
-            c.add(a, slot, TRACE);
-        }
-        if let Some(res) = &trace.result {
-            if trace.kind == "create"
-                && let Some(a) = res.address
-            {
-                c.add(a, slot, TRACE);
+        match (trace.kind.as_str(), trace.transaction_position) {
+            // Block and uncle rewards (pre-merge).
+            ("reward", _) => {
+                if let Some(a) = act.author {
+                    c.add(a, 0, BLOCK);
+                }
             }
-            for a in words(res.output.as_ref().map_or(&[][..], |b| b.as_ref()), 0) {
-                c.add(a, slot, WORD);
+            ("call" | "create" | "suicide", Some(pos)) => {
+                let slot = pos as u32 + 1;
+                // Call: from/to of the frame. Create: the creator. Suicide: the destroyed
+                // contract and its beneficiary.
+                for a in [act.from, act.to, act.address, act.refund_address]
+                    .into_iter()
+                    .flatten()
+                {
+                    c.add(a, slot, TRACE);
+                }
+                if let Some(res) = &trace.result {
+                    if trace.kind == "create"
+                        && let Some(a) = res.address
+                    {
+                        c.add(a, slot, TRACE);
+                    }
+                    for a in words(res.output.as_ref().map_or(&[][..], |b| b.as_ref()), 0) {
+                        c.add(a, slot, WORD);
+                    }
+                }
+                for a in words(act.input.as_ref().map_or(&[][..], |b| b.as_ref()), 4) {
+                    c.add(a, slot, WORD);
+                }
             }
-        }
-        for a in words(act.input.as_ref().map_or(&[][..], |b| b.as_ref()), 4) {
-            c.add(a, slot, WORD);
+            // Other types, or a transaction trace without a position: nothing (`fetch`
+            // rejects unknown types before detection runs).
+            _ => {}
         }
     }
 

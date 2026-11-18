@@ -76,9 +76,14 @@ The rules are a **superset of TrueBlocks'** (`trueblocks-chifra`, `pkg/uniq`, at
 heuristic, plus log emitters, known token events regardless of value, and EIP-7702
 authorities. Every appearance TrueBlocks' scraper finds is found here too, which makes its
 published index a test oracle for this one: its transaction index `i` is slot `i + 1`
-here, and its block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. One
-exception: TrueBlocks records a reward to a precompile address under a sentinel address;
-here it is ignored like every other address up to `0x…ffff`.
+here, and its block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. Two
+exceptions:
+
+- TrueBlocks records a reward to a precompile address under a sentinel address; here it is
+  ignored like every other address up to `0x…ffff`.
+- TrueBlocks indexes the **genesis allocations** as block 0, from a per-chain `allocs.csv`.
+  Genesis state is not in any block, so this detection does not see it; see *Open
+  questions*.
 
 - *Address-shaped* (TrueBlocks' "implicit address"): a 32-byte word whose first 12 bytes
   are zero, whose value is at least 2^104 (one of bytes 12–18 is non-zero, so an address
@@ -628,5 +633,8 @@ receipts on top for log roles.
 - **Block store.** Receipts, transaction offsets and trie nodes (above); moving the header
   accumulator to a Merkle Mountain Range (the same doubling scheme) would remove the
   "extending the range changes the anchor" limitation.
+- **Genesis allocations.** TrueBlocks indexes the prefunded addresses of the genesis
+  state at block 0 (about 8,900 on mainnet). Adding them needs the allocation list as an
+  input (it is not in any block), and a convention for its slots.
 - **Adding traces later.** A slice's `roles` byte says what was detected; a slice rebuilt
   with traces would have to be published under a new namespace.
