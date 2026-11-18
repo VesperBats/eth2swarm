@@ -453,12 +453,12 @@ range. `u32` block numbers last until block 2^32, more than 1600 years of 12-sec
 | Field | Type | Meaning |
 |---|---|---|
 | header | 5 bytes | `"E2S" ‖ 0x01 ‖ 0x06` |
-| `units` | u64 | `N`, the number of complete units |
+| `units` | u64 | `N`, the number of complete units, at most 2^26 (spill pages store block numbers as u32) |
 | `last_block` | u64 | `N·U − 1` |
 | `last_block_hash` | 32 bytes | hash of `last_block` |
 | `last_block_timestamp` | u64 | timestamp of `last_block` (seconds) |
 | `pending_count` | u8 | `p`, the number of deferred merges |
-| `pending` | `p` × (u8 level ‖ u32 index) | the deferred merged slices, ascending by first unit |
+| `pending` | `p` × (u8 level ‖ u32 index) | the deferred merged slices, strictly ascending by (first unit, level): an outer merge deferred while an inner one is pending starts at the same unit |
 
 ## Client lookup
 

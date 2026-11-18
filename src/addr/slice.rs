@@ -84,12 +84,12 @@ pub fn slices_after(m: u64, n: u64) -> Vec<SliceId> {
 }
 
 /// A slice built in memory: its descriptor, its bucket payloads (index = bucket number) and
-/// the spill and pages files they reference.
+/// the spill and pages files they reference, each with its Swarm reference.
 #[derive(Debug, Clone)]
 pub struct BuiltSlice {
     pub record: SliceRecord,
     pub buckets: Vec<Vec<u8>>,
-    pub files: Vec<Vec<u8>>,
+    pub files: Vec<(B256, Vec<u8>)>,
 }
 
 /// keccak256 of the address bytes: bucket from `h[0..4]`, fingerprint `h[4..12]`.
@@ -130,6 +130,10 @@ fn build(
     let (level, index) = slice;
     ensure!(level <= L_MAX, "slice level {level} above {L_MAX}");
     let (first, last) = (first_block(level, index), last_block(level, index));
+    ensure!(
+        last < 1 << 32,
+        "slice ({level}, {index}) ends at block {last}, beyond the format's u32 block numbers"
+    );
 
     // Entries per address, merged per (block, slot).
     let mut by_address: BTreeMap<Address, BTreeMap<(u64, u32), u8>> = BTreeMap::new();
@@ -166,7 +170,7 @@ fn build(
             let entries = if entries_len(&entries, first) > SPILL_INLINE_MAX {
                 let file = spill_file(&entries);
                 let spill_ref = file_reference(&file);
-                files.push(file);
+                files.push((spill_ref, file));
                 Entries::Spilled {
                     count: entries.len() as u64,
                     spill_ref,
@@ -217,6 +221,7 @@ fn build(
                 unreachable!()
             };
             let file = bucket_pages_file(&recs, first);
+            let pages_ref = file_reference(&file);
             let paged = BucketRecord {
                 level,
                 index,
@@ -224,10 +229,10 @@ fn build(
                 body: BucketBody::Paged {
                     count: recs.len() as u32,
                     pages: file.len().div_ceil(PAGE_SIZE) as u32,
-                    pages_ref: file_reference(&file),
+                    pages_ref,
                 },
             };
-            files.push(file);
+            files.push((pages_ref, file));
             payload = paged.encode();
         }
         buckets.push(payload);
@@ -425,15 +430,12 @@ mod tests {
             panic!("spilled expected")
         };
         assert_eq!(count, 400);
-        let file = built
-            .files
-            .iter()
-            .find(|f| file_reference(f) == spill_ref)
-            .unwrap();
+        let (_, file) = built.files.iter().find(|(r, _)| *r == spill_ref).unwrap();
+        assert_eq!(file_reference(file), spill_ref);
         let entries: Vec<Entry> = split_pages(file)
             .unwrap()
             .iter()
-            .flat_map(|p| decode_spill_page(p).unwrap())
+            .flat_map(|p| decode_spill_page(p, 0, 1023).unwrap())
             .collect();
         assert_eq!(entries.len(), 400);
         assert_eq!(entries[399].block, 399);
@@ -472,16 +474,13 @@ mod tests {
             panic!("paged expected")
         };
         assert_eq!(count, 400);
-        let file = built
-            .files
-            .iter()
-            .find(|f| file_reference(f) == pages_ref)
-            .unwrap();
+        let (_, file) = built.files.iter().find(|(r, _)| *r == pages_ref).unwrap();
+        assert_eq!(file_reference(file), pages_ref);
         let pages_list = split_pages(file).unwrap();
         assert_eq!(pages_list.len(), pages as usize);
         let decoded: Vec<AddressRecord> = pages_list
             .iter()
-            .flat_map(|p| decode_bucket_page(p, first_block(0, 0)).unwrap())
+            .flat_map(|p| decode_bucket_page(p, 0, 63).unwrap())
             .collect();
         assert_eq!(decoded.len(), 400);
         // Ordered by fingerprint.

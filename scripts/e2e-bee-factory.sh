@@ -85,6 +85,7 @@ echo "== address appearances (docs/address-index.md, detection rules)"
 # The first imported block with a transaction; with traces if the RPC serves trace_block
 # (Anvil, Erigon, Reth; not geth). The block, receipts and traces are verified on the way.
 TX_BLOCK=
+TRACE_FLAG=()
 for ((n = 0; n <= LAST; n++)); do
   TXS=$($BIN block "$n" | awk '/Txs:/ {print $2}')
   [[ "$TXS" =~ ^[0-9]+$ ]] || { echo "FAIL: no transaction count for block $n"; exit 1; }
@@ -93,7 +94,6 @@ done
 if [ -z "$TX_BLOCK" ]; then
   echo "skip: no transaction in blocks 0..$LAST"
 else
-  TRACE_FLAG=()
   $BIN appearances "$TX_BLOCK" --traces >/dev/null 2>&1 && TRACE_FLAG=(--traces)
   APPS=$($BIN appearances "$TX_BLOCK" "${TRACE_FLAG[@]}") \
     || { echo "FAIL: appearances of block $TX_BLOCK"; exit 1; }
@@ -106,6 +106,13 @@ else
   fi
   echo "ok: appearances of block $TX_BLOCK${TRACE_FLAG:+ (with traces)}"
 fi
+
+echo "== address-index slice (0, 0) built twice: identical buckets root"
+slice_root() { $BIN addr-slice 0 0 "${TRACE_FLAG[@]}" | awk '/buckets root:/ {print $3}'; }
+ROOT_A=$(slice_root) && ROOT_B=$(slice_root) || { echo "FAIL: addr-slice 0 0"; exit 1; }
+[[ "$ROOT_A" =~ ^0x[0-9a-f]{64}$ ]] || { echo "FAIL: no buckets root from addr-slice: $ROOT_A"; exit 1; }
+[ "$ROOT_A" = "$ROOT_B" ] || { echo "FAIL: addr-slice 0 0 gave $ROOT_A, then $ROOT_B"; exit 1; }
+echo "ok: slice (0, 0) buckets root $ROOT_A"
 
 echo "== inspector (ethswarm serve) verifies a block via $READ_BEE"
 # INSPECTOR_ADDR is an IP:port (a socket address, not a host name). Refuse a port that

@@ -349,14 +349,19 @@ async fn addr_slice<P>(provider: &P, level: u8, index: u32, traces: bool) -> Res
 where
     P: Provider + Clone + 'static,
 {
-    use addr::detect::{detect, role};
+    use addr::detect::role;
     use addr::layout::{BucketBody, BucketRecord, L_MAX, PAGE_SIZE, first_block, last_block};
 
     ensure!(level <= L_MAX, "slice level {level} above {L_MAX}");
     let (first, last) = (first_block(level, index), last_block(level, index));
-    let blocks = addr::fetch::fetch_range(provider, first..=last, traces, 16).await?;
-    let last_hash = blocks.last().map(|b| b.hash).unwrap_or_default();
-    let apps: Vec<_> = blocks.iter().flat_map(detect).collect();
+    let mut apps = Vec::new();
+    let mut last_hash = B256::ZERO;
+    addr::fetch::fetch_appearances(provider, first..=last, traces, 16, |b| {
+        apps.extend(b.appearances);
+        last_hash = b.hash;
+        Ok(())
+    })
+    .await?;
     let roles = if traces { 0xff } else { !role::TRACE };
     let built = addr::slice::build_slice((level, index), &apps, last_hash, roles)?;
     let r = &built.record;
@@ -370,11 +375,11 @@ where
             )
         })
         .count();
-    let file_bytes: usize = built.files.iter().map(Vec::len).sum();
+    let file_bytes: usize = built.files.iter().map(|(_, f)| f.len()).sum();
     let file_chunks: usize = built
         .files
         .iter()
-        .map(|f| f.len().div_ceil(PAGE_SIZE))
+        .map(|(_, f)| f.len().div_ceil(PAGE_SIZE))
         .sum();
     let bucket_bytes: usize = built.buckets.iter().map(Vec::len).sum();
     println!("Slice ({level}, {index}): blocks {first}..={last}");
