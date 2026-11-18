@@ -6,8 +6,9 @@
 #
 # Reads Ethereum mainnet blocks from the zbox node (override with ETH2SWARM_RPC), imports them
 # via worker 1 (which holds the postage batch), then reads and verifies them through the queen
-# (proves p2p retrieval), checks that bad inputs are rejected, lists the address appearances
-# of a block with a transaction, and checks that the inspector
+# (proves p2p retrieval), checks that bad inputs are rejected, exercises the address index
+# (detection, slices, import with deferred merges and crash recovery, verification, and on a
+# dev chain lookups checked against the chain), and checks that the inspector
 # (`ethswarm serve`) verifies a block too.
 #
 # Against the local Anvil chain instead (what the integration workflow does):
@@ -173,6 +174,55 @@ LOCAL=$($BIN addr-slice 2 0 "${TRACE_FLAG[@]}" | awk '/buckets root:/ {print $3}
   || { echo "FAIL: published (2, 0) root '$PUBLISHED', local build '$LOCAL'"; exit 1; }
 rm -rf "$ADDR_STATE"
 echo "ok: address index published, resumed, merged and verified (slice (2, 0) root $LOCAL)"
+
+if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
+  echo "== address index with traffic: devnet-activity, import, lookups checked against the chain"
+  # Public Foundry dev keys #0 (sender) and #2 (EIP-7702 authority), dev chains only.
+  AUTH_KEY=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
+  AUTHORITY=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
+  BUSY=0x$(od -An -tx1 -N20 /dev/urandom | tr -d ' \n')
+  ACT=$($BIN devnet-activity --key "$KEY" --authority-key "$AUTH_KEY" --busy "$BUSY" \
+    --transfers 120) || { echo "FAIL: devnet-activity"; exit 1; }
+  echo "$ACT"
+  EMITTER=$(echo "$ACT" | awk '{for (i = 1; i < NF; i++) if ($i == "emitter") print $(i + 1)}' | tr -d ,)
+  ACT_LAST=$(echo "$ACT" | awk '{split($4, r, "\\.\\.="); print r[2]}' | tr -d :)
+  [[ "$ACT_LAST" =~ ^[0-9]+$ ]] || { echo "FAIL: no last block in: $ACT"; exit 1; }
+  ACT_UNITS=$(((ACT_LAST + 64) / 64))
+  # Anvil finalizes 64 blocks behind its tip.
+  WANT=$((ACT_UNITS * 64 - 1 + 64))
+  for ((i = 0; i < 900; i++)); do
+    T=$($BIN tip 2>/dev/null | awk '/Tip:/ {sub("#", "", $2); print $2}')
+    [[ "$T" =~ ^[0-9]+$ ]] && [ "$T" -ge "$WANT" ] && break
+    sleep 1
+  done
+  [ "${T:-0}" -ge "$WANT" ] || { echo "FAIL: tip never reached #$WANT"; exit 1; }
+  ACT_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+  ACT_STATE=$(mktemp -d)
+  OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$ACT_KEY" --state "$ACT_STATE" --init \
+    --units "$ACT_UNITS" "${TRACE_FLAG[@]}") || { echo "FAIL: addr-import $ACT_UNITS units"; exit 1; }
+  ACT_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
+  OUT=$($BIN --bee "$READ_BEE" addr-verify --owner "$ACT_OWNER" --chain-id "$CHAIN_ID" \
+    --units "$ACT_UNITS") || { echo "FAIL: addr-verify"; echo "$OUT"; exit 1; }
+  echo "$OUT" | tail -1
+  FILES=$(echo "$OUT" | tail -1 | awk '{for (i = 1; i < NF; i++) if ($(i + 1) ~ /^files/) print $i}')
+  [ "${FILES:-0}" -ge 1 ] || { echo "FAIL: the busy address did not spill (no files)"; exit 1; }
+  lookup() {
+    $BIN --bee "$READ_BEE" addr-lookup "$1" --owner "$ACT_OWNER" --chain-id "$CHAIN_ID" \
+      --units "$ACT_UNITS" --limit 0 --against-chain "${TRACE_FLAG[@]}"
+  }
+  for A in "$BUSY" "$EMITTER" "$AUTHORITY" 0x9999999999999999999999999999999999999999; do
+    OUT=$(lookup "$A") || { echo "FAIL: addr-lookup $A"; echo "$OUT"; exit 1; }
+    echo "$OUT" | head -1
+  done
+  N=$(lookup "$BUSY" | awk '/appearances in the index/ {print $2}')
+  [ "${N:-0}" -ge 120 ] || { echo "FAIL: busy address has ${N:-0} appearances, expected >= 120"; exit 1; }
+  # Incremental: nothing new for the busy address after the last unit.
+  NEW=$($BIN --bee "$READ_BEE" addr-lookup "$BUSY" --owner "$ACT_OWNER" --chain-id "$CHAIN_ID" \
+    --units "$ACT_UNITS" --since "$ACT_UNITS" --limit 0 | awk '/appearances in the index/ {print $2}')
+  [ "$NEW" = 0 ] || { echo "FAIL: --since $ACT_UNITS found $NEW new entries"; exit 1; }
+  rm -rf "$ACT_STATE"
+  echo "ok: busy address ($N appearances, spilled), emitter, authority and an unrelated address match the chain"
+fi
 
 echo "== inspector (ethswarm serve) verifies a block via $READ_BEE"
 # INSPECTOR_ADDR is an IP:port (a socket address, not a host name). Refuse a port that

@@ -2,6 +2,7 @@ mod accumulator;
 mod addr;
 mod chain;
 mod client;
+mod devnet;
 mod import;
 mod inspect;
 mod layout;
@@ -101,6 +102,49 @@ enum Command {
         /// Blocks fetched, and chunks uploaded, in parallel.
         #[arg(long, default_value_t = 16)]
         concurrency: usize,
+    },
+    /// Dev chains only: send traffic that exercises every kind of appearance (ETH transfers,
+    /// a contract, `Transfer` logs, a busy address that spills, an EIP-7702 authorization).
+    DevnetActivity {
+        /// Key that sends the transactions (a funded dev account).
+        #[arg(long)]
+        key: PrivateKeySigner,
+        /// Key that signs the EIP-7702 authorization (another dev account).
+        #[arg(long)]
+        authority_key: PrivateKeySigner,
+        /// The address that receives every transfer.
+        #[arg(long)]
+        busy: Address,
+        /// Number of `Transfer` calls.
+        #[arg(long, default_value_t = 120)]
+        transfers: usize,
+    },
+    /// Look an address up in the published address index (newest first).
+    AddrLookup {
+        address: Address,
+        /// Address of the SOC owner (the importer's key).
+        #[arg(long, env = "ETH2SWARM_OWNER")]
+        owner: Address,
+        /// Chain ID used in the SOC identifiers.
+        #[arg(long, env = "ETH2SWARM_CHAIN_ID", default_value_t = 1)]
+        chain_id: u64,
+        /// Read the head announcing this many units (default: the newest one found, aiming
+        /// at the finalized block of --rpc).
+        #[arg(long)]
+        units: Option<u64>,
+        /// Incremental sync: only what is new after this many units.
+        #[arg(long)]
+        since: Option<u64>,
+        /// Entries to print (all are counted).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Compare with the address's appearances detected directly from --rpc over the same
+        /// blocks; exits with an error on any difference.
+        #[arg(long)]
+        against_chain: bool,
+        /// With --against-chain: the index was built with traces.
+        #[arg(long)]
+        traces: bool,
     },
     /// Read the published address index back and check what one head makes a client read:
     /// every slice's buckets against its descriptor, every file against its reference, and
@@ -282,6 +326,45 @@ async fn main() -> Result<()> {
                 "Address index of owner {} on chain {}: {} units, head update {}",
                 s.owner, s.chain_id, s.units, s.head_index
             );
+        }
+        Command::DevnetActivity {
+            key,
+            authority_key,
+            busy,
+            transfers,
+        } => {
+            let a = devnet::run(cli.rpc.clone(), key, authority_key, busy, transfers).await?;
+            println!(
+                "Activity in blocks {}..={}: {} transactions, emitter {}, busy {}, authority {}",
+                a.first_block,
+                a.last_block,
+                a.transactions,
+                a.emitter,
+                a.busy,
+                a.authority.map_or("none".to_string(), |x| x.to_string())
+            );
+        }
+        Command::AddrLookup {
+            address,
+            owner,
+            chain_id,
+            units,
+            since,
+            limit,
+            against_chain,
+            traces,
+        } => {
+            addr_lookup(
+                &provider,
+                &bee,
+                (address, owner, chain_id),
+                units,
+                since,
+                limit,
+                against_chain,
+                traces,
+            )
+            .await?;
         }
         Command::AddrVerify {
             owner,
@@ -573,6 +656,78 @@ where
         .await?;
         let w = addr::stats::window_stats((level, index), &apps, txs, roles)?;
         println!("{}", addr::stats::render(&w));
+    }
+    Ok(())
+}
+
+/// `addr-lookup`: newest entries of an address, optionally checked against the chain.
+#[allow(clippy::too_many_arguments)]
+async fn addr_lookup<P>(
+    provider: &P,
+    bee: &Bee,
+    (address, owner, chain_id): (Address, Address, u64),
+    units: Option<u64>,
+    since: Option<u64>,
+    limit: usize,
+    against_chain: bool,
+    traces: bool,
+) -> Result<()>
+where
+    P: Provider + Clone + 'static,
+{
+    use addr::detect::role;
+    use addr::layout::UNIT_BLOCKS;
+
+    let reader = addr::verify::IndexReader {
+        bee: bee.clone(),
+        owner,
+        chain_id,
+    };
+    let head = match units {
+        Some(u) => {
+            let origin = reader.origin().await?;
+            ensure!(
+                u >= origin.units,
+                "the index starts at {} units",
+                origin.units
+            );
+            reader.head(u - origin.units).await?
+        }
+        None => {
+            let finalized = provider
+                .get_block_by_number(alloy::eips::BlockNumberOrTag::Finalized)
+                .await?
+                .context("the node reports no finalized block")?
+                .header
+                .number;
+            addr::lookup::latest_head(&reader, finalized).await?
+        }
+    };
+    let entries = addr::lookup::lookup(&reader, address, &head, since).await?;
+    for e in entries.iter().take(limit) {
+        println!("{:>10}  {:>5}  {}", e.block, e.slot, role::names(e.roles));
+    }
+    println!(
+        "{address}: {} appearances in the index up to block {} ({} units{})",
+        entries.len(),
+        head.units * UNIT_BLOCKS - 1,
+        head.units,
+        since.map_or(String::new(), |m| format!(", new since unit {m}"))
+    );
+    if against_chain {
+        let from = since.map_or(0, |m| m * UNIT_BLOCKS);
+        let c = addr::lookup::against_chain(provider, address, &entries, head.units, from, traces)
+            .await?;
+        ensure!(
+            c.not_on_chain.is_empty() && c.missing.is_empty(),
+            "index and chain differ for {address}: {} entries not on the chain {:?}, {} \
+             appearances missing {:?}",
+            c.not_on_chain.len(),
+            c.not_on_chain.iter().take(5).collect::<Vec<_>>(),
+            c.missing.len(),
+            c.missing.iter().take(5).collect::<Vec<_>>()
+        );
+        println!("Matches the chain: every entry is on it, none is missing.");
     }
     Ok(())
 }
