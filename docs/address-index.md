@@ -162,7 +162,7 @@ A wallet that only wants transfers it took part in filters on `FROM | TO | TOPIC
 BLOCK | AUTH`. `WORD` keeps the index as complete as TrueBlocks' and gives spam filters
 something to work with. Without traces it was 1–10 % of all appearances (measured with the
 earlier, stricter heuristic); the share with traces and the TrueBlocks heuristic is still
-to be measured (`addr-stats`, part 3 of #8).
+to be measured with `addr-stats` on a tracing node (#8).
 
 The appearances of one address at one (block, slot) are merged into one entry whose role
 is the OR of all roles.
@@ -533,8 +533,18 @@ Oldest first is the same in the opposite order.
 **These figures predate the current detection rules.** They were measured with the earlier
 rule set: the 2^128 word bound, no init code, no `topic0`, no traces. The current rules (the
 TrueBlocks superset) find more appearances, so the totals, sizes and costs below are lower
-bounds until `addr-stats` (part 3 of #8) measures again, with traces once a tracing node is
+bounds until they are measured again with `addr-stats`, with traces once a tracing node is
 available.
+
+**Reproducing them:** `ethswarm addr-stats --level L --at <block> [--at …] [--traces]`
+builds every slice of levels `0..=L` in the level-`L` window around each block with the real
+encoder and prints one table per window: the per-level columns below (addresses,
+appearances, bytes per appearance, buckets, paged buckets, spilled addresses, chunks
+including every chunk of the spill and pages files, chunks per 1000 appearances, largest
+bucket) and each window's `WORD`, `TRACE` and `TRACE`-only shares. A window is the aligned
+slice that contains the `--at` block; it does not start there. The `Level 0` row of a
+`--level 5` window (2,048 blocks, the default) gives a per-era row below, `--level 8` the
+slice-length table.
 
 Measured on 2026-11-16 against mainnet (the zbox geth node: full history, no traces, so no
 `TRACE` role) with throwaway scripts that encode the sampled appearances in the record formats above.
@@ -544,8 +554,7 @@ the RPC receipt, the bucket header was counted as 18 bytes (19 with `paged`), an
 overflowing bucket was counted as a two-chunk file (as a paged bucket it is three: the
 bucket SOC, the file root and one page). Each changes the totals by a fraction of a
 percent. Bucket assignment used sha256 instead of keccak256, which gives the
-same size distribution for a uniform hash. A later `ethswarm addr-stats` subcommand built on the real
-encoder should replace the scripts and make the numbers reproducible.
+same size distribution for a uniform hash. `addr-stats` replaces the scripts.
 
 Sampled: 2,048 consecutive blocks at each of 1M, 4M, …, 22M; the 16,384 blocks from
 26,400,000; one block in 5,000 over the whole chain for block sizes; 8 consecutive blocks in
