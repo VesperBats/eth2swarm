@@ -35,6 +35,9 @@ export RUST_LOG=${RUST_LOG:-warn}
 cargo build -q --locked
 BIN=target/debug/ethswarm
 LAST=$((EPOCH_SIZE * EPOCHS - 1))
+# The address-index steps read blocks 0..=127 (the level-1 window at block 0), which may lie
+# beyond the imported range.
+NEED=$((LAST > 127 ? LAST : 127))
 
 # A freshly started Anvil chain may not have the blocks yet (1 block per second). A
 # failed `tip` call is retried; output that has no numeric tip fails at once. This loop
@@ -45,12 +48,12 @@ for ((i = 0; i < 600; i++)); do
   if TIP_OUT=$($BIN tip 2>&1); then
     TIP=$(printf '%s\n' "$TIP_OUT" | awk '/Tip:/ {sub("#", "", $2); print $2}')
     [[ "$TIP" =~ ^[0-9]+$ ]] || { echo "FAIL: no chain tip in: $TIP_OUT"; exit 1; }
-    [ "$TIP" -ge "$LAST" ] && break
+    [ "$TIP" -ge "$NEED" ] && break
   fi
-  [ "$i" -eq 0 ] && echo "== waiting for block #$LAST (tip #$TIP)"
+  [ "$i" -eq 0 ] && echo "== waiting for block #$NEED (tip #$TIP)"
   sleep 1
 done
-[ "$TIP" -ge "$LAST" ] || { echo "FAIL: chain tip #$TIP never reached #$LAST"; exit 1; }
+[ "$TIP" -ge "$NEED" ] || { echo "FAIL: chain tip #$TIP never reached #$NEED"; exit 1; }
 CHAIN_ID=$(printf '%s\n' "$TIP_OUT" | awk '/Chain ID:/ {print $3}')
 [[ "$CHAIN_ID" =~ ^[0-9]+$ ]] || { echo "FAIL: no chain ID in: $TIP_OUT"; exit 1; }
 

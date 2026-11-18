@@ -164,7 +164,9 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Logs go to stderr: stdout carries the commands' output (e.g. addr-stats' Markdown).
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -434,7 +436,8 @@ where
     use addr::layout::{UNIT_BLOCKS, first_block, last_block};
 
     // A window is held in memory with all its appearances: a level-8 window at the tip is
-    // ~25 M appearances (about 1 GB). Larger slices are built by merging, in the importer.
+    // ~25 M appearances (about 1 GB), and building a slice holds a map per address on top,
+    // so a few GB at peak. Larger slices are built by merging, in the importer.
     const MAX_WINDOW_LEVEL: u8 = 8;
     ensure!(
         level <= MAX_WINDOW_LEVEL,
@@ -451,12 +454,17 @@ where
         .collect::<Result<_, _>>()?;
     windows.sort_unstable();
     windows.dedup();
-    for index in windows {
-        let (first, last) = (first_block(level, index), last_block(level, index));
+    // Every window must be complete before the first one is fetched.
+    for &index in &windows {
+        let last = last_block(level, index);
         ensure!(
             last <= tip,
-            "window {first}..={last} is not complete yet (the chain is at {tip})"
+            "window {}..={last} is not complete yet (the chain is at {tip})",
+            first_block(level, index)
         );
+    }
+    for index in windows {
+        let (first, last) = (first_block(level, index), last_block(level, index));
         eprintln!("fetching blocks {first}..={last}");
         let mut apps = Vec::new();
         let mut txs = 0u64;

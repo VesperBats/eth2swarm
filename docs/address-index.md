@@ -162,7 +162,7 @@ A wallet that only wants transfers it took part in filters on `FROM | TO | TOPIC
 BLOCK | AUTH`. `WORD` keeps the index as complete as TrueBlocks' and gives spam filters
 something to work with. Without traces it was 1–10 % of all appearances (measured with the
 earlier, stricter heuristic); the share with traces and the TrueBlocks heuristic is still
-to be measured (`addr-stats`, part 3 of #8).
+to be measured with `addr-stats` on a tracing node (#8).
 
 The appearances of one address at one (block, slot) are merged into one entry whose role
 is the OR of all roles.
@@ -541,8 +541,10 @@ builds every slice of levels `0..=L` in the level-`L` window around each block w
 encoder and prints one table per window: the per-level columns below (addresses,
 appearances, bytes per appearance, buckets, paged buckets, spilled addresses, chunks
 including every chunk of the spill and pages files, chunks per 1000 appearances, largest
-bucket) and each window's `WORD` and `TRACE` shares. `--level 0` gives the per-era rows,
-`--level 8` the slice-length table.
+bucket) and each window's `WORD`, `TRACE` and `TRACE`-only shares. A window is the aligned
+slice that contains the `--at` block; it does not start there. The `Level 0` row of a
+`--level 5` window (2,048 blocks, the default) gives a per-era row below, `--level 8` the
+slice-length table.
 
 Measured on 2026-11-16 against mainnet (the zbox geth node: full history, no traces, so no
 `TRACE` role) with throwaway scripts that encode the sampled appearances in the record formats above.

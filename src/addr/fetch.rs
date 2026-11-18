@@ -12,6 +12,7 @@ use alloy::consensus::transaction::SignerRecoverable as _;
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::network::ReceiptResponse as _;
 use alloy::providers::Provider;
+use alloy::transports::{RpcError, TransportError};
 use anyhow::{Context, Result, ensure};
 
 use alloy::consensus::TxEnvelope;
@@ -142,9 +143,21 @@ pub async fn fetch_block_data(
 /// Attempts per block before [`fetch_appearances`] gives up.
 const ATTEMPTS: u32 = 4;
 
-/// [`fetch_block_data`], retried with growing pauses (1, 2, 4 s): one transport error on a
-/// slow node must not lose a window of thousands of blocks. A block that fails verification
-/// fails every attempt alike, and the last error is returned.
+/// Whether an error is a transport failure (connection, timeout, a body that broke off), the
+/// only kind a retry can fix. Error responses, missing methods (no `trace_block`), failed
+/// verification and rejected traces fail every attempt alike.
+fn is_transport_failure(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<TransportError>(),
+            Some(RpcError::Transport(_))
+        )
+    })
+}
+
+/// [`fetch_block_data`], retried with growing pauses (1, 2, 4 s) after a transport failure,
+/// so that one dropped connection to a slow node does not lose a window of thousands of
+/// blocks. Any other error is returned at once.
 async fn fetch_with_retry<P: Provider>(
     provider: &P,
     number: u64,
@@ -154,12 +167,12 @@ async fn fetch_with_retry<P: Provider>(
     loop {
         match fetch_block_data(provider, number, traces).await {
             Ok(data) => return Ok(data),
-            Err(e) if attempt < ATTEMPTS => {
+            Err(e) if attempt < ATTEMPTS && is_transport_failure(&e) => {
                 tracing::warn!("block {number}, attempt {attempt}/{ATTEMPTS}: {e:#}");
                 tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 1))).await;
                 attempt += 1;
             }
-            Err(e) => return Err(e.context(format!("block {number}: {ATTEMPTS} attempts failed"))),
+            Err(e) => return Err(e),
         }
     }
 }
@@ -243,6 +256,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_transport_failures_are_retried() {
+        let local: anyhow::Error = anyhow::Error::from(TransportError::<
+            Box<serde_json::value::RawValue>,
+        >::UnsupportedFeature("x"));
+        assert!(
+            !is_transport_failure(&local),
+            "a local error is not transport"
+        );
+        let dropped: anyhow::Error = TransportError::<Box<serde_json::value::RawValue>>::Transport(
+            alloy::transports::TransportErrorKind::BackendGone,
+        )
+        .into();
+        assert!(is_transport_failure(&dropped.context("querying block 7")));
+        // A non-transport RPC error (an error response, here a null one) is not retried.
+        let resp =
+            anyhow::Error::from(TransportError::<Box<serde_json::value::RawValue>>::NullResp);
+        assert!(!is_transport_failure(&resp));
+        assert!(!is_transport_failure(&anyhow::anyhow!(
+            "receipts root mismatch"
+        )));
+    }
     use alloy::consensus::{SignableTransaction, Signed, TxLegacy};
     use alloy::primitives::{Signature, TxKind, U256};
     use alloy::signers::SignerSync;

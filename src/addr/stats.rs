@@ -37,8 +37,11 @@ pub struct WindowStats {
     pub appearances: u64,
     /// Appearances whose only role is `WORD`.
     pub word_only: u64,
-    /// Appearances with the `TRACE` role, if traces were read.
+    /// Appearances with the `TRACE` role (every transaction's sender and recipient get it
+    /// from the root frame), and those whose only role is `TRACE` (what traces add), if traces
+    /// were read.
     pub with_trace: Option<u64>,
+    pub trace_only: Option<u64>,
     pub levels: Vec<LevelStats>,
 }
 
@@ -72,6 +75,12 @@ pub fn window_stats(
             appearances
                 .iter()
                 .filter(|a| a.roles & role::TRACE != 0)
+                .count() as u64
+        }),
+        trace_only: (roles & role::TRACE != 0).then(|| {
+            appearances
+                .iter()
+                .filter(|a| a.roles == role::TRACE)
                 .count() as u64
         }),
         levels: Vec::new(),
@@ -122,11 +131,12 @@ pub fn window_stats(
 pub fn render(w: &WindowStats) -> String {
     let blocks = w.last_block - w.first_block + 1;
     let pct = |n: u64| 100.0 * n as f64 / w.appearances.max(1) as f64;
-    let trace = w
-        .with_trace
-        .map_or("n/a (no traces read)".to_string(), |n| {
-            format!("{:.1} %", pct(n))
-        });
+    let trace = match (w.with_trace, w.trace_only) {
+        (Some(with), Some(only)) => {
+            format!("{:.1} %, `TRACE` only {:.1} %", pct(with), pct(only))
+        }
+        _ => "n/a (no traces read)".to_string(),
+    };
     let mut out = format!(
         "Blocks {}..={}: {:.1} txs and {:.1} appearances per block, `WORD` only {:.1} %, \
          with `TRACE` {trace}\n\n",
@@ -200,6 +210,7 @@ mod tests {
         assert_eq!(w.appearances, 512);
         assert_eq!(w.word_only, 256);
         assert_eq!(w.with_trace, Some(0));
+        assert_eq!(w.trace_only, Some(0));
         let no_traces = window_stats(window, &a, 300, !role::TRACE).unwrap();
         assert_eq!(no_traces.with_trace, None);
         assert!(render(&no_traces).contains("`TRACE` n/a"));
@@ -218,6 +229,19 @@ mod tests {
         assert_eq!(w.levels[0].addresses, 4 * 65);
         assert_eq!(w.levels[2].addresses, 257);
         assert_eq!(w.levels[2].spilled_addresses, 1);
+        // Known answers for the level-2 slice, computed by hand: the busy address spills
+        // (256 entries of 3 bytes, one 774-byte page: 6 + 256 × 3) and its record is 42 bytes
+        // (fp 8, varint 513 in 2, reference 32); the 256 fresh addresses take 12 bytes (block
+        // offset below 128) or 13 (from 128 on). Record bytes 128 × 12 + 128 × 13 + 42 = 3,242,
+        // so two buckets of 19-byte headers.
+        let top = &w.levels[2];
+        assert_eq!(top.buckets, 2);
+        assert_eq!(top.bytes, 2 * 19 + 3_242 + 774);
+        assert_eq!(
+            top.chunks,
+            1 + 2 + 1,
+            "descriptor, two buckets, one spill page"
+        );
         let table = render(&w);
         assert!(table.contains("| 2 | 256 | 1 | 257 | 512 |"), "{table}");
     }
