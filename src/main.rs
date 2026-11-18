@@ -96,7 +96,8 @@ enum Command {
         concurrency: usize,
     },
     /// Read the published address index back and check what one head makes a client read:
-    /// every slice's buckets against its descriptor, every file against its reference.
+    /// every slice's buckets against its descriptor, every file against its reference, and
+    /// every slice's last block against the chain (--rpc).
     AddrVerify {
         /// Address of the SOC owner (the importer's key).
         #[arg(long, env = "ETH2SWARM_OWNER")]
@@ -278,7 +279,8 @@ async fn main() -> Result<()> {
                 chain_id,
             };
             let r = addr::verify::verify_published(&reader, units).await?;
-            for ((level, index), root) in &r.slices {
+            addr::verify::check_chain(&provider, &r).await?;
+            for ((level, index), root, _) in &r.slices {
                 println!("  slice ({level}, {index}): buckets root {root}");
             }
             println!(
@@ -464,22 +466,14 @@ async fn addr_slice<P>(provider: &P, level: u8, index: u32, traces: bool) -> Res
 where
     P: Provider + Clone + 'static,
 {
-    use addr::detect::role;
     use addr::layout::{L_MAX, first_block, last_block};
     use swarm::file::file_chunks;
 
     ensure!(level <= L_MAX, "slice level {level} above {L_MAX}");
     let (first, last) = (first_block(level, index), last_block(level, index));
-    let mut apps = Vec::new();
-    let mut last_hash = B256::ZERO;
-    addr::fetch::fetch_appearances(provider, first..=last, traces, 16, |b| {
-        apps.extend(b.appearances);
-        last_hash = b.hash;
-        Ok(())
-    })
-    .await?;
-    let roles = if traces { 0xff } else { !role::TRACE };
-    let built = addr::slice::build_slice((level, index), &apps, last_hash, roles)?;
+    let built = addr::fetch::fetch_slice(provider, (level, index), traces, 16, None)
+        .await?
+        .built;
     let r = &built.record;
     let file_bytes: usize = built.files.iter().map(|(_, f)| f.len()).sum();
     let chunks: usize = built.files.iter().map(|(_, f)| file_chunks(f.len())).sum();
@@ -531,7 +525,7 @@ where
         level <= MAX_WINDOW_LEVEL,
         "window level {level} above {MAX_WINDOW_LEVEL} (the window is held in memory)"
     );
-    let roles = if traces { 0xff } else { !role::TRACE };
+    let roles = role::mask(traces);
     let tip = provider
         .get_block_number()
         .await

@@ -5,6 +5,11 @@
 //! slices, one head update per unit, and the origin (a copy of head update 0). Slices are
 //! built in memory from the chain, up to `max_level` (part 4b of #8 adds external-memory
 //! building for the large levels a mainnet import needs).
+//!
+//! Heads and the origin are write-once, so they are written ahead: the next head is saved in
+//! the state before it is uploaded, and a run that finds a prepared head uploads exactly that
+//! record again (signatures are deterministic, so the SOC is byte-identical). Slices are
+//! deterministic too and can be uploaded again after a crash.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,12 +23,11 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::detect::role;
-use super::fetch::fetch_appearances;
+use super::fetch::{FetchedSlice, fetch_slice};
 use super::layout::{
-    HeadRecord, L_MAX, MAX_UNITS, UNIT_BLOCKS, bucket_id, first_block, head_id, last_block,
-    origin_id, slice_id,
+    HeadRecord, L_MAX, MAX_UNITS, UNIT_BLOCKS, bucket_id, first_block, head_id, origin_id, slice_id,
 };
-use super::slice::{BuiltSlice, SliceId, build_slice, cover, new_slice, units};
+use super::slice::{BuiltSlice, SliceId, cover, new_slice, units};
 use crate::swarm::{bee::Bee, soc};
 
 /// Name of the state file in the state directory.
@@ -49,23 +53,26 @@ pub struct Schedule {
     pub built: Vec<SliceId>,
 }
 
-impl Schedule {
-    /// The work for the unit that completes `n` units. Merges of level `defer_level` and above
-    /// are deferred.
-    pub fn unit_work(&self, n: u64, defer_level: u8) -> UnitWork {
-        let s = new_slice(n);
-        if s.0 >= defer_level.max(1) {
-            UnitWork::Defer {
-                level0: (0, (n - 1) as u32),
-                merge: s,
-            }
-        } else {
-            UnitWork::Build(s)
+/// The work for the unit that completes `n` units. Merges of level `defer_level` and above
+/// are deferred.
+pub fn unit_work(n: u64, defer_level: u8) -> UnitWork {
+    let s = new_slice(n);
+    if s.0 >= defer_level.max(1) {
+        UnitWork::Defer {
+            level0: (0, (n - 1) as u32),
+            merge: s,
         }
+    } else {
+        UnitWork::Build(s)
     }
+}
 
+impl Schedule {
+    /// Lists `merge` as pending (once, even if a resumed run defers it again).
     pub fn defer(&mut self, merge: SliceId) {
-        self.pending.push(merge);
+        if !self.pending.contains(&merge) {
+            self.pending.push(merge);
+        }
     }
 
     pub fn merge_done(&mut self, merge: SliceId) {
@@ -101,14 +108,15 @@ pub struct State {
     pub roles: u8,
     /// Units of head update 0 (`N0`); update `n` announces `N0 + n` units.
     pub n0: u64,
-    /// Units of the last published head.
+    /// Units of the last head known to be published.
     pub units: u64,
-    pub last_block_hash: B256,
-    pub last_block_timestamp: u64,
     pub schedule: Schedule,
-    /// Hash of each published unit's last block, since the last top-level boundary: what a
-    /// slice built later (a merge) must match.
+    /// Hash of each published unit's last block, as far back as a later slice (a unit's or a
+    /// merge's) can start: what that slice must continue or end with.
     pub unit_hashes: BTreeMap<u64, B256>,
+    /// The next head, saved before it is uploaded (write-ahead): a run that finds it uploads
+    /// exactly this record.
+    pub prepared: Option<HeadRecord>,
 }
 
 impl State {
@@ -141,12 +149,26 @@ impl State {
 
     fn record_unit(&mut self, unit: u64, hash: B256) {
         self.unit_hashes.insert(unit, hash);
-        // A merge never reaches back past the start of the top-level slice that contains the
-        // newest unit; it checks the unit just before its start too.
-        let boundary = (unit >> L_MAX) << L_MAX;
-        self.unit_hashes = self.unit_hashes.split_off(&boundary.saturating_sub(1));
+        // Keep what a later slice can still need: the unit before the start of the top-level
+        // slice of the newest unit, and before every pending merge (a top-level merge is
+        // still pending after the boundary).
+        let mut keep = (unit >> L_MAX) << L_MAX;
+        for s in &self.schedule.pending {
+            keep = keep.min(units(*s).start);
+        }
+        self.unit_hashes = self.unit_hashes.split_off(&keep.saturating_sub(1));
+    }
+
+    fn unit_hash(&self, unit: u64) -> Result<B256> {
+        self.unit_hashes
+            .get(&unit)
+            .copied()
+            .with_context(|| format!("no published hash for unit {unit}"))
     }
 }
+
+/// Merges built at the same time; the rest wait in a queue.
+const MAX_PENDING_MERGES: usize = 16;
 
 pub struct ImportOptions {
     pub state_dir: PathBuf,
@@ -169,23 +191,13 @@ struct Ctx<P> {
     signer: PrivateKeySigner,
     batch: B256,
     chain_id: u64,
-    roles: u8,
     traces: bool,
     max_level: u8,
     concurrency: usize,
 }
 
-/// A slice fetched from the chain and built: with the links to check it against its
-/// neighbours.
-struct Fetched {
-    built: BuiltSlice,
-    first_parent: B256,
-    last_hash: B256,
-    last_timestamp: u64,
-}
-
 impl<P: Provider + Clone + 'static> Ctx<P> {
-    async fn fetch_and_build(&self, slice: SliceId) -> Result<Fetched> {
+    async fn fetch(&self, slice: SliceId, parent: Option<B256>) -> Result<FetchedSlice> {
         ensure!(
             slice.0 <= self.max_level,
             "slice ({}, {}) is above --max-level {}: building it in memory would need too \
@@ -194,30 +206,7 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
             slice.1,
             self.max_level
         );
-        let (first, last) = (first_block(slice.0, slice.1), last_block(slice.0, slice.1));
-        let mut apps = Vec::new();
-        let (mut first_parent, mut last_hash, mut last_timestamp) = (None, B256::ZERO, 0);
-        fetch_appearances(
-            &self.provider,
-            first..=last,
-            self.traces,
-            self.concurrency,
-            |b| {
-                first_parent.get_or_insert(b.parent_hash);
-                last_hash = b.hash;
-                last_timestamp = b.timestamp;
-                apps.extend(b.appearances);
-                Ok(())
-            },
-        )
-        .await?;
-        let built = build_slice(slice, &apps, last_hash, self.roles)?;
-        Ok(Fetched {
-            built,
-            first_parent: first_parent.unwrap_or_default(),
-            last_hash,
-            last_timestamp,
-        })
+        fetch_slice(&self.provider, slice, self.traces, self.concurrency, parent).await
     }
 
     /// Uploads a built slice: files first, then the buckets, the descriptor last.
@@ -280,26 +269,34 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
         Ok(())
     }
 
-    /// Builds and uploads a deferred merge, after checking that it ends on the published
-    /// chain: its last block is the published hash of its last unit, and its first block's
-    /// parent the published hash of the unit before.
-    async fn merge(&self, slice: SliceId, end_hash: B256, before: Option<B256>) -> Result<SliceId> {
-        let f = self.fetch_and_build(slice).await?;
+    /// Uploads the prepared head of `state`, if any, and records it as published.
+    async fn publish_prepared(&self, state: &mut State, dir: &Path) -> Result<()> {
+        let Some(head) = state.prepared.clone() else {
+            return Ok(());
+        };
+        self.publish_head(head.units - state.n0, &head).await?;
+        state.units = head.units;
+        state.prepared = None;
+        state.save(dir)?;
+        info!(
+            units = head.units,
+            pending = head.pending.len(),
+            "head published"
+        );
+        Ok(())
+    }
+
+    /// Builds and uploads a deferred merge. It must continue the published chain (`before`,
+    /// the hash of the unit before it) and end on it (`end`, the hash of its last unit).
+    async fn merge(&self, slice: SliceId, end: B256, before: Option<B256>) -> Result<SliceId> {
+        let f = self.fetch(slice, before).await?;
         ensure!(
-            f.last_hash == end_hash,
-            "merge ({}, {}) ends in block {}, not the published {end_hash}",
+            f.last_hash == end,
+            "merge ({}, {}) ends in block {}, not the published {end}",
             slice.0,
             slice.1,
             f.last_hash
         );
-        if let Some(b) = before {
-            ensure!(
-                f.first_parent == b,
-                "merge ({}, {}) does not continue the published chain",
-                slice.0,
-                slice.1
-            );
-        }
         self.upload_slice(&f.built).await?;
         info!(level = slice.0, index = slice.1, "deferred merge uploaded");
         Ok(slice)
@@ -311,6 +308,64 @@ async fn join_one(set: &mut tokio::task::JoinSet<Result<()>>) -> Result<()> {
     match set.join_next().await {
         Some(r) => r.context("upload task panicked")?,
         None => Ok(()),
+    }
+}
+
+/// Builds deferred merges one at a time, in the order they were deferred.
+struct MergeWorker {
+    queue: std::collections::VecDeque<SliceId>,
+    running: tokio::task::JoinSet<Result<SliceId>>,
+}
+
+impl MergeWorker {
+    fn new(queue: Vec<SliceId>) -> Self {
+        Self {
+            queue: queue.into(),
+            running: tokio::task::JoinSet::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len() + self.running.len()
+    }
+
+    /// Starts the next queued merge if none is running.
+    fn kick<P: Provider + Clone + 'static>(&mut self, ctx: &Ctx<P>, state: &State) -> Result<()> {
+        if !self.running.is_empty() {
+            return Ok(());
+        }
+        let Some(slice) = self.queue.pop_front() else {
+            return Ok(());
+        };
+        let r = units(slice);
+        let end = state.unit_hash(r.end - 1)?;
+        let before = match r.start {
+            0 => None,
+            start => Some(state.unit_hash(start - 1)?),
+        };
+        let ctx = ctx.clone();
+        self.running
+            .spawn(async move { ctx.merge(slice, end, before).await });
+        Ok(())
+    }
+
+    /// Records a finished merge and starts the next. With `wait`, waits for one to finish.
+    async fn collect<P: Provider + Clone + 'static>(
+        &mut self,
+        ctx: &Ctx<P>,
+        state: &mut State,
+        wait: bool,
+    ) -> Result<()> {
+        let done = if wait {
+            self.running.join_next().await
+        } else {
+            self.running.try_join_next()
+        };
+        if let Some(done) = done {
+            let slice = done.context("merge task panicked")??;
+            state.schedule.merge_done(slice);
+        }
+        self.kick(ctx, state)
     }
 }
 
@@ -350,14 +405,13 @@ where
         Some(b) => b,
         None => bee.usable_batch().await?,
     };
-    let roles = if opts.traces { 0xff } else { !role::TRACE };
+    let roles = role::mask(opts.traces);
     let ctx = Ctx {
         provider: provider.clone(),
         bee: bee.clone(),
         signer: signer.clone(),
         batch,
         chain_id,
-        roles,
         traces: opts.traces,
         max_level: opts.max_level,
         concurrency: opts.concurrency,
@@ -378,8 +432,10 @@ where
             );
             s
         }
-        None => backfill(&ctx, target, dir).await?,
+        None => backfill(&ctx, target, roles, dir).await?,
     };
+    // A head saved but perhaps not uploaded (the previous run stopped in between).
+    ctx.publish_prepared(&mut state, dir).await?;
     info!(
         units = state.units,
         target,
@@ -388,19 +444,12 @@ where
     );
 
     // Merges listed as pending but not built (a previous run stopped): build them again.
-    let mut merges = tokio::task::JoinSet::new();
-    for slice in state.schedule.unbuilt() {
-        spawn_merge(&ctx, &state, slice, &mut merges)?;
-    }
+    let mut merges = MergeWorker::new(state.schedule.unbuilt());
+    merges.kick(&ctx, &state)?;
 
     for n in state.units + 1..=target {
-        // Merges finished meanwhile are dropped from the next head.
-        while let Some(done) = merges.try_join_next() {
-            let slice = done.context("merge task panicked")??;
-            state.schedule.merge_done(slice);
-        }
-        let work = state.schedule.unit_work(n, opts.defer_level);
-        let (now, deferred) = match work {
+        merges.collect(&ctx, &mut state, false).await?;
+        let (now, deferred) = match unit_work(n, opts.defer_level) {
             UnitWork::Build(s) => (s, None),
             UnitWork::Defer { level0, merge } => (level0, Some(merge)),
         };
@@ -416,81 +465,47 @@ where
                 opts.max_level
             );
         }
-        let f = ctx.fetch_and_build(now).await?;
         let start = units(now).start;
-        if start > 0 {
-            let expected = *state
-                .unit_hashes
-                .get(&(start - 1))
-                .with_context(|| format!("no published hash for unit {}", start - 1))?;
-            ensure!(
-                f.first_parent == expected,
-                "unit {}: block {} does not continue the published chain (parent {}, \
-                 expected {expected})",
-                n - 1,
-                first_block(now.0, now.1),
-                f.first_parent
-            );
-        }
+        let parent = match start {
+            0 => None,
+            s => Some(state.unit_hash(s - 1)?),
+        };
+        let f = ctx.fetch(now, parent).await?;
         ctx.upload_slice(&f.built).await?;
         state.record_unit(n - 1, f.last_hash);
         if let Some(merge) = deferred {
+            // Backpressure: not more than MAX_PENDING_MERGES listed at a time.
+            while merges.len() >= MAX_PENDING_MERGES {
+                merges.collect(&ctx, &mut state, true).await?;
+            }
             state.schedule.defer(merge);
-            spawn_merge(&ctx, &state, merge, &mut merges)?;
+            merges.queue.push_back(merge);
+            merges.kick(&ctx, &state)?;
         }
-        let head = HeadRecord {
+        state.prepared = Some(HeadRecord {
             units: n,
             last_block_hash: f.last_hash,
             last_block_timestamp: f.last_timestamp,
             pending: state.schedule.next_head_pending(),
-        };
-        ctx.publish_head(n - state.n0, &head).await?;
-        state.units = n;
-        state.last_block_hash = f.last_hash;
-        state.last_block_timestamp = f.last_timestamp;
+        });
         state.save(dir)?;
-        info!(units = n, pending = head.pending.len(), "head published");
+        ctx.publish_prepared(&mut state, dir).await?;
     }
 
-    // Let running merges finish. They stay listed until the next run's first head.
-    while let Some(done) = merges.join_next().await {
-        let slice = done.context("merge task panicked")??;
-        state.schedule.merge_done(slice);
+    // Let the merges finish. They stay listed until the next run's first head.
+    while merges.len() > 0 {
+        merges.collect(&ctx, &mut state, true).await?;
         state.save(dir)?;
     }
-    Ok(())
-}
-
-fn spawn_merge<P: Provider + Clone + 'static>(
-    ctx: &Ctx<P>,
-    state: &State,
-    slice: SliceId,
-    merges: &mut tokio::task::JoinSet<Result<SliceId>>,
-) -> Result<()> {
-    let r = units(slice);
-    let end_hash = *state
-        .unit_hashes
-        .get(&(r.end - 1))
-        .with_context(|| format!("no published hash for unit {}", r.end - 1))?;
-    let before = match r.start {
-        0 => None,
-        s => Some(
-            *state
-                .unit_hashes
-                .get(&(s - 1))
-                .with_context(|| format!("no published hash for unit {}", s - 1))?,
-        ),
-    };
-    let ctx = ctx.clone();
-    merges.spawn(async move { ctx.merge(slice, end_hash, before).await });
     Ok(())
 }
 
 /// First run: publishes the cover of `[0, target)` (every other past slice would never be
-/// read), head update 0 and the origin.
+/// read), then head update 0 and the origin, written ahead like every head.
 async fn backfill<P: Provider + Clone + 'static>(
     ctx: &Ctx<P>,
     target: u64,
+    roles: u8,
     dir: &Path,
 ) -> Result<State> {
     ensure!(target >= 1, "nothing to import: no complete unit");
@@ -507,41 +522,35 @@ async fn backfill<P: Provider + Clone + 'static>(
     let mut state = State {
         chain_id: ctx.chain_id,
         owner: ctx.signer.address(),
-        roles: ctx.roles,
+        roles,
         n0: target,
         units: target,
-        last_block_hash: B256::ZERO,
-        last_block_timestamp: 0,
         schedule: Schedule::default(),
         unit_hashes: BTreeMap::new(),
+        prepared: None,
     };
-    let mut prev: Option<B256> = None;
+    let (mut parent, mut last) = (None, None);
     for s in slices {
         info!(level = s.0, index = s.1, "backfill");
-        let f = ctx.fetch_and_build(s).await?;
-        if let Some(p) = prev {
-            ensure!(
-                f.first_parent == p,
-                "slice ({}, {}) does not continue the previous one",
-                s.0,
-                s.1
-            );
-        }
+        let f = ctx.fetch(s, parent).await?;
         ctx.upload_slice(&f.built).await?;
-        prev = Some(f.last_hash);
+        parent = Some(f.last_hash);
         state.record_unit(units(s).end - 1, f.last_hash);
-        state.last_block_hash = f.last_hash;
-        state.last_block_timestamp = f.last_timestamp;
+        last = Some(f);
     }
-    let head = HeadRecord {
+    let last = last.expect("a cover of at least one unit");
+    state.prepared = Some(HeadRecord {
         units: target,
-        last_block_hash: state.last_block_hash,
-        last_block_timestamp: state.last_block_timestamp,
+        last_block_hash: last.last_hash,
+        last_block_timestamp: last.last_timestamp,
         pending: Vec::new(),
-    };
-    ctx.publish_head(0, &head).await?;
+    });
+    // From here on the origin's N0 is fixed: a later run publishes this head, never another.
     state.save(dir)?;
-    info!(units = target, "backfill published (head 0 and origin)");
+    info!(
+        units = target,
+        "backfill uploaded; publishing head 0 and the origin"
+    );
     Ok(state)
 }
 
@@ -553,18 +562,22 @@ mod tests {
 
     #[test]
     fn unit_work_defers_from_the_given_level() {
-        let s = Schedule::default();
-        assert_eq!(s.unit_work(13, 2), UnitWork::Build((0, 12)));
-        assert_eq!(s.unit_work(14, 2), UnitWork::Build((1, 6)));
+        assert_eq!(unit_work(13, 2), UnitWork::Build((0, 12)));
+        assert_eq!(unit_work(14, 2), UnitWork::Build((1, 6)));
         assert_eq!(
-            s.unit_work(16, 2),
+            unit_work(16, 2),
             UnitWork::Defer {
                 level0: (0, 15),
                 merge: (4, 0)
             }
         );
+        // Deferring a merge that is already listed lists it once.
+        let mut sched = Schedule::default();
+        sched.defer((4, 0));
+        sched.defer((4, 0));
+        assert_eq!(sched.next_head_pending(), vec![(4, 0)]);
         // Level 0 is never deferred, whatever the threshold.
-        assert_eq!(s.unit_work(3, 0), UnitWork::Build((0, 2)));
+        assert_eq!(unit_work(3, 0), UnitWork::Build((0, 2)));
     }
 
     /// Simulates the importer: every head must only reference slices that are written, every
@@ -588,7 +601,7 @@ mod tests {
                             true
                         }
                     });
-                    match schedule.unit_work(n, defer_level) {
+                    match unit_work(n, defer_level) {
                         UnitWork::Build(s) => {
                             written.insert(s);
                         }
@@ -633,21 +646,28 @@ mod tests {
             roles: 0xdf,
             n0: 5,
             units: 9,
-            last_block_hash: B256::repeat_byte(2),
-            last_block_timestamp: 1_800_000_000,
             schedule: Schedule {
                 pending: vec![(1, 4)],
                 built: vec![],
             },
             unit_hashes: BTreeMap::new(),
+            prepared: Some(HeadRecord {
+                units: 10,
+                last_block_hash: B256::repeat_byte(2),
+                last_block_timestamp: 1_800_000_000,
+                pending: vec![(1, 4)],
+            }),
         };
         s.save(&dir).unwrap();
         assert_eq!(State::load(&dir).unwrap(), Some(s.clone()));
         assert_eq!(s.head_index(), 4);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(State::load(&dir).unwrap(), None);
+
         // Unit hashes before the top-level slice of the newest unit are dropped, except the
-        // unit just before it, which a merge starting at the boundary checks. The last unit of
-        // a top-level slice still keeps the whole slice (its top-level merge is due then).
+        // unit just before it, which a merge starting at the boundary checks.
         let top = 1u64 << L_MAX;
+        s.schedule = Schedule::default();
         for u in [top - 3, top - 2, top - 1] {
             s.record_unit(u, B256::repeat_byte(u as u8));
         }
@@ -659,7 +679,19 @@ mod tests {
             s.unit_hashes.keys().copied().collect::<Vec<_>>(),
             vec![top - 1, top, top + 1]
         );
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(State::load(&dir).unwrap(), None);
+
+        // A top-level merge still pending after its boundary keeps what it needs: the unit
+        // before its start, and its last unit.
+        let mut s2 = s.clone();
+        s2.unit_hashes.clear();
+        for u in [top - 1, 2 * top - 1] {
+            s2.record_unit(u, B256::repeat_byte(1));
+        }
+        s2.schedule.defer((L_MAX, 1)); // units top..2·top, due at unit 2·top − 1
+        for u in 2 * top..2 * top + 100 {
+            s2.record_unit(u, B256::repeat_byte(2));
+        }
+        assert!(s2.unit_hash(top - 1).is_ok(), "the unit before the merge");
+        assert!(s2.unit_hash(2 * top - 1).is_ok(), "the merge's last unit");
     }
 }

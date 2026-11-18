@@ -22,7 +22,9 @@ use std::collections::BTreeMap;
 
 use alloy::primitives::B256;
 
-use super::detect::{Appearance, BlockData, LogData, Trace, TxData, check_traces, detect};
+use super::detect::{Appearance, BlockData, LogData, Trace, TxData, check_traces, detect, role};
+use super::layout::{first_block, last_block};
+use super::slice::{BuiltSlice, SliceId, build_slice};
 use crate::chain::fetch_verified_block;
 
 /// The sender of a transaction from a verified block. Recovery skips EIP-2's low-`s` rule:
@@ -254,6 +256,53 @@ where
         }
     }
     Ok(())
+}
+
+/// A slice fetched from the chain and built, with its last block.
+pub struct FetchedSlice {
+    pub built: BuiltSlice,
+    pub last_hash: B256,
+    pub last_timestamp: u64,
+}
+
+/// Fetches the blocks of `slice` and builds it. If `parent` is given, the slice's first block
+/// must be its child: the slice continues a chain the caller has already published.
+pub async fn fetch_slice<P>(
+    provider: &P,
+    slice: SliceId,
+    traces: bool,
+    concurrency: usize,
+    parent: Option<B256>,
+) -> Result<FetchedSlice>
+where
+    P: Provider + Clone + 'static,
+{
+    let (first, last) = (first_block(slice.0, slice.1), last_block(slice.0, slice.1));
+    let mut apps = Vec::new();
+    let (mut first_parent, mut last_hash, mut last_timestamp) = (None, B256::ZERO, 0);
+    fetch_appearances(provider, first..=last, traces, concurrency, |b| {
+        first_parent.get_or_insert(b.parent_hash);
+        last_hash = b.hash;
+        last_timestamp = b.timestamp;
+        apps.extend(b.appearances);
+        Ok(())
+    })
+    .await?;
+    if let (Some(expected), Some(got)) = (parent, first_parent) {
+        ensure!(
+            got == expected,
+            "slice ({}, {}): block {first}'s parent is {got}, not the published {expected} \
+             (reorg or another chain?)",
+            slice.0,
+            slice.1
+        );
+    }
+    let built = build_slice(slice, &apps, last_hash, role::mask(traces))?;
+    Ok(FetchedSlice {
+        built,
+        last_hash,
+        last_timestamp,
+    })
 }
 
 #[cfg(test)]

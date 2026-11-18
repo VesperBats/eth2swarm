@@ -1,9 +1,6 @@
 //! Slices: which slices cover the chain (`docs/address-index.md`, "Slices and covers"), and
 //! building one slice from its appearances ("Record formats").
 
-// The importer and client that use all of this follow in parts 4 and 5 of #8.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
@@ -99,6 +96,8 @@ pub fn resolve(n: u64, pending: &[SliceId]) -> Vec<SliceId> {
 
 /// The slices of the cover of `[0, n)` that end after unit `m`: what a client that has read
 /// everything up to unit `m` still has to read.
+// The client's incremental sync (part 5 of #8) uses this.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn slices_after(m: u64, n: u64) -> Vec<SliceId> {
     cover(n).into_iter().filter(|s| units(*s).end > m).collect()
 }

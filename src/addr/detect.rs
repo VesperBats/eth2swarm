@@ -47,6 +47,11 @@ pub mod role {
         (AUTH, "auth"),
     ];
 
+    /// The roles an importer detects: all of them with traces, all but `TRACE` without.
+    pub fn mask(traces: bool) -> u8 {
+        if traces { 0xff } else { !TRACE }
+    }
+
     /// `"from|topic"` style rendering.
     pub fn names(roles: u8) -> String {
         NAMES
