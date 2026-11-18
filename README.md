@@ -13,8 +13,8 @@ Importer of Ethereum blocks into Ethereum Swarm.
   `header-stats`).
 - Address → transaction index (in progress, #8): a mobile-friendly index on Swarm from an
   address to the transactions it appears in — design in
-  [docs/address-index.md](docs/address-index.md); `appearances`, `addr-stats`, `addr-import`
-  and `addr-verify` so far.
+  [docs/address-index.md](docs/address-index.md); `appearances`, `addr-stats`, `addr-import`,
+  `addr-verify`, `addr-lookup` (and `devnet-activity` for test traffic).
 - State on Swarm (design sketch, not implemented): accounts, storage and code on Swarm,
   read by a light client and checked against the state root, with no trust in the
   publisher — see [docs/state-on-swarm.md](docs/state-on-swarm.md).

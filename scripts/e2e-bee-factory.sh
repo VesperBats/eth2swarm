@@ -6,8 +6,9 @@
 #
 # Reads Ethereum mainnet blocks from the zbox node (override with ETH2SWARM_RPC), imports them
 # via worker 1 (which holds the postage batch), then reads and verifies them through the queen
-# (proves p2p retrieval), checks that bad inputs are rejected, lists the address appearances
-# of a block with a transaction, and checks that the inspector
+# (proves p2p retrieval), checks that bad inputs are rejected, exercises the address index
+# (detection, slices, import with deferred merges and crash recovery, verification, and on a
+# dev chain lookups checked against the chain), and checks that the inspector
 # (`ethswarm serve`) verifies a block too.
 #
 # Against the local Anvil chain instead (what the integration workflow does):
@@ -155,6 +156,11 @@ for u in 2 3 4; do
 done
 echo "$OUT" | grep -q 'pending \[(2, 0)\]' \
   || { echo "FAIL: head 4 does not list the deferred merge (2, 0)"; exit 1; }
+# A client reading head 4 expands the pending merge; its result must match the chain.
+$BIN --bee "$READ_BEE" addr-lookup "$OWNER" --owner "$ADDR_OWNER" --chain-id "$CHAIN_ID" \
+  --units 4 --limit 0 --against-chain >/dev/null \
+  || { echo "FAIL: addr-lookup against head 4 (pending (2, 0)) differs from the chain"; exit 1; }
+echo "ok: a lookup through the pending merge's expansion matches the chain"
 # Unit 5, with two crashes: one between saving head 5 and uploading it, one after the upload
 # but before the state records it. Each next run must publish exactly the prepared head (the
 # second one uploads an identical SOC again). Head 5 drops the built merge (2, 0).
@@ -173,6 +179,99 @@ LOCAL=$($BIN addr-slice 2 0 "${TRACE_FLAG[@]}" | awk '/buckets root:/ {print $3}
   || { echo "FAIL: published (2, 0) root '$PUBLISHED', local build '$LOCAL'"; exit 1; }
 rm -rf "$ADDR_STATE"
 echo "ok: address index published, resumed, merged and verified (slice (2, 0) root $LOCAL)"
+
+if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
+  echo "== address index with traffic: devnet-activity, import, lookups checked against the chain"
+  # Public Foundry dev keys #0 (sender) and #2 (EIP-7702 authority), dev chains only.
+  AUTH_KEY=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
+  AUTHORITY=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
+  BUSY=0x$(od -An -tx1 -N20 /dev/urandom | tr -d ' \n')
+  # Start right after a unit boundary, so that the activity (about seven blocks at one block
+  # per second) stays inside one unit: the import then ends with that unit, and the wait for
+  # its finality is at most about two units.
+  for ((i = 0; i < 120; i++)); do
+    T=$($BIN tip 2>/dev/null | awk '/Tip:/ {sub("#", "", $2); print $2}') || true
+    [[ "$T" =~ ^[0-9]+$ ]] && [ $((T % 64)) -le 40 ] && break
+    sleep 1
+  done
+  ACT=$($BIN devnet-activity --key "$KEY" --authority-key "$AUTH_KEY" --busy "$BUSY" \
+    --transfers 120) || { echo "FAIL: devnet-activity"; exit 1; }
+  echo "$ACT"
+  EMITTER=$(echo "$ACT" | awk '{for (i = 1; i < NF; i++) if ($i == "emitter") print $(i + 1)}' | tr -d ,)
+  echo "$ACT" | grep -q 'authority 0x' || { echo "FAIL: the chain did not take the EIP-7702 transaction"; exit 1; }
+  ACT_RANGE=$(echo "$ACT" | awk '{print $4}' | tr -d :)
+  ACT_FIRST=${ACT_RANGE%%..=*}
+  ACT_LAST=${ACT_RANGE##*..=}
+  [[ "$ACT_FIRST" =~ ^[0-9]+$ && "$ACT_LAST" =~ ^[0-9]+$ ]] || { echo "FAIL: no block range in: $ACT"; exit 1; }
+  # Import up to the end of the smallest aligned slice that holds all of the activity, so that
+  # one slice holds every entry of the busy address and it spills deterministically.
+  U1=$((ACT_FIRST / 64)); U2=$((ACT_LAST / 64)); L=0
+  while [ $((U1 >> L)) -ne $((U2 >> L)) ]; do L=$((L + 1)); done
+  ACT_UNITS=$((((U2 >> L) + 1) << L))
+  # Anvil finalizes 64 blocks behind its tip.
+  WANT=$((ACT_UNITS * 64 - 1 + 64))
+  for ((i = 0; i < 900; i++)); do
+    T=$($BIN tip 2>/dev/null | awk '/Tip:/ {sub("#", "", $2); print $2}') || true
+    [[ "$T" =~ ^[0-9]+$ ]] && [ "$T" -ge "$WANT" ] && break
+    sleep 1
+  done
+  [ "${T:-0}" -ge "$WANT" ] || { echo "FAIL: tip never reached #$WANT"; exit 1; }
+  ACT_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+  ACT_STATE=$(mktemp -d)
+  # The backfill covers the whole dev chain from genesis; its blocks are nearly empty, so
+  # building even large slices in memory is fine here (--max-level 16), only slower on an
+  # old stack.
+  OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$ACT_KEY" --state "$ACT_STATE" --init \
+    --units "$ACT_UNITS" --max-level 16 "${TRACE_FLAG[@]}") \
+    || { echo "FAIL: addr-import $ACT_UNITS units"; exit 1; }
+  ACT_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
+  OUT=$($BIN --bee "$READ_BEE" addr-verify --owner "$ACT_OWNER" --chain-id "$CHAIN_ID" \
+    --units "$ACT_UNITS") || { echo "FAIL: addr-verify"; echo "$OUT"; exit 1; }
+  echo "$OUT" | tail -1
+  lookup() {
+    $BIN --bee "$READ_BEE" addr-lookup "$1" --owner "$ACT_OWNER" --chain-id "$CHAIN_ID" \
+      --units "$ACT_UNITS" --limit 0 "${@:2}"
+  }
+  count() { awk '/appearances in the index/ {print $2}'; }
+  # Checked against the chain from the activity's first unit on: re-detecting the whole chain
+  # would grow with its age (the authority key has appearances from earlier runs too).
+  for A in "$BUSY" "$EMITTER" "$AUTHORITY" 0x9999999999999999999999999999999999999999; do
+    OUT=$(lookup "$A" --since "$U1" --against-chain) \
+      || { echo "FAIL: addr-lookup $A"; echo "$OUT"; exit 1; }
+    echo "$OUT" | head -1
+    case "$A" in
+      "$BUSY") N=$(echo "$OUT" | count); BUSY_OUT=$OUT ;;
+      "$AUTHORITY")
+        NEWEST=$($BIN --bee "$READ_BEE" addr-lookup "$A" --owner "$ACT_OWNER" \
+          --chain-id "$CHAIN_ID" --units "$ACT_UNITS" --since "$U1" --limit 1)
+        echo "$NEWEST" | head -1 | grep -qw auth \
+          || { echo "FAIL: the authority's newest entry has no AUTH role: $NEWEST"; exit 1; } ;;
+    esac
+  done
+  [ "${N:-0}" -ge 120 ] || { echo "FAIL: busy address has ${N:-0} appearances, expected >= 120"; exit 1; }
+  BUSY_FILES=$(echo "$BUSY_OUT" | head -1 | awk '{for (i = 1; i < NF; i++) if ($(i + 1) == "files") print $i}')
+  [ "${BUSY_FILES:-0}" -ge 1 ] || { echo "FAIL: the busy address did not spill: $BUSY_OUT"; exit 1; }
+  # The full lookup of the (fresh) busy address finds exactly what the incremental one did.
+  FULL=$(lookup "$BUSY" | count)
+  [ "$FULL" = "$N" ] || { echo "FAIL: the full lookup found $FULL entries, --since $U1 found $N"; exit 1; }
+  # The sender has appearances before and after unit U1: the incremental lookup must read
+  # fewer slices than the full one and match the chain from U1 on.
+  slices_read() { awk '/appearances in the index/ {for (i = 1; i < NF; i++) if ($(i + 1) == "slices,") print $i}'; }
+  FULL_SLICES=$(lookup "$OWNER" | slices_read)
+  OUT=$(lookup "$OWNER" --since "$U1" --against-chain) \
+    || { echo "FAIL: incremental lookup of the sender"; echo "$OUT"; exit 1; }
+  SINCE_SLICES=$(echo "$OUT" | slices_read)
+  if [ "${FULL_SLICES:-0}" -gt 1 ] && [ "${SINCE_SLICES:-0}" -ge "$FULL_SLICES" ]; then
+    echo "FAIL: --since $U1 read $SINCE_SLICES slices, the full lookup $FULL_SLICES"; exit 1
+  fi
+  # Head discovery (no --units): the newest head of this index is the one for ACT_UNITS.
+  FOUND_UNITS=$($BIN --bee "$READ_BEE" addr-lookup "$BUSY" --owner "$ACT_OWNER" \
+    --chain-id "$CHAIN_ID" --limit 0 2>/dev/null | sed -n 's/.*(\([0-9]*\) units.*/\1/p')
+  [ "$FOUND_UNITS" = "$ACT_UNITS" ] \
+    || { echo "FAIL: head discovery found $FOUND_UNITS units, the index has $ACT_UNITS"; exit 1; }
+  rm -rf "$ACT_STATE"
+  echo "ok: busy address ($N appearances, $BUSY_FILES spill file), emitter, authority and an unrelated address match the chain since unit $U1; the full lookup agrees; the sender's incremental lookup reads $SINCE_SLICES of $FULL_SLICES slices; head discovery finds $ACT_UNITS units"
+fi
 
 echo "== inspector (ethswarm serve) verifies a block via $READ_BEE"
 # INSPECTOR_ADDR is an IP:port (a socket address, not a host name). Refuse a port that

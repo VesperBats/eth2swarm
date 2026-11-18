@@ -94,12 +94,14 @@ pub fn resolve(n: u64, pending: &[SliceId]) -> Vec<SliceId> {
     out
 }
 
-/// The slices of the cover of `[0, n)` that end after unit `m`: what a client that has read
-/// everything up to unit `m` still has to read.
-// The client's incremental sync (part 5 of #8) uses this.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn slices_after(m: u64, n: u64) -> Vec<SliceId> {
-    cover(n).into_iter().filter(|s| units(*s).end > m).collect()
+/// What a client that has read everything up to unit `m` still has to read for a head with
+/// `n` units and the deferred merges `pending`: the slices of [`resolve`] that end after unit
+/// `m`. A slice that starts before `m` is read whole; its entries before `m` are not new.
+pub fn resolve_after(m: u64, n: u64, pending: &[SliceId]) -> Vec<SliceId> {
+    resolve(n, pending)
+        .into_iter()
+        .filter(|s| units(*s).end > m)
+        .collect()
 }
 
 /// A slice built in memory: its descriptor, its bucket payloads (index = bucket number) and
@@ -380,9 +382,14 @@ mod tests {
     #[test]
     fn incremental() {
         // Up to unit 12 read; the cover of 13 has only (0, 12) after it.
-        assert_eq!(slices_after(12, 13), vec![(0, 12)]);
+        assert_eq!(resolve_after(12, 13, &[]), vec![(0, 12)]);
         // Read up to unit 13; at 16 the cover is one slice, re-read whole.
-        assert_eq!(slices_after(13, 16), vec![(4, 0)]);
+        assert_eq!(resolve_after(13, 16, &[]), vec![(4, 0)]);
+        // With (4, 0) pending, only the parts of its expansion after unit 13 are read.
+        assert_eq!(
+            resolve_after(13, 16, &[(4, 0)]),
+            vec![(1, 6), (0, 14), (0, 15)]
+        );
     }
 
     fn app(block: u64, slot: u32, byte: u8, roles: u8) -> Appearance {

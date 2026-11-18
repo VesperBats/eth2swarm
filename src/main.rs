@@ -2,6 +2,7 @@ mod accumulator;
 mod addr;
 mod chain;
 mod client;
+mod devnet;
 mod import;
 mod inspect;
 mod layout;
@@ -101,6 +102,51 @@ enum Command {
         /// Blocks fetched, and chunks uploaded, in parallel.
         #[arg(long, default_value_t = 16)]
         concurrency: usize,
+    },
+    /// Dev chains only: send traffic that exercises every kind of appearance (ETH transfers,
+    /// a contract, `Transfer` logs, a busy address that spills, an EIP-7702 authorization).
+    DevnetActivity {
+        /// Key that sends the transactions (a funded dev account).
+        #[arg(long)]
+        key: PrivateKeySigner,
+        /// Key that signs the EIP-7702 authorization (another dev account).
+        #[arg(long)]
+        authority_key: PrivateKeySigner,
+        /// The address that receives every transfer.
+        #[arg(long)]
+        busy: Address,
+        /// Number of `Transfer` calls.
+        #[arg(long, default_value_t = 120)]
+        transfers: usize,
+        /// Allow this chain ID besides the dev chains 1337 and 31337 (the command refuses
+        /// any other chain).
+        #[arg(long)]
+        allow_chain_id: Option<u64>,
+    },
+    /// Look an address up in the published address index (newest first).
+    AddrLookup {
+        address: Address,
+        /// Address of the SOC owner (the importer's key).
+        #[arg(long, env = "ETH2SWARM_OWNER")]
+        owner: Address,
+        /// Chain ID used in the SOC identifiers.
+        #[arg(long, env = "ETH2SWARM_CHAIN_ID", default_value_t = 1)]
+        chain_id: u64,
+        /// Read the head announcing this many units (default: the newest one found, aiming
+        /// at the finalized block of --rpc).
+        #[arg(long)]
+        units: Option<u64>,
+        /// Incremental sync: only what is new after this many units.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(0..=addr::layout::MAX_UNITS))]
+        since: Option<u64>,
+        /// Entries to print (all are counted).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Compare with the address's appearances detected directly from --rpc over the same
+        /// blocks (with traces if the index has them); exits with an error on any difference,
+        /// or if --rpc serves another chain.
+        #[arg(long)]
+        against_chain: bool,
     },
     /// Read the published address index back and check what one head makes a client read:
     /// every slice's buckets against its descriptor, every file against its reference, and
@@ -282,6 +328,52 @@ async fn main() -> Result<()> {
                 "Address index of owner {} on chain {}: {} units, head update {}",
                 s.owner, s.chain_id, s.units, s.head_index
             );
+        }
+        Command::DevnetActivity {
+            key,
+            authority_key,
+            busy,
+            transfers,
+            allow_chain_id,
+        } => {
+            let a = devnet::run(
+                cli.rpc.clone(),
+                key,
+                authority_key,
+                busy,
+                transfers,
+                allow_chain_id,
+            )
+            .await?;
+            println!(
+                "Activity in blocks {}..={}: {} transactions, emitter {}, busy {}, authority {}",
+                a.first_block,
+                a.last_block,
+                a.transactions,
+                a.emitter,
+                a.busy,
+                a.authority.map_or("none".to_string(), |x| x.to_string())
+            );
+        }
+        Command::AddrLookup {
+            address,
+            owner,
+            chain_id,
+            units,
+            since,
+            limit,
+            against_chain,
+        } => {
+            addr_lookup(
+                &provider,
+                &bee,
+                (address, owner, chain_id),
+                units,
+                since,
+                limit,
+                against_chain,
+            )
+            .await?;
         }
         Command::AddrVerify {
             owner,
@@ -573,6 +665,80 @@ where
         .await?;
         let w = addr::stats::window_stats((level, index), &apps, txs, roles)?;
         println!("{}", addr::stats::render(&w));
+    }
+    Ok(())
+}
+
+/// `addr-lookup`: newest entries of an address, optionally checked against the chain.
+async fn addr_lookup<P>(
+    provider: &P,
+    bee: &Bee,
+    (address, owner, chain_id): (Address, Address, u64),
+    units: Option<u64>,
+    since: Option<u64>,
+    limit: usize,
+    against_chain: bool,
+) -> Result<()>
+where
+    P: Provider + Clone + 'static,
+{
+    use addr::detect::role;
+    use addr::layout::UNIT_BLOCKS;
+
+    let reader = addr::verify::IndexReader {
+        bee: bee.clone(),
+        owner,
+        chain_id,
+    };
+    let head = match units {
+        Some(u) => reader.head_at(&reader.origin().await?, u).await?,
+        None => {
+            let finalized = provider
+                .get_block_by_number(alloy::eips::BlockNumberOrTag::Finalized)
+                .await?
+                .context("the node reports no finalized block")?
+                .header
+                .number;
+            let (head, miss) = addr::lookup::latest_head(&reader, finalized).await?;
+            if let Some(reason) = miss {
+                eprintln!(
+                    "note: using the newest readable head ({} units), not the one for block \
+                     {finalized}: {reason}. Usually the importer has not published it yet; \
+                     Bee answers a missing and an unretrievable chunk alike.",
+                    head.units
+                );
+            }
+            head
+        }
+    };
+    let found = addr::lookup::lookup(&reader, address, &head, since).await?;
+    for e in found.entries.iter().take(limit) {
+        println!("{:>10}  {:>5}  {}", e.block, e.slot, role::names(e.roles));
+    }
+    println!(
+        "{address}: {} appearances in the index up to block {} ({} units{}; {} slices, {} \
+         files read)",
+        found.entries.len(),
+        head.last_block(),
+        head.units,
+        since.map_or(String::new(), |m| format!(", new since unit {m}")),
+        found.slices,
+        found.files
+    );
+    if against_chain {
+        let from = since.map_or(0, |m| m * UNIT_BLOCKS);
+        let c =
+            addr::lookup::against_chain(provider, address, &found, &head, chain_id, from).await?;
+        ensure!(
+            c.not_on_chain.is_empty() && c.missing.is_empty(),
+            "index and chain differ for {address}: {} entries not on the chain {:?}, {} \
+             appearances missing {:?}",
+            c.not_on_chain.len(),
+            c.not_on_chain.iter().take(5).collect::<Vec<_>>(),
+            c.missing.len(),
+            c.missing.iter().take(5).collect::<Vec<_>>()
+        );
+        println!("Matches the chain: every entry is on it, none is missing.");
     }
     Ok(())
 }

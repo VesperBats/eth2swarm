@@ -1,13 +1,17 @@
 # Address index (design)
 
-Status: **design; implementation in progress** (#8). Implemented: detection
-(`src/addr/detect.rs`), the record formats (`src/addr/layout.rs`), slice building and the
-cover math (`src/addr/slice.rs`), measuring (`ethswarm addr-stats`), and the importer
-(`ethswarm addr-import`, `src/addr/import.rs`) with a full read-back check (`ethswarm
-addr-verify`). The importer builds slices in memory, up to `--max-level` (8 by default),
-and stamps everything with one `--batch`. Still open: building the large levels of a
-mainnet import from disk, postage batches grouped by lifetime (*Lifetime* below), and the
-client. Design issue: #5.
+Status: **implemented on a dev chain; mainnet scale in progress** (#8). Detection
+(`src/addr/detect.rs`, `ethswarm appearances`), the record formats (`src/addr/layout.rs`),
+slice building and the cover math (`src/addr/slice.rs`), measuring (`ethswarm addr-stats`),
+the importer (`ethswarm addr-import`) with a full read-back check (`ethswarm addr-verify`),
+and a client (`ethswarm addr-lookup`, head discovery from a finalized block, incremental
+sync, and a check against the chain). `ethswarm devnet-activity` generates test traffic on
+a dev chain. The client reads every slice and whole spill and pages files; steps 3–5 of
+*Client lookup* (page search, last page first, stopping when the screen is full) and the
+time-based head estimate are not implemented. Still open:
+building the large levels of a mainnet import from disk (the importer builds in memory up to
+`--max-level`, 8 by default), postage batches grouped by lifetime (*Lifetime* below; one
+`--batch` so far), and re-measuring with traces. Design issue: #5.
 
 An index from an **address** to the transactions it **appears in**, stored on Swarm next to
 the [SOC block store](soc-block-store.md). A mobile wallet uses it to list an address's

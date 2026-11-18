@@ -6,7 +6,7 @@ use alloy::providers::Provider;
 use anyhow::{Context, Result, ensure};
 
 use super::layout::{
-    AddressRecord, BucketBody, BucketRecord, Entries, HeadRecord, SliceRecord, bucket_id,
+    AddressRecord, BucketBody, BucketRecord, Entries, Entry, HeadRecord, SliceRecord, bucket_id,
     bucket_pages_file, decode_bucket_page, decode_spill_page, first_block, head_id, last_block,
     origin_id, pages, slice_id, spill_file,
 };
@@ -99,6 +99,138 @@ impl IndexReader {
         );
         Ok(data)
     }
+
+    /// The address records of bucket `k` of slice `s`, from the bucket or its pages file,
+    /// with the bucket payload (for `buckets_root`) and the number of files read. A pages
+    /// file must state the page count the bucket gives, keep the records ascending across
+    /// its pages, and be their canonical encoding: what a client's page search relies on.
+    pub async fn bucket_records(
+        &self,
+        s: SliceId,
+        k: u32,
+    ) -> Result<(Vec<u8>, Vec<AddressRecord>, u64)> {
+        let (first, last) = (first_block(s.0, s.1), last_block(s.0, s.1));
+        let (payload, bucket) = self.bucket(s, k).await?;
+        let (records, files) = match bucket.body {
+            BucketBody::Inline(records) => (records, 0),
+            BucketBody::Paged {
+                count,
+                pages: page_count,
+                pages_ref,
+            } => {
+                let file = self.file(&pages_ref).await?;
+                let split = pages(&file)?;
+                ensure!(
+                    split.len() as u64 == page_count as u64,
+                    "paged bucket {k} of ({}, {}) states {page_count} pages, its file has {}",
+                    s.0,
+                    s.1,
+                    split.len()
+                );
+                let records = split
+                    .into_iter()
+                    .map(|p| decode_bucket_page(p, first, last))
+                    .collect::<Result<Vec<_>>>()?
+                    .concat();
+                ensure!(
+                    records.len() as u64 == count as u64,
+                    "paged bucket {k} of ({}, {}) states {count} records, holds {}",
+                    s.0,
+                    s.1,
+                    records.len()
+                );
+                ensure!(
+                    records.windows(2).all(|w| w[0].fp <= w[1].fp),
+                    "paged bucket {k} of ({}, {}): records not ascending across pages",
+                    s.0,
+                    s.1
+                );
+                ensure!(
+                    bucket_pages_file(&records, first) == file,
+                    "paged bucket {k} of ({}, {}): pages file not canonically encoded",
+                    s.0,
+                    s.1
+                );
+                (records, 1)
+            }
+        };
+        Ok((payload, records, files))
+    }
+
+    /// The entries of a spilled address record of slice `s`, checked: the stated count,
+    /// ascending across pages, and the canonical encoding.
+    pub async fn spill_entries(
+        &self,
+        s: SliceId,
+        spill_ref: &B256,
+        count: u64,
+    ) -> Result<Vec<Entry>> {
+        let (first, last) = (first_block(s.0, s.1), last_block(s.0, s.1));
+        let file = self.file(spill_ref).await?;
+        let entries = pages(&file)?
+            .into_iter()
+            .map(|p| decode_spill_page(p, first, last))
+            .collect::<Result<Vec<_>>>()?
+            .concat();
+        ensure!(
+            entries.len() as u64 == count,
+            "spill file {spill_ref} states {count} entries, holds {}",
+            entries.len()
+        );
+        ensure!(
+            entries
+                .windows(2)
+                .all(|w| (w[0].block, w[0].slot) < (w[1].block, w[1].slot)),
+            "spill file {spill_ref}: entries not ascending across pages"
+        );
+        ensure!(
+            spill_file(&entries) == file,
+            "spill file {spill_ref} not canonically encoded"
+        );
+        Ok(entries)
+    }
+
+    /// The head announcing exactly `units` units, given the origin.
+    pub async fn head_at(&self, origin: &HeadRecord, units: u64) -> Result<HeadRecord> {
+        ensure!(
+            units >= origin.units,
+            "head with {units} units requested, but the index starts at {}",
+            origin.units
+        );
+        let head = self.head(units - origin.units).await?;
+        ensure!(
+            head.units == units,
+            "head update {} announces {} units, expected {units}",
+            units - origin.units,
+            head.units
+        );
+        Ok(head)
+    }
+
+    /// Head update `n` if it can be retrieved. A failed retrieval is `Ok(Err(reason))`: Bee
+    /// 2.8.3 answers a missing chunk and an unretrievable one alike, so it may also be
+    /// transient. A chunk that is retrieved but fails its signature, decoding or the unit
+    /// count `N0 + n` is an error.
+    pub async fn probe_head(
+        &self,
+        origin: &HeadRecord,
+        n: u64,
+    ) -> Result<std::result::Result<HeadRecord, String>> {
+        let address = soc_address(&head_id(self.chain_id, n), &self.owner);
+        let raw = match self.bee.get_chunk(&address).await {
+            Ok(raw) => raw,
+            Err(e) => return Ok(Err(format!("{e:#}"))),
+        };
+        let head = HeadRecord::decode(&soc::verify(&raw, &address, &self.owner)?)
+            .with_context(|| format!("head update {n}"))?;
+        ensure!(
+            head.units == origin.units + n,
+            "head update {n} announces {} units, expected {}",
+            head.units,
+            origin.units + n
+        );
+        Ok(Ok(head))
+    }
 }
 
 /// What `addr-verify` read.
@@ -129,91 +261,24 @@ struct BucketCheck {
 
 /// Reads bucket `k` of slice `s` with every file it references, and checks them.
 async fn check_bucket(r: IndexReader, s: SliceId, k: u32) -> Result<BucketCheck> {
-    let (first, last) = (first_block(s.0, s.1), last_block(s.0, s.1));
-    let (payload, bucket) = r.bucket(s, k).await?;
+    let (payload, records, mut files) = r.bucket_records(s, k).await?;
     let mut c = BucketCheck {
         leaf: keccak256(&payload),
-        addresses: 0,
+        addresses: records.len() as u64,
         appearances: 0,
         files: 0,
     };
-    let records: Vec<AddressRecord> = match bucket.body {
-        BucketBody::Inline(records) => records,
-        BucketBody::Paged {
-            count,
-            pages: page_count,
-            pages_ref,
-        } => {
-            let file = r.file(&pages_ref).await?;
-            c.files += 1;
-            let split = pages(&file)?;
-            ensure!(
-                split.len() as u64 == page_count as u64,
-                "paged bucket {k} of ({}, {}) states {page_count} pages, its file has {}",
-                s.0,
-                s.1,
-                split.len()
-            );
-            let records = split
-                .into_iter()
-                .map(|p| decode_bucket_page(p, first, last))
-                .collect::<Result<Vec<_>>>()?
-                .concat();
-            ensure!(
-                records.len() as u64 == count as u64,
-                "paged bucket {k} of ({}, {}) states {count} records, holds {}",
-                s.0,
-                s.1,
-                records.len()
-            );
-            // A client binary-searches the pages: the order must hold across them, and the
-            // file must be the canonical (greedy, padded) encoding of its records.
-            ensure!(
-                records.windows(2).all(|w| w[0].fp <= w[1].fp),
-                "paged bucket {k} of ({}, {}): records not ascending across pages",
-                s.0,
-                s.1
-            );
-            ensure!(
-                bucket_pages_file(&records, first) == file,
-                "paged bucket {k} of ({}, {}): pages file not canonically encoded",
-                s.0,
-                s.1
-            );
-            records
-        }
-    };
     for rec in records {
-        c.addresses += 1;
         c.appearances += match rec.entries {
             Entries::Inline(e) => e.len() as u64,
             Entries::Spilled { count, spill_ref } => {
-                let file = r.file(&spill_ref).await?;
-                c.files += 1;
-                let entries = pages(&file)?
-                    .into_iter()
-                    .map(|p| decode_spill_page(p, first, last))
-                    .collect::<Result<Vec<_>>>()?
-                    .concat();
-                ensure!(
-                    entries.len() as u64 == count,
-                    "spill file {spill_ref} states {count} entries, holds {}",
-                    entries.len()
-                );
-                ensure!(
-                    entries
-                        .windows(2)
-                        .all(|w| (w[0].block, w[0].slot) < (w[1].block, w[1].slot)),
-                    "spill file {spill_ref}: entries not ascending across pages"
-                );
-                ensure!(
-                    spill_file(&entries) == file,
-                    "spill file {spill_ref} not canonically encoded"
-                );
+                r.spill_entries(s, &spill_ref, count).await?;
+                files += 1;
                 count
             }
         };
     }
+    c.files = files;
     Ok(c)
 }
 
@@ -226,12 +291,7 @@ async fn check_bucket(r: IndexReader, s: SliceId, k: u32) -> Result<BucketCheck>
 pub async fn verify_published(r: &IndexReader, units: Option<u64>) -> Result<Report> {
     let origin = r.origin().await?;
     let units = units.unwrap_or(origin.units);
-    ensure!(
-        units >= origin.units,
-        "head with {units} units requested, but the index starts at {}",
-        origin.units
-    );
-    let head = r.head(units - origin.units).await?;
+    let head = r.head_at(&origin, units).await?;
     // The origin is a copy of head update 0.
     let head0 = if units == origin.units {
         head.clone()
@@ -239,12 +299,6 @@ pub async fn verify_published(r: &IndexReader, units: Option<u64>) -> Result<Rep
         r.head(0).await?
     };
     ensure!(head0 == origin, "the origin differs from head update 0");
-    ensure!(
-        head.units == units,
-        "head update {} announces {} units, expected {units}",
-        units - origin.units,
-        head.units
-    );
     let mut report = Report {
         units,
         pending: head.pending.clone(),
