@@ -1,7 +1,8 @@
 # Address index (design)
 
-Status: **design; implementation in progress** (#8). Detection is implemented in
-`src/addr/detect.rs`; the formats, importer and client are not yet. Design issue: #5.
+Status: **design; implementation in progress** (#8). Implemented: detection
+(`src/addr/detect.rs`), the record formats (`src/addr/layout.rs`), slice building and the
+cover math (`src/addr/slice.rs`). Not yet: the importer and the client. Design issue: #5.
 
 An index from an **address** to the transactions it **appears in**, stored on Swarm next to
 the [SOC block store](soc-block-store.md). A mobile wallet uses it to list an address's
@@ -338,7 +339,11 @@ Encodings are canonical: the same appearances must give byte-identical records, 
 and therefore Swarm references, or independent importers cannot be compared. Besides
 shortest varints that means the orderings given below, greedy spill pages, zero padding, and
 spill files uploaded with Bee's default chunker, unencrypted and without erasure coding
-(redundancy level 0), since encryption and redundancy change the reference.
+(redundancy level 0), since encryption and redundancy change the reference. Bee 2.8.3
+erasure-codes `POST /bytes` unless the request sets `Swarm-Redundancy-Level: 0`, so the
+importer sets it. With it, the reference can be computed before uploading
+(`src/swarm/file.rs`, checked against Bee at every level boundary), which is how a bucket
+names its spill and pages files.
 
 ### `SliceRecord` (kind 4), 111 bytes
 
@@ -448,12 +453,12 @@ range. `u32` block numbers last until block 2^32, more than 1600 years of 12-sec
 | Field | Type | Meaning |
 |---|---|---|
 | header | 5 bytes | `"E2S" ‖ 0x01 ‖ 0x06` |
-| `units` | u64 | `N`, the number of complete units |
+| `units` | u64 | `N`, the number of complete units, at most 2^26 (spill pages store block numbers as u32) |
 | `last_block` | u64 | `N·U − 1` |
 | `last_block_hash` | 32 bytes | hash of `last_block` |
 | `last_block_timestamp` | u64 | timestamp of `last_block` (seconds) |
 | `pending_count` | u8 | `p`, the number of deferred merges |
-| `pending` | `p` × (u8 level ‖ u32 index) | the deferred merged slices, ascending by first unit |
+| `pending` | `p` × (u8 level ‖ u32 index) | the deferred merged slices, strictly ascending by (first unit, level): an outer merge deferred while an inner one is pending starts at the same unit |
 
 ## Client lookup
 

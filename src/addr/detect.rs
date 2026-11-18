@@ -72,6 +72,10 @@ pub struct Appearance {
 #[derive(Debug, Clone, Default)]
 pub struct BlockData {
     pub number: u64,
+    /// Block hash (verified by `fetch`).
+    pub hash: B256,
+    /// Parent block hash, from the verified header.
+    pub parent_hash: B256,
     /// Header beneficiary (fee recipient, miner).
     pub beneficiary: Address,
     pub uncle_beneficiaries: Vec<Address>,

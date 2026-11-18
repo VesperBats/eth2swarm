@@ -73,10 +73,12 @@ pub struct AnchorRecord {
     pub anchor: B256,
 }
 
-struct Writer(Vec<u8>);
+/// Record encoder: `MAGIC ‖ VERSION ‖ kind`, then big-endian fields. Shared with the
+/// address index records (`addr::layout`).
+pub(crate) struct Writer(pub(crate) Vec<u8>);
 
 impl Writer {
-    fn new(kind: u8) -> Self {
+    pub(crate) fn new(kind: u8) -> Self {
         let mut buf = MAGIC.to_vec();
         buf.extend([VERSION, kind]);
         Self(buf)
@@ -85,8 +87,17 @@ impl Writer {
         self.0.extend(g.epoch_size.to_be_bytes());
         self.0.extend(g.num_epochs.to_be_bytes());
     }
-    fn hash(&mut self, h: &B256) {
+    pub(crate) fn hash(&mut self, h: &B256) {
         self.0.extend_from_slice(h.as_slice());
+    }
+    pub(crate) fn u8(&mut self, v: u8) {
+        self.0.push(v);
+    }
+    pub(crate) fn u32(&mut self, v: u32) {
+        self.0.extend(v.to_be_bytes());
+    }
+    pub(crate) fn u64(&mut self, v: u64) {
+        self.0.extend(v.to_be_bytes());
     }
     fn hashes(&mut self, hs: &[B256]) {
         self.0
@@ -103,10 +114,11 @@ impl Writer {
     }
 }
 
-struct Reader<'a>(&'a [u8]);
+/// Record decoder matching [`Writer`].
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 
 impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8], kind: u8) -> Result<Self> {
+    pub(crate) fn new(buf: &'a [u8], kind: u8) -> Result<Self> {
         ensure!(
             buf.len() >= 5 && &buf[..3] == MAGIC,
             "not an eth2swarm record"
@@ -115,17 +127,23 @@ impl<'a> Reader<'a> {
         ensure!(buf[4] == kind, "record kind {} (expected {kind})", buf[4]);
         Ok(Self(&buf[5..]))
     }
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         ensure!(self.0.len() >= n, "record truncated");
         let (head, tail) = self.0.split_at(n);
         self.0 = tail;
         Ok(head)
     }
-    fn u16(&mut self) -> Result<u16> {
+    pub(crate) fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    pub(crate) fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_be_bytes(self.take(2)?.try_into()?))
     }
-    fn u32(&mut self) -> Result<u32> {
+    pub(crate) fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(self.take(4)?.try_into()?))
+    }
+    pub(crate) fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.take(8)?.try_into()?))
     }
     fn geometry(&mut self) -> Result<Geometry> {
         Ok(Geometry {
@@ -133,7 +151,7 @@ impl<'a> Reader<'a> {
             num_epochs: self.u32()?,
         })
     }
-    fn hash(&mut self) -> Result<B256> {
+    pub(crate) fn hash(&mut self) -> Result<B256> {
         Ok(B256::from_slice(self.take(32)?))
     }
     fn hashes(&mut self) -> Result<Vec<B256>> {
@@ -144,7 +162,7 @@ impl<'a> Reader<'a> {
         let n = self.u16()? as usize;
         Ok(self.take(n)?.to_vec())
     }
-    fn finish(self) -> Result<()> {
+    pub(crate) fn finish(self) -> Result<()> {
         if !self.0.is_empty() {
             bail!("{} trailing bytes in record", self.0.len());
         }

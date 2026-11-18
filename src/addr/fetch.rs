@@ -17,7 +17,11 @@ use anyhow::{Context, Result, ensure};
 use alloy::consensus::TxEnvelope;
 use alloy::primitives::Address;
 
-use super::detect::{BlockData, LogData, Trace, TxData, check_traces};
+use std::collections::BTreeMap;
+
+use alloy::primitives::B256;
+
+use super::detect::{Appearance, BlockData, LogData, Trace, TxData, check_traces, detect};
 use crate::chain::fetch_verified_block;
 
 /// The sender of a transaction from a verified block. Recovery skips EIP-2's low-`s` rule:
@@ -120,6 +124,8 @@ pub async fn fetch_block_data(
 
     Ok(BlockData {
         number,
+        hash,
+        parent_hash: block.header.parent_hash,
         beneficiary: block.header.beneficiary,
         uncle_beneficiaries,
         withdrawal_recipients: block
@@ -131,6 +137,80 @@ pub async fn fetch_block_data(
         txs: tx_data,
         traces,
     })
+}
+
+/// The appearances of one block, with the hashes that link it to its neighbours.
+#[derive(Debug, Clone)]
+pub struct BlockAppearances {
+    pub number: u64,
+    pub hash: B256,
+    pub parent_hash: B256,
+    pub appearances: Vec<Appearance>,
+}
+
+/// Fetches and detects every block in `blocks`, up to `concurrency` blocks in flight, and
+/// hands the results to `sink` in block order. Only the appearances are kept, and at most
+/// `2 · concurrency` blocks wait to be handed on. Each block must be the child of the one
+/// before it (`parent_hash`), so a range never mixes two forks; the caller checks the first
+/// block's parent if it knows it.
+pub async fn fetch_appearances<P>(
+    provider: &P,
+    blocks: std::ops::RangeInclusive<u64>,
+    traces: bool,
+    concurrency: usize,
+    mut sink: impl FnMut(BlockAppearances) -> Result<()>,
+) -> Result<()>
+where
+    P: Provider + Clone + 'static,
+{
+    let concurrency = concurrency.max(1);
+    let (mut next_spawn, end) = (*blocks.start(), *blocks.end());
+    if next_spawn > end {
+        return Ok(());
+    }
+    let mut next_emit = next_spawn;
+    let mut waiting: BTreeMap<u64, BlockAppearances> = BTreeMap::new();
+    let mut prev_hash: Option<B256> = None;
+    let mut set = tokio::task::JoinSet::new();
+    while next_emit <= end {
+        while set.len() < concurrency
+            && next_spawn <= end
+            && next_spawn - next_emit < 2 * concurrency as u64
+        {
+            let (p, n) = (provider.clone(), next_spawn);
+            set.spawn(async move {
+                let data = fetch_block_data(&p, n, traces).await?;
+                anyhow::Ok(BlockAppearances {
+                    number: n,
+                    hash: data.hash,
+                    parent_hash: data.parent_hash,
+                    appearances: detect(&data),
+                })
+            });
+            next_spawn += 1;
+        }
+        let done = set
+            .join_next()
+            .await
+            .expect("a fetch is in flight while blocks remain")
+            .context("block fetch task panicked")??;
+        waiting.insert(done.number, done);
+        while let Some(b) = waiting.remove(&next_emit) {
+            if let Some(prev) = prev_hash {
+                ensure!(
+                    b.parent_hash == prev,
+                    "block {}: parent {} is not block {}'s hash {prev} (reorg or mixed sources?)",
+                    b.number,
+                    b.parent_hash,
+                    b.number - 1
+                );
+            }
+            prev_hash = Some(b.hash);
+            next_emit += 1;
+            sink(b)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
