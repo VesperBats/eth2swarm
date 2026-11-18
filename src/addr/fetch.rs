@@ -139,6 +139,31 @@ pub async fn fetch_block_data(
     })
 }
 
+/// Attempts per block before [`fetch_appearances`] gives up.
+const ATTEMPTS: u32 = 4;
+
+/// [`fetch_block_data`], retried with growing pauses (1, 2, 4 s): one transport error on a
+/// slow node must not lose a window of thousands of blocks. A block that fails verification
+/// fails every attempt alike, and the last error is returned.
+async fn fetch_with_retry<P: Provider>(
+    provider: &P,
+    number: u64,
+    traces: bool,
+) -> Result<BlockData> {
+    let mut attempt = 1;
+    loop {
+        match fetch_block_data(provider, number, traces).await {
+            Ok(data) => return Ok(data),
+            Err(e) if attempt < ATTEMPTS => {
+                tracing::warn!("block {number}, attempt {attempt}/{ATTEMPTS}: {e:#}");
+                tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 1))).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e.context(format!("block {number}: {ATTEMPTS} attempts failed"))),
+        }
+    }
+}
+
 /// The appearances of one block, with the hashes that link it to its neighbours.
 #[derive(Debug, Clone)]
 pub struct BlockAppearances {
@@ -180,7 +205,7 @@ where
         {
             let (p, n) = (provider.clone(), next_spawn);
             set.spawn(async move {
-                let data = fetch_block_data(&p, n, traces).await?;
+                let data = fetch_with_retry(&p, n, traces).await?;
                 anyhow::Ok(BlockAppearances {
                     number: n,
                     hash: data.hash,

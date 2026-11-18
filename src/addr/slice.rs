@@ -4,7 +4,7 @@
 // The importer and client that use all of this follow in parts 4 and 5 of #8.
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
 use alloy::primitives::{Address, B256, keccak256};
@@ -84,12 +84,29 @@ pub fn slices_after(m: u64, n: u64) -> Vec<SliceId> {
 }
 
 /// A slice built in memory: its descriptor, its bucket payloads (index = bucket number) and
-/// the spill and pages files they reference, each with its Swarm reference.
+/// the spill and pages files they reference, each with its Swarm reference. Files are
+/// content-addressed, so a file two addresses share (identical entries) is listed once.
 #[derive(Debug, Clone)]
 pub struct BuiltSlice {
     pub record: SliceRecord,
     pub buckets: Vec<Vec<u8>>,
     pub files: Vec<(B256, Vec<u8>)>,
+    /// Addresses whose entries went to a spill file.
+    pub spilled: u32,
+    /// Buckets stored as pages files.
+    pub paged: u32,
+}
+
+/// Adds `file` under `reference` unless a file with that reference is already there.
+fn add_file(
+    files: &mut Vec<(B256, Vec<u8>)>,
+    seen: &mut HashSet<B256>,
+    reference: B256,
+    file: Vec<u8>,
+) {
+    if seen.insert(reference) {
+        files.push((reference, file));
+    }
 }
 
 /// keccak256 of the address bytes: bucket from `h[0..4]`, fingerprint `h[4..12]`.
@@ -156,6 +173,8 @@ fn build(
     }
 
     let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    let mut spilled = 0u32;
     let mut appearance_count = 0u64;
     // (hash, address, record, encoded length)
     let mut records: Vec<(B256, Address, AddressRecord, usize)> = by_address
@@ -170,7 +189,8 @@ fn build(
             let entries = if entries_len(&entries, first) > SPILL_INLINE_MAX {
                 let file = spill_file(&entries);
                 let spill_ref = file_reference(&file);
-                files.push((spill_ref, file));
+                add_file(&mut files, &mut seen, spill_ref, file);
+                spilled += 1;
                 Entries::Spilled {
                     count: entries.len() as u64,
                     spill_ref,
@@ -208,6 +228,7 @@ fn build(
     }
 
     let mut buckets = Vec::with_capacity(grouped.len());
+    let mut paged = 0u32;
     for (k, recs) in grouped.into_iter().enumerate() {
         let inline = BucketRecord {
             level,
@@ -222,7 +243,7 @@ fn build(
             };
             let file = bucket_pages_file(&recs, first);
             let pages_ref = file_reference(&file);
-            let paged = BucketRecord {
+            let paged_bucket = BucketRecord {
                 level,
                 index,
                 bucket: k as u32,
@@ -232,8 +253,9 @@ fn build(
                     pages_ref,
                 },
             };
-            files.push((pages_ref, file));
-            payload = paged.encode();
+            add_file(&mut files, &mut seen, pages_ref, file);
+            payload = paged_bucket.encode();
+            paged += 1;
         }
         buckets.push(payload);
     }
@@ -254,6 +276,8 @@ fn build(
         },
         buckets,
         files,
+        spilled,
+        paged,
     })
 }
 
@@ -447,6 +471,20 @@ mod tests {
         assert_eq!(again.record, built.record);
     }
 
+    #[test]
+    fn identical_spill_files_are_listed_once() {
+        // Two addresses with the same 100 entries: one spill file, two spilled addresses.
+        let mut apps = Vec::new();
+        for b in 0..100 {
+            apps.push(app(b * 3, 1, 0xaa, 1));
+            apps.push(app(b * 3, 1, 0xbb, 1));
+        }
+        let built = build_slice((3, 0), &apps, B256::ZERO, 0xff).unwrap();
+        assert_eq!(built.spilled, 2);
+        assert_eq!(built.files.len(), 1);
+        assert_eq!(built.paged, 0);
+    }
+
     /// Addresses whose hashes share `h[0..4]` cannot be separated by any bucket count; the
     /// bucket is paged instead of breaking the slice. Grinding real collisions is too slow
     /// for a test, so all addresses are forced into one bucket.
@@ -463,6 +501,7 @@ mod tests {
             .collect();
         let built = build(slice, &apps, B256::ZERO, 0x10, Some(1)).unwrap();
         assert_eq!(built.buckets.len(), 1);
+        assert_eq!(built.paged, 1);
         assert!(built.buckets[0].len() <= PAGE_SIZE);
         let b = BucketRecord::decode(&built.buckets[0]).unwrap();
         let BucketBody::Paged {

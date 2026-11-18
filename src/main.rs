@@ -375,7 +375,8 @@ where
     P: Provider + Clone + 'static,
 {
     use addr::detect::role;
-    use addr::layout::{BucketBody, BucketRecord, L_MAX, PAGE_SIZE, first_block, last_block};
+    use addr::layout::{L_MAX, first_block, last_block};
+    use swarm::file::file_chunks;
 
     ensure!(level <= L_MAX, "slice level {level} above {L_MAX}");
     let (first, last) = (first_block(level, index), last_block(level, index));
@@ -390,22 +391,8 @@ where
     let roles = if traces { 0xff } else { !role::TRACE };
     let built = addr::slice::build_slice((level, index), &apps, last_hash, roles)?;
     let r = &built.record;
-    let paged = built
-        .buckets
-        .iter()
-        .filter(|b| {
-            matches!(
-                BucketRecord::decode(b).map(|b| b.body),
-                Ok(BucketBody::Paged { .. })
-            )
-        })
-        .count();
     let file_bytes: usize = built.files.iter().map(|(_, f)| f.len()).sum();
-    let file_chunks: usize = built
-        .files
-        .iter()
-        .map(|(_, f)| f.len().div_ceil(PAGE_SIZE))
-        .sum();
+    let chunks: usize = built.files.iter().map(|(_, f)| file_chunks(f.len())).sum();
     let bucket_bytes: usize = built.buckets.iter().map(Vec::len).sum();
     println!("Slice ({level}, {index}): blocks {first}..={last}");
     println!("  appearances: {}", r.appearances);
@@ -413,15 +400,16 @@ where
     println!(
         "  buckets:     {} ({} paged), {} bytes, largest {} bytes",
         r.bucket_count,
-        paged,
+        built.paged,
         bucket_bytes,
         built.buckets.iter().map(Vec::len).max().unwrap_or(0)
     );
     println!(
-        "  files:       {} (spill and pages), {} bytes, {} data chunks",
+        "  files:       {} (spill and pages; {} spilled addresses), {} bytes, {} chunks",
         built.files.len(),
+        built.spilled,
         file_bytes,
-        file_chunks
+        chunks
     );
     println!(
         "  bytes per appearance: {:.2}",
@@ -443,13 +431,33 @@ where
     P: Provider + Clone + 'static,
 {
     use addr::detect::role;
-    use addr::layout::{L_MAX, UNIT_BLOCKS, first_block, last_block};
+    use addr::layout::{UNIT_BLOCKS, first_block, last_block};
 
-    ensure!(level <= L_MAX, "window level {level} above {L_MAX}");
+    // A window is held in memory with all its appearances: a level-8 window at the tip is
+    // ~25 M appearances (about 1 GB). Larger slices are built by merging, in the importer.
+    const MAX_WINDOW_LEVEL: u8 = 8;
+    ensure!(
+        level <= MAX_WINDOW_LEVEL,
+        "window level {level} above {MAX_WINDOW_LEVEL} (the window is held in memory)"
+    );
     let roles = if traces { 0xff } else { !role::TRACE };
-    for &block in at {
-        let index = u32::try_from((block / UNIT_BLOCKS) >> level)?;
+    let tip = provider
+        .get_block_number()
+        .await
+        .context("querying the chain tip")?;
+    let mut windows: Vec<u32> = at
+        .iter()
+        .map(|b| u32::try_from((b / UNIT_BLOCKS) >> level))
+        .collect::<Result<_, _>>()?;
+    windows.sort_unstable();
+    windows.dedup();
+    for index in windows {
         let (first, last) = (first_block(level, index), last_block(level, index));
+        ensure!(
+            last <= tip,
+            "window {first}..={last} is not complete yet (the chain is at {tip})"
+        );
+        eprintln!("fetching blocks {first}..={last}");
         let mut apps = Vec::new();
         let mut txs = 0u64;
         addr::fetch::fetch_appearances(provider, first..=last, traces, concurrency, |b| {

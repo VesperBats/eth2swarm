@@ -7,7 +7,7 @@
 use anyhow::{Result, ensure};
 
 use super::detect::{Appearance, role};
-use super::layout::{BucketBody, BucketRecord, first_block, last_block};
+use super::layout::{first_block, last_block};
 use super::slice::{SliceId, build_slice};
 use crate::swarm::file::file_chunks;
 
@@ -37,8 +37,8 @@ pub struct WindowStats {
     pub appearances: u64,
     /// Appearances whose only role is `WORD`.
     pub word_only: u64,
-    /// Appearances with the `TRACE` role.
-    pub with_trace: u64,
+    /// Appearances with the `TRACE` role, if traces were read.
+    pub with_trace: Option<u64>,
     pub levels: Vec<LevelStats>,
 }
 
@@ -68,10 +68,12 @@ pub fn window_stats(
         txs,
         appearances: appearances.len() as u64,
         word_only: appearances.iter().filter(|a| a.roles == role::WORD).count() as u64,
-        with_trace: appearances
-            .iter()
-            .filter(|a| a.roles & role::TRACE != 0)
-            .count() as u64,
+        with_trace: (roles & role::TRACE != 0).then(|| {
+            appearances
+                .iter()
+                .filter(|a| a.roles & role::TRACE != 0)
+                .count() as u64
+        }),
         levels: Vec::new(),
     };
     for level in 0..=top {
@@ -87,23 +89,12 @@ pub fn window_stats(
             let hi = appearances.partition_point(|x| x.block <= b);
             // The hash of the last block is not needed for sizes.
             let built = build_slice(slice, &appearances[lo..hi], Default::default(), roles)?;
-            let paged = built
-                .buckets
-                .iter()
-                .filter(|b| {
-                    matches!(
-                        BucketRecord::decode(b).map(|b| b.body),
-                        Ok(BucketBody::Paged { .. })
-                    )
-                })
-                .count() as u64;
             s.slices += 1;
             s.addresses += built.record.addresses as u64;
             s.appearances += built.record.appearances;
             s.buckets += built.buckets.len() as u64;
-            s.paged_buckets += paged;
-            // Every file is a spill file, except one pages file per paged bucket.
-            s.spilled_addresses += built.files.len() as u64 - paged;
+            s.paged_buckets += built.paged as u64;
+            s.spilled_addresses += built.spilled as u64;
             s.bytes += built.buckets.iter().map(|b| b.len() as u64).sum::<u64>()
                 + built.files.iter().map(|(_, f)| f.len() as u64).sum::<u64>();
             s.chunks += 1
@@ -131,26 +122,30 @@ pub fn window_stats(
 pub fn render(w: &WindowStats) -> String {
     let blocks = w.last_block - w.first_block + 1;
     let pct = |n: u64| 100.0 * n as f64 / w.appearances.max(1) as f64;
+    let trace = w
+        .with_trace
+        .map_or("n/a (no traces read)".to_string(), |n| {
+            format!("{:.1} %", pct(n))
+        });
     let mut out = format!(
         "Blocks {}..={}: {:.1} txs and {:.1} appearances per block, `WORD` only {:.1} %, \
-         with `TRACE` {:.1} %\n\n",
+         with `TRACE` {trace}\n\n",
         w.first_block,
         w.last_block,
         w.txs as f64 / blocks as f64,
         w.appearances as f64 / blocks as f64,
         pct(w.word_only),
-        pct(w.with_trace),
     );
     out.push_str(
         "| Level | Blocks / slice | Slices | Addresses / slice | Appearances / slice | \
-         Bytes / appearance | Buckets / slice | Paged | Spilled / slice | Chunks / slice | \
+         Bytes / appearance | Buckets / slice | Paged / slice | Spilled / slice | Chunks / slice | \
          Chunks / 1000 appearances | Largest bucket |\n",
     );
     out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
     for s in &w.levels {
         let n = s.slices.max(1) as f64;
         out.push_str(&format!(
-            "| {} | {} | {} | {:.0} | {:.0} | {:.2} | {:.1} | {} | {:.1} | {:.1} | {:.2} | {} |\n",
+            "| {} | {} | {} | {:.0} | {:.0} | {:.2} | {:.1} | {:.2} | {:.1} | {:.1} | {:.2} | {} |\n",
             s.level,
             blocks / s.slices.max(1),
             s.slices,
@@ -158,7 +153,7 @@ pub fn render(w: &WindowStats) -> String {
             s.appearances as f64 / n,
             s.bytes as f64 / s.appearances.max(1) as f64,
             s.buckets as f64 / n,
-            s.paged_buckets,
+            s.paged_buckets as f64 / n,
             s.spilled_addresses as f64 / n,
             s.chunks as f64 / n,
             1000.0 * s.chunks as f64 / s.appearances.max(1) as f64,
@@ -204,7 +199,10 @@ mod tests {
         let w = window_stats(window, &a, 300, 0xff).unwrap();
         assert_eq!(w.appearances, 512);
         assert_eq!(w.word_only, 256);
-        assert_eq!(w.with_trace, 0);
+        assert_eq!(w.with_trace, Some(0));
+        let no_traces = window_stats(window, &a, 300, !role::TRACE).unwrap();
+        assert_eq!(no_traces.with_trace, None);
+        assert!(render(&no_traces).contains("`TRACE` n/a"));
         assert_eq!(w.levels.len(), 3);
         for (s, slices) in w.levels.iter().zip([4u64, 2, 1]) {
             assert_eq!(s.slices, slices);

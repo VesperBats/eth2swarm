@@ -116,7 +116,7 @@ echo "ok: slice (0, 0) buckets root $ROOT_A"
 
 echo "== address-index sizes (addr-stats) of the level-1 window at block 0"
 STATS=$($BIN addr-stats --level 1 --at 0 "${TRACE_FLAG[@]}") || { echo "FAIL: addr-stats"; exit 1; }
-ROWS=$(printf '%s\n' "$STATS" | grep -cE '^\| [01] \|')
+ROWS=$(printf '%s\n' "$STATS" | grep -cE '^\| [01] \|' || true)
 [ "$ROWS" = 2 ] || { echo "FAIL: addr-stats printed $ROWS level rows, expected 2:"; echo "$STATS"; exit 1; }
 echo "ok: addr-stats"
 
