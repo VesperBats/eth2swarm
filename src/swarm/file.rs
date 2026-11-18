@@ -58,6 +58,24 @@ pub fn file_reference(data: &[u8]) -> B256 {
     }
 }
 
+/// Number of chunks Bee stores for a file of `len` bytes (leaves and intermediate chunks;
+/// a carried single reference adds no chunk).
+pub fn file_chunks(len: usize) -> usize {
+    if len <= CHUNK_SIZE {
+        return 1;
+    }
+    let mut refs = len.div_ceil(CHUNK_SIZE);
+    let mut chunks = refs;
+    while refs > 1 {
+        let (full, rest) = (refs / BRANCHES, refs % BRANCHES);
+        // Full groups are wrapped; a remainder of several references is wrapped too, a single
+        // one is carried up as it is.
+        chunks += full + usize::from(rest > 1);
+        refs = full + usize::from(rest > 0);
+    }
+    chunks
+}
+
 /// Append a reference to level `l`, wrapping the level as soon as it is full.
 fn push(levels: &mut Vec<Vec<(B256, u64)>>, l: usize, r: (B256, u64)) {
     if levels.len() == l {
@@ -90,6 +108,25 @@ mod tests {
     fn single_chunk_is_its_cac_address() {
         let d = data(4096);
         assert_eq!(file_reference(&d), cac_address(4096, &d));
+    }
+
+    #[test]
+    fn chunk_counts() {
+        for (len, chunks) in [
+            (0, 1),
+            (4096, 1),
+            (4097, 3),
+            // 128 leaves + their intermediate chunk.
+            (128 * 4096, 129),
+            // 129 leaves: one full intermediate chunk, the last leaf carried, and a root.
+            (128 * 4096 + 1, 131),
+            // 16384 leaves: 128 intermediates and a root.
+            (16384 * 4096, 16513),
+            // One more leaf, carried two levels up: 128 + 1 + 1 extra chunks.
+            (16384 * 4096 + 1, 16515),
+        ] {
+            assert_eq!(file_chunks(len), chunks, "length {len}");
+        }
     }
 
     #[test]

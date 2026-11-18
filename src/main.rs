@@ -67,6 +67,23 @@ enum Command {
         /// Block number.
         number: u64,
     },
+    /// Measure the address index with the real encoder: build every slice of levels
+    /// 0..=LEVEL in the level-LEVEL window around each `--at` block and print the sizes per
+    /// level as a Markdown table (nothing is uploaded).
+    AddrStats {
+        /// Window level (0 = one unit of 64 blocks, 8 = 16,384 blocks).
+        #[arg(long, default_value_t = 5)]
+        level: u8,
+        /// A block in each window to measure (repeatable).
+        #[arg(long = "at", required = true)]
+        at: Vec<u64>,
+        /// Also read `trace_block` (see `appearances`).
+        #[arg(long)]
+        traces: bool,
+        /// Blocks fetched in parallel.
+        #[arg(long, default_value_t = 16)]
+        concurrency: usize,
+    },
     /// Build one address-index slice in memory and print its sizes (nothing is uploaded).
     AddrSlice {
         /// Slice level (0 = one unit of 64 blocks).
@@ -185,6 +202,14 @@ async fn main() -> Result<()> {
             println!("Timestamp:  {}", block.header.timestamp);
             println!("Txs:        {}", block.transactions.len());
             println!("Gas used:   {}", block.header.gas_used);
+        }
+        Command::AddrStats {
+            level,
+            at,
+            traces,
+            concurrency,
+        } => {
+            addr_stats(&provider, level, &at, traces, concurrency).await?;
         }
         Command::AddrSlice {
             level,
@@ -403,5 +428,38 @@ where
         (bucket_bytes + file_bytes) as f64 / r.appearances.max(1) as f64
     );
     println!("  buckets root: {}", r.buckets_root);
+    Ok(())
+}
+
+/// `addr-stats`: one Markdown table per window.
+async fn addr_stats<P>(
+    provider: &P,
+    level: u8,
+    at: &[u64],
+    traces: bool,
+    concurrency: usize,
+) -> Result<()>
+where
+    P: Provider + Clone + 'static,
+{
+    use addr::detect::role;
+    use addr::layout::{L_MAX, UNIT_BLOCKS, first_block, last_block};
+
+    ensure!(level <= L_MAX, "window level {level} above {L_MAX}");
+    let roles = if traces { 0xff } else { !role::TRACE };
+    for &block in at {
+        let index = u32::try_from((block / UNIT_BLOCKS) >> level)?;
+        let (first, last) = (first_block(level, index), last_block(level, index));
+        let mut apps = Vec::new();
+        let mut txs = 0u64;
+        addr::fetch::fetch_appearances(provider, first..=last, traces, concurrency, |b| {
+            apps.extend(b.appearances);
+            txs += b.txs as u64;
+            Ok(())
+        })
+        .await?;
+        let w = addr::stats::window_stats((level, index), &apps, txs, roles)?;
+        println!("{}", addr::stats::render(&w));
+    }
     Ok(())
 }

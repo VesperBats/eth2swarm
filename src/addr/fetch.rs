@@ -145,6 +145,7 @@ pub struct BlockAppearances {
     pub number: u64,
     pub hash: B256,
     pub parent_hash: B256,
+    pub txs: usize,
     pub appearances: Vec<Appearance>,
 }
 
@@ -184,6 +185,7 @@ where
                     number: n,
                     hash: data.hash,
                     parent_hash: data.parent_hash,
+                    txs: data.txs.len(),
                     appearances: detect(&data),
                 })
             });

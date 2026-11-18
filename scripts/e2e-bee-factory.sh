@@ -114,6 +114,12 @@ ROOT_A=$(slice_root) && ROOT_B=$(slice_root) || { echo "FAIL: addr-slice 0 0"; e
 [ "$ROOT_A" = "$ROOT_B" ] || { echo "FAIL: addr-slice 0 0 gave $ROOT_A, then $ROOT_B"; exit 1; }
 echo "ok: slice (0, 0) buckets root $ROOT_A"
 
+echo "== address-index sizes (addr-stats) of the level-1 window at block 0"
+STATS=$($BIN addr-stats --level 1 --at 0 "${TRACE_FLAG[@]}") || { echo "FAIL: addr-stats"; exit 1; }
+ROWS=$(printf '%s\n' "$STATS" | grep -cE '^\| [01] \|')
+[ "$ROWS" = 2 ] || { echo "FAIL: addr-stats printed $ROWS level rows, expected 2:"; echo "$STATS"; exit 1; }
+echo "ok: addr-stats"
+
 echo "== inspector (ethswarm serve) verifies a block via $READ_BEE"
 # INSPECTOR_ADDR is an IP:port (a socket address, not a host name). Refuse a port that
 # is already taken: the checks would otherwise talk to whatever holds it.
