@@ -76,6 +76,8 @@ pub struct BlockData {
     pub hash: B256,
     /// Parent block hash, from the verified header.
     pub parent_hash: B256,
+    /// Block timestamp (seconds), from the verified header.
+    pub timestamp: u64,
     /// Header beneficiary (fee recipient, miner).
     pub beneficiary: Address,
     pub uncle_beneficiaries: Vec<Address>,

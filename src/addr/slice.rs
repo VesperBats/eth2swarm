@@ -77,6 +77,26 @@ pub fn expansion(slice: SliceId) -> Vec<SliceId> {
     out
 }
 
+/// What a client reads for a head with `n` units and the deferred merges `pending`: the
+/// cover of `[0, n)`, with every pending slice replaced by its expansion, recursively (an
+/// expansion can contain a merge that is still pending itself). Oldest first.
+pub fn resolve(n: u64, pending: &[SliceId]) -> Vec<SliceId> {
+    fn push(out: &mut Vec<SliceId>, s: SliceId, pending: &[SliceId]) {
+        if s.0 > 0 && pending.contains(&s) {
+            for e in expansion(s) {
+                push(out, e, pending);
+            }
+        } else {
+            out.push(s);
+        }
+    }
+    let mut out = Vec::new();
+    for s in cover(n) {
+        push(&mut out, s, pending);
+    }
+    out
+}
+
 /// The slices of the cover of `[0, n)` that end after unit `m`: what a client that has read
 /// everything up to unit `m` still has to read.
 pub fn slices_after(m: u64, n: u64) -> Vec<SliceId> {

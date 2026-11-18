@@ -2,7 +2,11 @@
 
 Status: **design; implementation in progress** (#8). Implemented: detection
 (`src/addr/detect.rs`), the record formats (`src/addr/layout.rs`), slice building and the
-cover math (`src/addr/slice.rs`). Not yet: the importer and the client. Design issue: #5.
+cover math (`src/addr/slice.rs`), measuring (`ethswarm addr-stats`), and the importer
+(`ethswarm addr-import`, `src/addr/import.rs`) with a full read-back check (`ethswarm
+addr-verify`). The importer builds slices in memory, up to `--max-level` (8 by default);
+building the large levels of a mainnet import from disk is still open, as is the client.
+Design issue: #5.
 
 An index from an **address** to the transactions it **appears in**, stored on Swarm next to
 the [SOC block store](soc-block-store.md). A mobile wallet uses it to list an address's

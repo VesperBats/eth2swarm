@@ -20,6 +20,7 @@ async fn backoff(attempt: u32) {
     }
 }
 
+#[derive(Clone)]
 pub struct Bee {
     base: Url,
     http: reqwest::Client,
@@ -98,7 +99,21 @@ impl Bee {
 
     /// Upload arbitrary bytes as a Swarm file (chunk tree); returns its root reference.
     pub async fn upload_bytes(&self, batch: &B256, data: Vec<u8>) -> Result<B256> {
-        self.post_with_retry(self.url("bytes")?, batch, data).await
+        self.post_with_retry(self.url("bytes")?, batch, data, &[])
+            .await
+    }
+
+    /// Upload bytes as a Swarm file without erasure coding (`Swarm-Redundancy-Level: 0`), so
+    /// that the reference is the plain chunk tree's (`swarm::file::file_reference`). Bee
+    /// 2.8.3 erasure-codes `/bytes` uploads unless told otherwise.
+    pub async fn upload_file(&self, batch: &B256, data: Vec<u8>) -> Result<B256> {
+        self.post_with_retry(
+            self.url("bytes")?,
+            batch,
+            data,
+            &[("Swarm-Redundancy-Level", "0")],
+        )
+        .await
     }
 
     /// Upload a signed SOC; returns its address as reported by Bee.
@@ -109,23 +124,30 @@ impl Bee {
             hex::encode(soc.identifier),
             hex::encode(soc.signature)
         );
-        self.post_with_retry(self.url(&path)?, batch, soc.span_and_payload())
+        self.post_with_retry(self.url(&path)?, batch, soc.span_and_payload(), &[])
             .await
     }
 
-    async fn post_with_retry(&self, url: Url, batch: &B256, data: Vec<u8>) -> Result<B256> {
+    async fn post_with_retry(
+        &self,
+        url: Url,
+        batch: &B256,
+        data: Vec<u8>,
+        headers: &[(&str, &str)],
+    ) -> Result<B256> {
         let mut last = None;
         for attempt in 0..RETRIES {
             backoff(attempt).await;
-            let sent = self
+            let mut req = self
                 .http
                 .post(url.clone())
                 .header("Swarm-Postage-Batch-Id", hex::encode(batch))
                 .header("Swarm-Deferred-Upload", "false")
-                .header("Content-Type", "application/octet-stream")
-                .body(data.clone())
-                .send()
-                .await;
+                .header("Content-Type", "application/octet-stream");
+            for (name, value) in headers {
+                req = req.header(*name, *value);
+            }
+            let sent = req.body(data.clone()).send().await;
             match sent {
                 Ok(resp) if resp.status().is_success() => {
                     // The upload may already be stored; resending the same payload is

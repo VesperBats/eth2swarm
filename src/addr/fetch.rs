@@ -127,6 +127,7 @@ pub async fn fetch_block_data(
         number,
         hash,
         parent_hash: block.header.parent_hash,
+        timestamp: block.header.timestamp,
         beneficiary: block.header.beneficiary,
         uncle_beneficiaries,
         withdrawal_recipients: block
@@ -183,6 +184,7 @@ pub struct BlockAppearances {
     pub number: u64,
     pub hash: B256,
     pub parent_hash: B256,
+    pub timestamp: u64,
     pub txs: usize,
     pub appearances: Vec<Appearance>,
 }
@@ -223,6 +225,7 @@ where
                     number: n,
                     hash: data.hash,
                     parent_hash: data.parent_hash,
+                    timestamp: data.timestamp,
                     txs: data.txs.len(),
                     appearances: detect(&data),
                 })

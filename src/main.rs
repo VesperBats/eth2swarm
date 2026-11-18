@@ -67,6 +67,47 @@ enum Command {
         /// Block number.
         number: u64,
     },
+    /// Publish the address index to Swarm (docs/address-index.md): a backfill on the first
+    /// run, then one slice and one head update per finalized unit, resuming from --state.
+    AddrImport {
+        /// Private key of the SOC owner.
+        #[arg(long, env = "ETH2SWARM_KEY", hide_env_values = true)]
+        key: PrivateKeySigner,
+        /// Directory for the importer's state file.
+        #[arg(long)]
+        state: std::path::PathBuf,
+        /// Import up to this many units (default: every finalized unit).
+        #[arg(long)]
+        units: Option<u64>,
+        /// Also read `trace_block` (see `appearances`).
+        #[arg(long)]
+        traces: bool,
+        /// Postage batch ID. Defaults to the Bee node's first usable batch.
+        #[arg(long)]
+        batch: Option<B256>,
+        /// Merges of this level and above are built in the background.
+        #[arg(long, default_value_t = 6)]
+        defer_level: u8,
+        /// Highest slice level built in memory.
+        #[arg(long, default_value_t = 8)]
+        max_level: u8,
+        /// Blocks fetched, and chunks uploaded, in parallel.
+        #[arg(long, default_value_t = 16)]
+        concurrency: usize,
+    },
+    /// Read the published address index back and check what one head makes a client read:
+    /// every slice's buckets against its descriptor, every file against its reference.
+    AddrVerify {
+        /// Address of the SOC owner (the importer's key).
+        #[arg(long, env = "ETH2SWARM_OWNER")]
+        owner: Address,
+        /// Chain ID used in the SOC identifiers.
+        #[arg(long, env = "ETH2SWARM_CHAIN_ID", default_value_t = 1)]
+        chain_id: u64,
+        /// The head announcing this many units (default: the origin's).
+        #[arg(long)]
+        units: Option<u64>,
+    },
     /// Measure the address index with the real encoder: build every slice of levels
     /// 0..=LEVEL in the level-LEVEL window around each `--at` block and print the sizes per
     /// level as a Markdown table (nothing is uploaded).
@@ -204,6 +245,53 @@ async fn main() -> Result<()> {
             println!("Timestamp:  {}", block.header.timestamp);
             println!("Txs:        {}", block.transactions.len());
             println!("Gas used:   {}", block.header.gas_used);
+        }
+        Command::AddrImport {
+            key,
+            state,
+            units,
+            traces,
+            batch,
+            defer_level,
+            max_level,
+            concurrency,
+        } => {
+            let opts = addr::import::ImportOptions {
+                state_dir: state,
+                units,
+                traces,
+                batch,
+                defer_level,
+                max_level,
+                concurrency,
+            };
+            addr::import::run(&provider, &bee, &key, opts).await?;
+        }
+        Command::AddrVerify {
+            owner,
+            chain_id,
+            units,
+        } => {
+            let reader = addr::verify::IndexReader {
+                bee: bee.clone(),
+                owner,
+                chain_id,
+            };
+            let r = addr::verify::verify_published(&reader, units).await?;
+            for ((level, index), root) in &r.slices {
+                println!("  slice ({level}, {index}): buckets root {root}");
+            }
+            println!(
+                "Verified head for {} units (pending {:?}): {} slices, {} buckets, {} files, \
+                 {} addresses, {} appearances",
+                r.units,
+                r.pending,
+                r.slices.len(),
+                r.buckets,
+                r.files,
+                r.addresses,
+                r.appearances
+            );
         }
         Command::AddrStats {
             level,
