@@ -1,4 +1,5 @@
 mod accumulator;
+mod addr;
 mod chain;
 mod client;
 mod import;
@@ -65,6 +66,15 @@ enum Command {
     Block {
         /// Block number.
         number: u64,
+    },
+    /// List the address appearances in a block (docs/address-index.md, detection rules).
+    Appearances {
+        /// Block number.
+        number: u64,
+        /// Also read `trace_block` (Erigon, Reth, Anvil; not geth): internal calls,
+        /// self-destructs, rewards, and words in internal calls' input and output.
+        #[arg(long)]
+        traces: bool,
     },
     /// RLP header sizes over a block range, grouped by fork shape (header field count).
     HeaderStats {
@@ -165,6 +175,26 @@ async fn main() -> Result<()> {
             println!("Timestamp:  {}", block.header.timestamp);
             println!("Txs:        {}", block.transactions.len());
             println!("Gas used:   {}", block.header.gas_used);
+        }
+        Command::Appearances { number, traces } => {
+            let data = addr::fetch::fetch_block_data(&provider, number, traces).await?;
+            let apps = addr::detect::detect(&data);
+            for a in &apps {
+                println!(
+                    "{:>5}  {}  {}",
+                    a.slot,
+                    a.address,
+                    addr::detect::role::names(a.roles)
+                );
+            }
+            let addresses: std::collections::BTreeSet<_> = apps.iter().map(|a| a.address).collect();
+            println!(
+                "Block #{number}: {} txs, {} appearances, {} addresses{}",
+                data.txs.len(),
+                apps.len(),
+                addresses.len(),
+                if traces { " (with traces)" } else { "" }
+            );
         }
         Command::HeaderStats { from, to, step } => {
             header_stats(&provider, from, to, step).await?;
