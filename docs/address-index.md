@@ -1,6 +1,7 @@
 # Address index (design)
 
-Status: **design, not implemented.** Tracking issue: #5.
+Status: **design; implementation in progress** (#8). Detection is implemented in
+`src/addr/detect.rs`; the formats, importer and client are not yet. Design issue: #5.
 
 An index from an **address** to the transactions it **appears in**, stored on Swarm next to
 the [SOC block store](soc-block-store.md). A mobile wallet uses it to list an address's
@@ -50,7 +51,7 @@ These follow from how Swarm and the block store work; the discussion is in #5.
 An *appearance* is a pair (block, slot) at which an address occurs, with a set of roles.
 
 `slot` is `0` for block-level appearances (fee recipient, withdrawal recipient, uncle
-miner) and `txIndex + 1` for an appearance in a transaction.
+miner, reward author) and `txIndex + 1` for an appearance in a transaction.
 
 `role` is a bit set:
 
@@ -59,21 +60,40 @@ miner) and `txIndex + 1` for an appearance in a transaction.
 | `0x01` | `FROM` | sender of the transaction |
 | `0x02` | `TO` | recipient, or the contract the transaction created |
 | `0x04` | `EMITTER` | address of a log the transaction emitted |
-| `0x08` | `TOPIC` | address in an indexed log topic (ERC-20/721/1155 `from`/`to`, …) |
-| `0x10` | `WORD` | address-shaped 32-byte word in the input data or in log data |
-| `0x20` | `TRACE` | address in an internal call (requires traces) |
-| `0x40` | `BLOCK` | block-level: fee recipient, uncle miner, withdrawal recipient |
+| `0x08` | `TOPIC` | address in a log topic (ERC-20/721/1155 `from`/`to`, …) |
+| `0x10` | `WORD` | address-shaped 32-byte word in input data, init code, log data, or an internal call's input or output |
+| `0x20` | `TRACE` | address in a call frame, creation or self-destruct (requires traces) |
+| `0x40` | `BLOCK` | block-level: fee recipient, uncle miner, reward author, withdrawal recipient |
 | `0x80` | `AUTH` | authority of an EIP-7702 authorization |
 
 ### Detection rules
 
 Independent importers must produce identical slices (see *Verification*), so these rules
-are normative.
+are normative. They are implemented in `src/addr/detect.rs` and checked by
+`ethswarm appearances <block> [--traces]`.
 
-- *Address-shaped*: a 32-byte word whose first 12 bytes are zero and whose last 20 bytes,
-  read as a number, are at least 2^128. This approximates TrueBlocks' heuristic: it skips
-  small integers, but also vanity addresses with four or more leading zero bytes.
-- **The zero address is never indexed.**
+The rules are a **superset of TrueBlocks'** (`trueblocks-chifra`, `pkg/uniq`, at
+`ff9df4f`): the same sources (traces, receipts, withdrawals, miner) and the same word
+heuristic, plus log emitters, known token events regardless of value, and EIP-7702
+authorities. Every appearance TrueBlocks' scraper finds is found here too, which makes its
+published index a test oracle for this one: its transaction index `i` is slot `i + 1`
+here, and its block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. Two
+exceptions:
+
+- TrueBlocks records a reward to a precompile address under a sentinel address; here it is
+  ignored like every other address up to `0x…ffff`.
+- TrueBlocks indexes the **genesis allocations** as block 0, from a per-chain `allocs.csv`.
+  Genesis state is not in any block, so this detection does not see it; see *Open
+  questions*.
+
+- *Address-shaped* (TrueBlocks' "implicit address"): a 32-byte word whose first 12 bytes
+  are zero, whose value is at least 2^104 (one of bytes 12–18 is non-zero, so an address
+  may have up to six leading zero bytes), and whose last four bytes are not all zero
+  (that is a round amount far more often than an address).
+- *Words of* some data at offset `o`: the 32-byte windows at byte offsets `o + 32·k` that
+  fit completely; a shorter remainder is ignored.
+- **Addresses up to `0x…ffff`** (the zero address and the precompiles) are **never
+  indexed**, in any role.
 - `FROM`: the transaction's sender. `TO`: its `to`; for a contract creation the address
   `keccak256(rlp([sender, nonce]))[12..32]`, from the transaction's sender and nonce, whether
   the creation succeeded or not (the consensus receipt carries no contract address; the
@@ -81,8 +101,8 @@ are normative.
   `FROM`, `TO` and their input `WORD`s; they have no logs.
 - `EMITTER`: the `address` of every log of the transaction.
 - `TOPIC`, known events: for a log whose `topic0` is the keccak256 of one of the signatures
-  below, the listed topics are addresses, taken whatever their value (so vanity addresses,
-  Permit2 or Seaport are not lost):
+  below, the listed topics are addresses, taken whatever their value (so vanity addresses
+  like Seaport's, with seven leading zero bytes, are not lost):
 
   | Event signature | Address topics |
   |---|---|
@@ -94,11 +114,18 @@ are normative.
   | `Deposit(address,uint256)`, `Withdrawal(address,uint256)` (WETH) | 1 |
 
   A listed topic whose first 12 bytes are not zero is not an address and is skipped.
-- `TOPIC`, everything else: every address-shaped topic at index 1–3 that the known-event
-  rule did not classify. `topic0` is never scanned.
-- `WORD`: the address-shaped words of the input data of a call at byte offsets `4 + 32·k`
-  (after the selector), and of every log's data at offsets `32·k`. Contract-creation init
-  code is not scanned. The code address of an EIP-7702 authorization is a `WORD` as well.
+- `TOPIC`, everything else: every address-shaped topic the known-event rule did not
+  classify, `topic0` included (an anonymous event can carry an address there).
+- `WORD`:
+  - the words of the transaction's input at offset 4: after the selector of a call, and in
+    the init code of a creation (as TrueBlocks does; init code mostly yields bytecode
+    fragments that pass the heuristic, a known source of noise);
+  - the words of every log's data at offset 0;
+  - the code address of every EIP-7702 authorization, whatever its value;
+  - with traces: the words of every trace's `action.input` at offset 4 and of its
+    `result.output` at offset 0. This finds addresses that only occur inside the
+    execution: recipients a multisig, router or bundler passes on, or an address a
+    factory returns.
 - `AUTH`: the authority of an entry in the authorization list of a type-4 transaction. An
   entry counts if `y_parity ∈ {0, 1}`, `0 < r < n`, `0 < s ≤ n/2` (`n` the secp256k1 group
   order) and `ecrecover(keccak256(0x05 ‖ rlp([chain_id, address, nonce])), y_parity, r, s)`
@@ -106,15 +133,35 @@ are normative.
   it does not matter whether the authorization took effect (deciding that needs state).
   EIP-7702 skips invalid entries instead of rejecting the transaction, so this exact rule
   keeps importers on different libraries in agreement.
-- `BLOCK` (slot 0): the header's beneficiary, the beneficiary of every uncle, and the
-  address of every withdrawal.
-- `TRACE`: from and to of every internal call frame, created contracts and self-destruct
-  beneficiaries, from a call tracer. Only importers with a tracing source set it; the
+- `BLOCK` (slot 0): the header's beneficiary, the beneficiary of every uncle, the address of
+  every withdrawal, and with traces the `author` of every `reward` trace.
+- `TRACE`, from Parity-style `trace_block` (Erigon, Reth, Anvil; not geth): for every trace
+  of a transaction, `action.from` and `action.to` (every call frame, including the
+  top-level one and delegate and static calls), the created contract (`result.address` of a
+  `create`), and for a `suicide` the destroyed contract (`action.address`) and its
+  beneficiary (`action.refundAddress`). Only importers with a tracing source set it; the
   slice's `roles` byte says which roles were detected.
 
+  Traces cannot be verified without re-executing the block, so an importer that sets
+  `TRACE` checks the `trace_block` answer and **rejects the block** (publishes nothing for
+  it, and stops) unless:
+  - every trace has type `call`, `create`, `suicide` or `reward`, and this block's
+    `blockHash`;
+  - a `reward` names no transaction, and its `author` is the beneficiary of the block or
+    of an uncle;
+  - every other trace names an existing transaction by `transactionPosition` and
+    `transactionHash`;
+  - every transaction has exactly one root trace (empty `traceAddress`), which rules out
+    an empty or partial answer.
+
+  A trace of another type therefore stops the import instead of being skipped: skipping it
+  is exactly how two importers would end up with different slices.
+
 A wallet that only wants transfers it took part in filters on `FROM | TO | TOPIC | TRACE |
-BLOCK | AUTH`. `WORD` keeps the index close to TrueBlocks' coverage and gives spam filters
-something to work with; it is cheap: 1–10 % of all appearances, measured.
+BLOCK | AUTH`. `WORD` keeps the index as complete as TrueBlocks' and gives spam filters
+something to work with. Without traces it was 1–10 % of all appearances (measured with the
+earlier, stricter heuristic); the share with traces and the TrueBlocks heuristic is still
+to be measured (`addr-stats`, part 3 of #8).
 
 The appearances of one address at one (block, slot) are merged into one entry whose role
 is the OR of all roles.
@@ -434,15 +481,19 @@ Oldest first is the same in the opposite order.
 
 - **Most entries can be checked.** Fetch the header of the block from the block store
   (verified against the trust anchor), then the evidence for the role:
-  - `FROM`, `TO`, input `WORD`, `AUTH`: the transaction (sender and authorities by
-    signature recovery; a created contract's address from sender and nonce).
+  - `FROM`, `TO`, `WORD` from the input or init code, `AUTH`: the transaction (sender and
+    authorities by signature recovery; a created contract's address from sender and
+    nonce).
   - `EMITTER`, `TOPIC`, log `WORD`: the receipt.
   - `BLOCK` (slot 0): the header itself (beneficiary) or the body (withdrawals, uncles),
-    checked against the header's roots.
-  - `TRACE`: cannot be checked from the block. Internal calls are not recorded in the
-    transaction or the receipt; checking one needs re-execution with the state, or an
-    execution proof. A client trusts the importer for `TRACE` entries, or compares
-    importers.
+    checked against the header's roots. A pre-merge reward `author` from a trace is the
+    beneficiary of the block or an uncle, so the same evidence applies.
+  - `TRACE`, and a `WORD` found only in a trace's input or output: cannot be checked from
+    the block. Internal calls are not recorded in the transaction or the receipt; checking
+    one needs re-execution with the state, or an execution proof. A client trusts the
+    importer for these entries, or compares importers. A client cannot tell from the
+    entry whether a `WORD` came from a trace; if it finds the address in neither the
+    transaction nor the receipt, it treats the entry as trace-derived.
 - **Checking one transaction is cheap only if the block store supports it.** Today's block
   store, like devp2p, delivers only whole bodies (164 KB on average at the tip), and the
   client recomputes `transactionsRoot` from all of them. To read one transaction, the block
@@ -473,6 +524,12 @@ Oldest first is the same in the opposite order.
     that a slice was built correctly from the blocks. Both are out of scope.
 
 ## Measurements
+
+**These figures predate the current detection rules.** They were measured with the earlier
+rule set: the 2^128 word bound, no init code, no `topic0`, no traces. The current rules (the
+TrueBlocks superset) find more appearances, so the totals, sizes and costs below are lower
+bounds until `addr-stats` (part 3 of #8) measures again, with traces once a tracing node is
+available.
 
 Measured on 2026-11-16 against mainnet (the zbox geth node: full history, no traces, so no
 `TRACE` role) with throwaway scripts that encode the sampled appearances in the record formats above.
@@ -597,5 +654,15 @@ receipts on top for log roles.
 - **Block store.** Receipts, transaction offsets and trie nodes (above); moving the header
   accumulator to a Merkle Mountain Range (the same doubling scheme) would remove the
   "extending the range changes the anchor" limitation.
+- **Tracer-dependent edge cases.** `TRACE` and trace `WORD`s are defined by an RPC
+  format, not by the EVM, and Parity-style tracers differ at the edges. For example, a
+  reverted frame's revert data may or may not be in `result.output`. A call to a precompile
+  may get a frame only at top level or with value, and `ecrecover`'s output is an
+  address-shaped word. Identical slices across importers need these cases written into the
+  rules, or the tracer named as part of them. To be settled when the detection is compared
+  against TrueBlocks on an Erigon node.
+- **Genesis allocations.** TrueBlocks indexes the prefunded addresses of the genesis
+  state at block 0 (about 8,900 on mainnet). Adding them needs the allocation list as an
+  input (it is not in any block), and a convention for its slots.
 - **Adding traces later.** A slice's `roles` byte says what was detected; a slice rebuilt
   with traces would have to be published under a new namespace.

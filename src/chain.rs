@@ -17,9 +17,18 @@ pub struct CanonicalBlock {
     pub body_rlp: Vec<u8>,
 }
 
-/// Fetch block `number` and re-encode header and body canonically. Fails if the re-encoded
-/// header does not hash to the block hash reported by the node.
-pub async fn fetch_block(provider: &impl Provider, number: u64) -> Result<CanonicalBlock> {
+/// A block whose header hashes to its block hash and whose body matches the header's
+/// transactions, ommers and withdrawals roots.
+pub struct VerifiedBlock {
+    pub hash: B256,
+    pub header: Header,
+    pub body: Body,
+}
+
+/// Fetch block `number` and its uncles, and verify them against the block hash the node
+/// reports. Uncles are requested by that hash, so a reorg between the requests fails the
+/// check instead of mixing two blocks.
+pub async fn fetch_verified_block(provider: &impl Provider, number: u64) -> Result<VerifiedBlock> {
     let block = provider
         .get_block_by_number(number.into())
         .full()
@@ -29,17 +38,16 @@ pub async fn fetch_block(provider: &impl Provider, number: u64) -> Result<Canoni
 
     let rpc_hash = block.header.hash;
     let header = block.header.inner.clone();
-    let header_rlp = alloy::rlp::encode(&header);
+    let rehashed = keccak256(alloy::rlp::encode(&header));
     ensure!(
-        keccak256(&header_rlp) == rpc_hash,
-        "block {number}: re-encoded header hashes to {}, node says {rpc_hash}",
-        keccak256(&header_rlp)
+        rehashed == rpc_hash,
+        "block {number}: re-encoded header hashes to {rehashed}, node says {rpc_hash}"
     );
 
     let mut ommers = Vec::with_capacity(block.uncles.len());
     for idx in 0..block.uncles.len() {
         let uncle = provider
-            .get_uncle(BlockId::number(number), idx as u64)
+            .get_uncle(BlockId::hash(rpc_hash), idx as u64)
             .await
             .with_context(|| format!("querying uncle {idx} of block {number}"))?
             .with_context(|| format!("uncle {idx} of block {number} not found"))?;
@@ -56,15 +64,25 @@ pub async fn fetch_block(provider: &impl Provider, number: u64) -> Result<Canoni
         ommers,
         withdrawals: block.withdrawals,
     };
-    let body_rlp = alloy::rlp::encode(&body);
     check_body(&header, &body).with_context(|| format!("block {number}: body from RPC"))?;
 
-    Ok(CanonicalBlock {
-        number,
+    Ok(VerifiedBlock {
         hash: rpc_hash,
         header,
-        header_rlp,
-        body_rlp,
+        body,
+    })
+}
+
+/// Fetch block `number` and re-encode header and body canonically (see
+/// [`fetch_verified_block`] for the checks).
+pub async fn fetch_block(provider: &impl Provider, number: u64) -> Result<CanonicalBlock> {
+    let b = fetch_verified_block(provider, number).await?;
+    Ok(CanonicalBlock {
+        number,
+        hash: b.hash,
+        header_rlp: alloy::rlp::encode(&b.header),
+        body_rlp: alloy::rlp::encode(&b.body),
+        header: b.header,
     })
 }
 
