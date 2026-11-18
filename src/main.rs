@@ -684,15 +684,7 @@ where
         chain_id,
     };
     let head = match units {
-        Some(u) => {
-            let origin = reader.origin().await?;
-            ensure!(
-                u >= origin.units,
-                "the index starts at {} units",
-                origin.units
-            );
-            reader.head(u - origin.units).await?
-        }
+        Some(u) => reader.head_at(u).await?.1,
         None => {
             let finalized = provider
                 .get_block_by_number(alloy::eips::BlockNumberOrTag::Finalized)
@@ -700,23 +692,36 @@ where
                 .context("the node reports no finalized block")?
                 .header
                 .number;
-            addr::lookup::latest_head(&reader, finalized).await?
+            let (head, older) = addr::lookup::latest_head(&reader, finalized).await?;
+            if older {
+                eprintln!(
+                    "warning: the head for block {finalized} could not be read; using the \
+                     newest readable one ({} units). Bee answers a missing and an \
+                     unretrievable chunk alike, so this may be transient.",
+                    head.units
+                );
+            }
+            head
         }
     };
-    let entries = addr::lookup::lookup(&reader, address, &head, since).await?;
+    let found = addr::lookup::lookup(&reader, address, &head, since).await?;
+    let entries = &found.entries;
     for e in entries.iter().take(limit) {
         println!("{:>10}  {:>5}  {}", e.block, e.slot, role::names(e.roles));
     }
     println!(
-        "{address}: {} appearances in the index up to block {} ({} units{})",
+        "{address}: {} appearances in the index up to block {} ({} units{}; {} slices, {} \
+         files read)",
         entries.len(),
-        head.units * UNIT_BLOCKS - 1,
+        head.last_block(),
         head.units,
-        since.map_or(String::new(), |m| format!(", new since unit {m}"))
+        since.map_or(String::new(), |m| format!(", new since unit {m}")),
+        found.slices,
+        found.files
     );
     if against_chain {
         let from = since.map_or(0, |m| m * UNIT_BLOCKS);
-        let c = addr::lookup::against_chain(provider, address, &entries, head.units, from, traces)
+        let c = addr::lookup::against_chain(provider, address, entries, head.units, from, traces)
             .await?;
         ensure!(
             c.not_on_chain.is_empty() && c.missing.is_empty(),

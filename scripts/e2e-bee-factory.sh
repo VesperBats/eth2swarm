@@ -185,9 +185,16 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
     --transfers 120) || { echo "FAIL: devnet-activity"; exit 1; }
   echo "$ACT"
   EMITTER=$(echo "$ACT" | awk '{for (i = 1; i < NF; i++) if ($i == "emitter") print $(i + 1)}' | tr -d ,)
-  ACT_LAST=$(echo "$ACT" | awk '{split($4, r, "\\.\\.="); print r[2]}' | tr -d :)
-  [[ "$ACT_LAST" =~ ^[0-9]+$ ]] || { echo "FAIL: no last block in: $ACT"; exit 1; }
-  ACT_UNITS=$(((ACT_LAST + 64) / 64))
+  echo "$ACT" | grep -q 'authority 0x' || { echo "FAIL: the chain did not take the EIP-7702 transaction"; exit 1; }
+  ACT_RANGE=$(echo "$ACT" | awk '{print $4}' | tr -d :)
+  ACT_FIRST=${ACT_RANGE%%..=*}
+  ACT_LAST=${ACT_RANGE##*..=}
+  [[ "$ACT_FIRST" =~ ^[0-9]+$ && "$ACT_LAST" =~ ^[0-9]+$ ]] || { echo "FAIL: no block range in: $ACT"; exit 1; }
+  # Import up to the end of the smallest aligned slice that holds all of the activity, so that
+  # one slice holds every entry of the busy address and it spills deterministically.
+  U1=$((ACT_FIRST / 64)); U2=$((ACT_LAST / 64)); L=0
+  while [ $((U1 >> L)) -ne $((U2 >> L)) ]; do L=$((L + 1)); done
+  ACT_UNITS=$((((U2 >> L) + 1) << L))
   # Anvil finalizes 64 blocks behind its tip.
   WANT=$((ACT_UNITS * 64 - 1 + 64))
   for ((i = 0; i < 900; i++)); do
@@ -204,24 +211,27 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   OUT=$($BIN --bee "$READ_BEE" addr-verify --owner "$ACT_OWNER" --chain-id "$CHAIN_ID" \
     --units "$ACT_UNITS") || { echo "FAIL: addr-verify"; echo "$OUT"; exit 1; }
   echo "$OUT" | tail -1
-  FILES=$(echo "$OUT" | tail -1 | awk '{for (i = 1; i < NF; i++) if ($(i + 1) ~ /^files/) print $i}')
-  [ "${FILES:-0}" -ge 1 ] || { echo "FAIL: the busy address did not spill (no files)"; exit 1; }
   lookup() {
     $BIN --bee "$READ_BEE" addr-lookup "$1" --owner "$ACT_OWNER" --chain-id "$CHAIN_ID" \
-      --units "$ACT_UNITS" --limit 0 --against-chain "${TRACE_FLAG[@]}"
+      --units "$ACT_UNITS" --limit 0 "${@:2}"
   }
+  count() { awk '/appearances in the index/ {print $2}'; }
   for A in "$BUSY" "$EMITTER" "$AUTHORITY" 0x9999999999999999999999999999999999999999; do
-    OUT=$(lookup "$A") || { echo "FAIL: addr-lookup $A"; echo "$OUT"; exit 1; }
+    OUT=$(lookup "$A" --against-chain "${TRACE_FLAG[@]}") || { echo "FAIL: addr-lookup $A"; echo "$OUT"; exit 1; }
     echo "$OUT" | head -1
+    case "$A" in
+      "$BUSY") N=$(echo "$OUT" | count); BUSY_OUT=$OUT ;;
+      "$AUTHORITY") [ "$(echo "$OUT" | count)" -ge 1 ] || { echo "FAIL: no AUTH appearance"; exit 1; } ;;
+    esac
   done
-  N=$(lookup "$BUSY" | awk '/appearances in the index/ {print $2}')
   [ "${N:-0}" -ge 120 ] || { echo "FAIL: busy address has ${N:-0} appearances, expected >= 120"; exit 1; }
-  # Incremental: nothing new for the busy address after the last unit.
-  NEW=$($BIN --bee "$READ_BEE" addr-lookup "$BUSY" --owner "$ACT_OWNER" --chain-id "$CHAIN_ID" \
-    --units "$ACT_UNITS" --since "$ACT_UNITS" --limit 0 | awk '/appearances in the index/ {print $2}')
-  [ "$NEW" = 0 ] || { echo "FAIL: --since $ACT_UNITS found $NEW new entries"; exit 1; }
+  BUSY_FILES=$(echo "$BUSY_OUT" | head -1 | awk '{for (i = 1; i < NF; i++) if ($(i + 1) == "files") print $i}')
+  [ "${BUSY_FILES:-0}" -ge 1 ] || { echo "FAIL: the busy address did not spill: $BUSY_OUT"; exit 1; }
+  # Incremental: since the activity's first unit, every entry of the busy address is new.
+  NEW=$(lookup "$BUSY" --since "$U1" | count)
+  [ "$NEW" = "$N" ] || { echo "FAIL: --since $U1 found $NEW entries, the full lookup $N"; exit 1; }
   rm -rf "$ACT_STATE"
-  echo "ok: busy address ($N appearances, spilled), emitter, authority and an unrelated address match the chain"
+  echo "ok: busy address ($N appearances, $BUSY_FILES spill file), emitter, authority and an unrelated address match the chain; incremental lookup since unit $U1 complete"
 fi
 
 echo "== inspector (ethswarm serve) verifies a block via $READ_BEE"
