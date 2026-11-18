@@ -75,9 +75,16 @@ impl Schedule {
         }
     }
 
+    /// Records a built merge. Pending merges inside it are done too: once it is dropped from
+    /// the heads, nothing reads them (a resumed run can have both listed).
     pub fn merge_done(&mut self, merge: SliceId) {
-        if self.pending.contains(&merge) && !self.built.contains(&merge) {
-            self.built.push(merge);
+        let outer = units(merge);
+        for s in &self.pending {
+            let inner = units(*s);
+            let inside = outer.start <= inner.start && inner.end <= outer.end;
+            if inside && !self.built.contains(s) {
+                self.built.push(*s);
+            }
         }
     }
 
@@ -90,13 +97,17 @@ impl Schedule {
         self.pending.clone()
     }
 
-    /// Listed merges that still have to be built (after a restart, all of them).
+    /// Listed merges that still have to be built, in the order they were deferred (by their
+    /// last unit; the list itself is in head order).
     pub fn unbuilt(&self) -> Vec<SliceId> {
-        self.pending
+        let mut out: Vec<SliceId> = self
+            .pending
             .iter()
             .filter(|s| !self.built.contains(s))
             .copied()
-            .collect()
+            .collect();
+        out.sort_by_key(|s| units(*s).end);
+        out
     }
 }
 
@@ -132,13 +143,22 @@ impl State {
         }
     }
 
-    /// Writes the state atomically (a temporary file renamed over the old one).
+    /// Writes the state durably: a temporary file, synced, renamed over the old one, and the
+    /// directory synced, so that after a crash or a power loss the file is either the old or
+    /// the new state, and a head saved before its upload stays saved.
     pub fn save(&self, dir: &Path) -> Result<()> {
+        use std::io::Write as _;
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let tmp = dir.join(format!("{STATE_FILE}.tmp"));
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(&serde_json::to_vec_pretty(self)?)
+            .and_then(|_| f.sync_all())
             .with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, dir.join(STATE_FILE)).context("replacing the state file")?;
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("syncing {}", dir.display()))?;
         Ok(())
     }
 
@@ -147,16 +167,20 @@ impl State {
         self.units - self.n0
     }
 
-    fn record_unit(&mut self, unit: u64, hash: B256) {
-        self.unit_hashes.insert(unit, hash);
-        // Keep what a later slice can still need: the unit before the start of the top-level
-        // slice of the newest unit, and before every pending merge (a top-level merge is
-        // still pending after the boundary).
-        let mut keep = (unit >> L_MAX) << L_MAX;
+    /// Drops the unit hashes no later slice can need once `n` units are published: only the
+    /// last unit of each slice of the cover of `[0, n)` (where the next slices start) and both
+    /// ends of every pending merge are ever read.
+    fn prune(&mut self, n: u64) {
+        let mut keep: std::collections::BTreeSet<u64> =
+            cover(n).iter().map(|s| units(*s).end - 1).collect();
         for s in &self.schedule.pending {
-            keep = keep.min(units(*s).start);
+            let r = units(*s);
+            keep.insert(r.end - 1);
+            if r.start > 0 {
+                keep.insert(r.start - 1);
+            }
         }
-        self.unit_hashes = self.unit_hashes.split_off(&keep.saturating_sub(1));
+        self.unit_hashes.retain(|u, _| keep.contains(u));
     }
 
     fn unit_hash(&self, unit: u64) -> Result<B256> {
@@ -167,13 +191,47 @@ impl State {
     }
 }
 
-/// Merges built at the same time; the rest wait in a queue.
+/// Deferred merges listed as pending at a time, queued or running (they are built one at a
+/// time). At this limit the importer waits for one to finish before deferring another.
 const MAX_PENDING_MERGES: usize = 16;
+
+/// Holds the state directory for one run: a second importer on the same directory would
+/// write the same heads from a diverging state.
+pub struct StateLock(#[allow(dead_code)] std::fs::File);
+
+impl StateLock {
+    pub fn acquire(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join("addr-import.lock");
+        let f =
+            std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        f.try_lock().map_err(|_| {
+            anyhow::anyhow!(
+                "another addr-import holds {} (one importer per state directory)",
+                path.display()
+            )
+        })?;
+        Ok(Self(f))
+    }
+}
+
+/// Test hook: `ETH2SWARM_ADDR_FAILPOINT=before-head-upload` or `after-head-upload` makes a run
+/// stop around a head upload, as a crash would (used by `scripts/e2e-bee-factory.sh`).
+fn failpoint(name: &str) -> Result<()> {
+    match std::env::var("ETH2SWARM_ADDR_FAILPOINT") {
+        Ok(v) if v == name => bail!("failpoint {name}"),
+        _ => Ok(()),
+    }
+}
 
 pub struct ImportOptions {
     pub state_dir: PathBuf,
     /// Units to import up to; defaults to every finalized unit.
     pub units: Option<u64>,
+    /// Keep importing newly finalized units (with deferred merges built meanwhile).
+    pub follow: bool,
+    /// A first run: start a new index. Without it, a missing state file is an error.
+    pub init: bool,
     pub traces: bool,
     pub batch: Option<B256>,
     /// Merges of this level and above are built in the background.
@@ -274,7 +332,9 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
         let Some(head) = state.prepared.clone() else {
             return Ok(());
         };
+        failpoint("before-head-upload")?;
         self.publish_head(head.units - state.n0, &head).await?;
+        failpoint("after-head-upload")?;
         state.units = head.units;
         state.prepared = None;
         state.save(dir)?;
@@ -334,7 +394,11 @@ impl MergeWorker {
         if !self.running.is_empty() {
             return Ok(());
         }
-        let Some(slice) = self.queue.pop_front() else {
+        // Skip merges a finished one made obsolete.
+        let unbuilt = state.schedule.unbuilt();
+        let Some(slice) =
+            std::iter::from_fn(|| self.queue.pop_front()).find(|s| unbuilt.contains(s))
+        else {
             return Ok(());
         };
         let r = units(slice);
@@ -369,21 +433,8 @@ impl MergeWorker {
     }
 }
 
-/// Imports up to the target unit count, resuming from the state directory.
-pub async fn run<P>(
-    provider: &P,
-    bee: &Bee,
-    signer: &PrivateKeySigner,
-    opts: ImportOptions,
-) -> Result<()>
-where
-    P: Provider + Clone + 'static,
-{
-    ensure!(
-        opts.max_level <= L_MAX && opts.defer_level <= L_MAX,
-        "levels above {L_MAX}"
-    );
-    let chain_id = provider.get_chain_id().await.context("querying chain id")?;
+/// Complete units of finalized blocks (the anvil and beacon "finalized" tag).
+async fn finalized_units(provider: &impl Provider) -> Result<(u64, u64)> {
     let finalized = provider
         .get_block_by_number(BlockNumberOrTag::Finalized)
         .await
@@ -391,16 +442,56 @@ where
         .context("the node reports no finalized block")?
         .header
         .number;
-    let complete = (finalized + 1) / UNIT_BLOCKS;
-    let target = opts.units.unwrap_or(complete);
+    Ok(((finalized + 1) / UNIT_BLOCKS, finalized))
+}
+
+/// How long `--follow` waits between looking for newly finalized units (one slot).
+const FOLLOW_POLL: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// What a run did, for the summary line.
+pub struct Summary {
+    pub owner: Address,
+    pub chain_id: u64,
+    pub units: u64,
+    pub head_index: u64,
+}
+
+/// Imports up to the target unit count (or, with `follow`, keeps importing), resuming from the
+/// state directory. A run returns only after the merges it started are built.
+pub async fn run<P>(
+    provider: &P,
+    bee: &Bee,
+    signer: &PrivateKeySigner,
+    opts: ImportOptions,
+) -> Result<Summary>
+where
+    P: Provider + Clone + 'static,
+{
     ensure!(
-        target <= complete,
-        "{target} units requested, but only {complete} are finalized (block {finalized})"
+        opts.max_level <= L_MAX && opts.defer_level <= L_MAX,
+        "levels above {L_MAX}"
     );
     ensure!(
-        target <= MAX_UNITS,
-        "{target} units exceed the format's {MAX_UNITS}"
+        !(opts.follow && opts.units.is_some()),
+        "--follow imports every finalized unit; it cannot be combined with --units"
     );
+    let dir = &opts.state_dir;
+    let _lock = StateLock::acquire(dir)?;
+    let chain_id = provider.get_chain_id().await.context("querying chain id")?;
+    let target_now = |complete: u64, finalized: u64| -> Result<u64> {
+        let target = opts.units.unwrap_or(complete);
+        ensure!(
+            target <= complete,
+            "{target} units requested, but only {complete} are finalized (block {finalized})"
+        );
+        ensure!(
+            target <= MAX_UNITS,
+            "{target} units exceed the format's {MAX_UNITS}"
+        );
+        Ok(target)
+    };
+    let (complete, finalized) = finalized_units(provider).await?;
+    let mut target = target_now(complete, finalized)?;
     let batch = match opts.batch {
         Some(b) => b,
         None => bee.usable_batch().await?,
@@ -416,7 +507,6 @@ where
         max_level: opts.max_level,
         concurrency: opts.concurrency,
     };
-    let dir = &opts.state_dir;
 
     let mut state = match State::load(dir)? {
         Some(s) => {
@@ -432,7 +522,37 @@ where
             );
             s
         }
-        None => backfill(&ctx, target, roles, dir).await?,
+        None => {
+            ensure!(
+                opts.init,
+                "no importer state in {}: pass --init to start a new index (only for a key \
+                 that has never published one), or point --state at the existing state",
+                dir.display()
+            );
+            // An origin under this key means an index exists: a second backfill would write
+            // another origin and other heads under the same write-once identifiers. The read
+            // is best effort: Bee 2.8.3 answers a missing chunk and a failed retrieval alike
+            // (500), so only finding the origin is conclusive; --init is the guard.
+            let reader = super::verify::IndexReader {
+                bee: bee.clone(),
+                owner: signer.address(),
+                chain_id,
+            };
+            match reader.origin().await {
+                Ok(origin) => bail!(
+                    "owner {} already published an index on chain {chain_id} (origin at {} \
+                     units); restore its state directory instead of starting over",
+                    signer.address(),
+                    origin.units
+                ),
+                Err(e) => tracing::warn!(
+                    "no origin found for owner {} on chain {chain_id}, starting a new index \
+                     ({e:#})",
+                    signer.address()
+                ),
+            }
+            backfill(&ctx, target, roles, dir).await?
+        }
     };
     // A head saved but perhaps not uploaded (the previous run stopped in between).
     ctx.publish_prepared(&mut state, dir).await?;
@@ -443,53 +563,23 @@ where
         "address index"
     );
 
-    // Merges listed as pending but not built (a previous run stopped): build them again.
+    // Merges listed as pending but not built (a previous run stopped): build them again, in
+    // the order they were deferred.
     let mut merges = MergeWorker::new(state.schedule.unbuilt());
     merges.kick(&ctx, &state)?;
 
-    for n in state.units + 1..=target {
+    loop {
+        for n in state.units + 1..=target {
+            import_unit(&ctx, &mut state, &mut merges, n, &opts).await?;
+        }
+        if !opts.follow {
+            break;
+        }
         merges.collect(&ctx, &mut state, false).await?;
-        let (now, deferred) = match unit_work(n, opts.defer_level) {
-            UnitWork::Build(s) => (s, None),
-            UnitWork::Defer { level0, merge } => (level0, Some(merge)),
-        };
-        // A merge listed as pending must be buildable: fail before a head lists it.
-        for s in [Some(now), deferred].into_iter().flatten() {
-            ensure!(
-                s.0 <= opts.max_level,
-                "unit {} needs slice ({}, {}), above --max-level {} (external-memory \
-                 building is part 4b of #8)",
-                n - 1,
-                s.0,
-                s.1,
-                opts.max_level
-            );
-        }
-        let start = units(now).start;
-        let parent = match start {
-            0 => None,
-            s => Some(state.unit_hash(s - 1)?),
-        };
-        let f = ctx.fetch(now, parent).await?;
-        ctx.upload_slice(&f.built).await?;
-        state.record_unit(n - 1, f.last_hash);
-        if let Some(merge) = deferred {
-            // Backpressure: not more than MAX_PENDING_MERGES listed at a time.
-            while merges.len() >= MAX_PENDING_MERGES {
-                merges.collect(&ctx, &mut state, true).await?;
-            }
-            state.schedule.defer(merge);
-            merges.queue.push_back(merge);
-            merges.kick(&ctx, &state)?;
-        }
-        state.prepared = Some(HeadRecord {
-            units: n,
-            last_block_hash: f.last_hash,
-            last_block_timestamp: f.last_timestamp,
-            pending: state.schedule.next_head_pending(),
-        });
         state.save(dir)?;
-        ctx.publish_prepared(&mut state, dir).await?;
+        tokio::time::sleep(FOLLOW_POLL).await;
+        let (complete, finalized) = finalized_units(provider).await?;
+        target = target_now(complete, finalized)?;
     }
 
     // Let the merges finish. They stay listed until the next run's first head.
@@ -497,7 +587,66 @@ where
         merges.collect(&ctx, &mut state, true).await?;
         state.save(dir)?;
     }
-    Ok(())
+    Ok(Summary {
+        owner: signer.address(),
+        chain_id,
+        units: state.units,
+        head_index: state.head_index(),
+    })
+}
+
+/// Publishes the unit that completes `n` units: its slice (or level-0 slice and a deferred
+/// merge), then its head, written ahead.
+async fn import_unit<P: Provider + Clone + 'static>(
+    ctx: &Ctx<P>,
+    state: &mut State,
+    merges: &mut MergeWorker,
+    n: u64,
+    opts: &ImportOptions,
+) -> Result<()> {
+    merges.collect(ctx, state, false).await?;
+    let (now, deferred) = match unit_work(n, opts.defer_level) {
+        UnitWork::Build(s) => (s, None),
+        UnitWork::Defer { level0, merge } => (level0, Some(merge)),
+    };
+    // A merge listed as pending must be buildable: fail before a head lists it.
+    for s in [Some(now), deferred].into_iter().flatten() {
+        ensure!(
+            s.0 <= opts.max_level,
+            "unit {} needs slice ({}, {}), above --max-level {} (external-memory building \
+             is part 4b of #8)",
+            n - 1,
+            s.0,
+            s.1,
+            opts.max_level
+        );
+    }
+    let start = units(now).start;
+    let parent = match start {
+        0 => None,
+        s => Some(state.unit_hash(s - 1)?),
+    };
+    let f = ctx.fetch(now, parent).await?;
+    ctx.upload_slice(&f.built).await?;
+    state.unit_hashes.insert(n - 1, f.last_hash);
+    if let Some(merge) = deferred {
+        // Backpressure: not more than MAX_PENDING_MERGES listed at a time.
+        while merges.len() >= MAX_PENDING_MERGES {
+            merges.collect(ctx, state, true).await?;
+        }
+        state.schedule.defer(merge);
+        merges.queue.push_back(merge);
+        merges.kick(ctx, state)?;
+    }
+    state.prepared = Some(HeadRecord {
+        units: n,
+        last_block_hash: f.last_hash,
+        last_block_timestamp: f.last_timestamp,
+        pending: state.schedule.next_head_pending(),
+    });
+    state.prune(n);
+    state.save(&opts.state_dir)?;
+    ctx.publish_prepared(state, &opts.state_dir).await
 }
 
 /// First run: publishes the cover of `[0, target)` (every other past slice would never be
@@ -535,7 +684,7 @@ async fn backfill<P: Provider + Clone + 'static>(
         let f = ctx.fetch(s, parent).await?;
         ctx.upload_slice(&f.built).await?;
         parent = Some(f.last_hash);
-        state.record_unit(units(s).end - 1, f.last_hash);
+        state.unit_hashes.insert(units(s).end - 1, f.last_hash);
         last = Some(f);
     }
     let last = last.expect("a cover of at least one unit");
@@ -664,34 +813,38 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(State::load(&dir).unwrap(), None);
 
-        // Unit hashes before the top-level slice of the newest unit are dropped, except the
-        // unit just before it, which a merge starting at the boundary checks.
-        let top = 1u64 << L_MAX;
+        // After 13 units (cover (3, 0), (2, 2), (0, 12)), only the cover's last units are
+        // kept: 7, 11 and 12. Where the next slices start, they continue from these.
         s.schedule = Schedule::default();
-        for u in [top - 3, top - 2, top - 1] {
-            s.record_unit(u, B256::repeat_byte(u as u8));
+        for u in 0..13 {
+            s.unit_hashes.insert(u, B256::repeat_byte(u as u8));
         }
-        assert!(s.unit_hashes.contains_key(&(top - 3)));
-        for u in [top, top + 1] {
-            s.record_unit(u, B256::repeat_byte(u as u8));
-        }
+        s.prune(13);
         assert_eq!(
             s.unit_hashes.keys().copied().collect::<Vec<_>>(),
-            vec![top - 1, top, top + 1]
+            vec![7, 11, 12]
         );
+        // Every slice the importer builds next starts right after a kept unit.
+        for n in 14..40 {
+            let start = units(new_slice(n)).start;
+            assert!(
+                start == 0 || s.unit_hashes.contains_key(&(start - 1)),
+                "unit {}: no hash for unit {}",
+                n - 1,
+                start - 1
+            );
+            s.unit_hashes.insert(n - 1, B256::ZERO);
+            s.prune(n);
+        }
 
-        // A top-level merge still pending after its boundary keeps what it needs: the unit
-        // before its start, and its last unit.
+        // A top-level merge still pending after its boundary keeps both of its ends.
+        let top = 1u64 << L_MAX;
         let mut s2 = s.clone();
-        s2.unit_hashes.clear();
-        for u in [top - 1, 2 * top - 1] {
-            s2.record_unit(u, B256::repeat_byte(1));
-        }
+        s2.unit_hashes = (top - 2..2 * top + 100).map(|u| (u, B256::ZERO)).collect();
         s2.schedule.defer((L_MAX, 1)); // units top..2·top, due at unit 2·top − 1
-        for u in 2 * top..2 * top + 100 {
-            s2.record_unit(u, B256::repeat_byte(2));
-        }
+        s2.prune(2 * top + 100);
         assert!(s2.unit_hash(top - 1).is_ok(), "the unit before the merge");
         assert!(s2.unit_hash(2 * top - 1).is_ok(), "the merge's last unit");
+        assert!(s2.unit_hash(top - 2).is_err());
     }
 }

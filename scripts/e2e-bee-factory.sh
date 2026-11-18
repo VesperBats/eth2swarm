@@ -135,19 +135,36 @@ addr_import() {
 addr_verify() {
   $BIN --bee "$READ_BEE" addr-verify --owner "$ADDR_OWNER" --chain-id "$CHAIN_ID" --units "$1"
 }
-addr_import --units 2 || { echo "FAIL: addr-import (backfill)"; exit 1; }
-ADDR_OWNER=$(awk -F'"' '/"owner"/ {print $4}' "$ADDR_STATE/addr-import.json")
-[[ "$ADDR_OWNER" =~ ^0x[0-9a-fA-F]{40}$ ]] || { echo "FAIL: no owner in the importer state"; exit 1; }
+OUT=$(addr_import --units 2 --init) || { echo "FAIL: addr-import (backfill)"; echo "$OUT"; exit 1; }
+ADDR_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
+[[ "$ADDR_OWNER" =~ ^0x[0-9a-fA-F]{40}$ ]] || { echo "FAIL: no owner in: $OUT"; exit 1; }
+# Another first run under the same key, from an empty state directory, must be refused: it
+# would write a second origin.
+OTHER_STATE=$(mktemp -d)
+if $BIN --bee "$UPLOAD_BEE" addr-import --key "$ADDR_KEY" --state "$OTHER_STATE" --init \
+    --units 2 >/dev/null 2>&1; then
+  echo "FAIL: a second --init under the same key was accepted"; exit 1
+fi
+rm -rf "$OTHER_STATE"
+echo "ok: a second backfill under the same key is refused"
 # Unit 4 completes slice (2, 0), which is deferred: head 4 lists it as pending.
-addr_import --units 4 || { echo "FAIL: addr-import (resume to 4 units)"; exit 1; }
+addr_import --units 4 >/dev/null || { echo "FAIL: addr-import (resume to 4 units)"; exit 1; }
 for u in 2 3 4; do
   OUT=$(addr_verify "$u") || { echo "FAIL: addr-verify --units $u"; echo "$OUT"; exit 1; }
   echo "$OUT" | tail -1
 done
 echo "$OUT" | grep -q 'pending \[(2, 0)\]' \
   || { echo "FAIL: head 4 does not list the deferred merge (2, 0)"; exit 1; }
-# Unit 5's head drops the merge, now built: the client reads (2, 0) itself.
-addr_import --units 5 || { echo "FAIL: addr-import (resume to 5 units)"; exit 1; }
+# Unit 5, with two crashes: one between saving head 5 and uploading it, one after the upload
+# but before the state records it. Each next run must publish exactly the prepared head (the
+# second one uploads an identical SOC again). Head 5 drops the built merge (2, 0).
+for fp in before-head-upload after-head-upload; do
+  if ETH2SWARM_ADDR_FAILPOINT=$fp addr_import --units 5 >/dev/null 2>&1; then
+    echo "FAIL: failpoint $fp did not stop the run"; exit 1
+  fi
+done
+addr_import --units 5 >/dev/null || { echo "FAIL: addr-import (resume to 5 units after crashes)"; exit 1; }
+echo "ok: head 5 published after a crash before and one after its upload"
 OUT=$(addr_verify 5) || { echo "FAIL: addr-verify --units 5"; echo "$OUT"; exit 1; }
 echo "$OUT" | tail -1
 PUBLISHED=$(echo "$OUT" | awk '/slice \(2, 0\)/ {print $NF}')

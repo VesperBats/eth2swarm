@@ -79,6 +79,13 @@ enum Command {
         /// Import up to this many units (default: every finalized unit).
         #[arg(long)]
         units: Option<u64>,
+        /// Keep importing newly finalized units until stopped. Without it, a run returns once
+        /// the target is published and the merges it started are built.
+        #[arg(long)]
+        follow: bool,
+        /// Start a new index (first run, no state yet). Refused if the key already has one.
+        #[arg(long)]
+        init: bool,
         /// Also read `trace_block` (see `appearances`).
         #[arg(long)]
         traces: bool,
@@ -251,6 +258,8 @@ async fn main() -> Result<()> {
             key,
             state,
             units,
+            follow,
+            init,
             traces,
             batch,
             defer_level,
@@ -260,13 +269,19 @@ async fn main() -> Result<()> {
             let opts = addr::import::ImportOptions {
                 state_dir: state,
                 units,
+                follow,
+                init,
                 traces,
                 batch,
                 defer_level,
                 max_level,
                 concurrency,
             };
-            addr::import::run(&provider, &bee, &key, opts).await?;
+            let s = addr::import::run(&provider, &bee, &key, opts).await?;
+            println!(
+                "Address index of owner {} on chain {}: {} units, head update {}",
+                s.owner, s.chain_id, s.units, s.head_index
+            );
         }
         Command::AddrVerify {
             owner,

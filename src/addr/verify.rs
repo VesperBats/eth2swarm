@@ -7,8 +7,8 @@ use anyhow::{Context, Result, ensure};
 
 use super::layout::{
     AddressRecord, BucketBody, BucketRecord, Entries, HeadRecord, SliceRecord, bucket_id,
-    decode_bucket_page, decode_spill_page, first_block, head_id, last_block, origin_id, pages,
-    slice_id,
+    bucket_pages_file, decode_bucket_page, decode_spill_page, first_block, head_id, last_block,
+    origin_id, pages, slice_id, spill_file,
 };
 use super::slice::{SliceId, resolve};
 use crate::accumulator::{Tree, depth_for};
@@ -106,6 +106,8 @@ impl IndexReader {
 pub struct Report {
     pub units: u64,
     pub pending: Vec<SliceId>,
+    /// The head's `last_block_timestamp`, checked against the chain by [`check_chain`].
+    pub last_block_timestamp: u64,
     /// Each slice read, with its `buckets_root` and `last_block_hash`.
     pub slices: Vec<(SliceId, B256, B256)>,
     pub buckets: u64,
@@ -138,11 +140,21 @@ async fn check_bucket(r: IndexReader, s: SliceId, k: u32) -> Result<BucketCheck>
     let records: Vec<AddressRecord> = match bucket.body {
         BucketBody::Inline(records) => records,
         BucketBody::Paged {
-            count, pages_ref, ..
+            count,
+            pages: page_count,
+            pages_ref,
         } => {
             let file = r.file(&pages_ref).await?;
             c.files += 1;
-            let records = pages(&file)?
+            let split = pages(&file)?;
+            ensure!(
+                split.len() as u64 == page_count as u64,
+                "paged bucket {k} of ({}, {}) states {page_count} pages, its file has {}",
+                s.0,
+                s.1,
+                split.len()
+            );
+            let records = split
                 .into_iter()
                 .map(|p| decode_bucket_page(p, first, last))
                 .collect::<Result<Vec<_>>>()?
@@ -154,6 +166,20 @@ async fn check_bucket(r: IndexReader, s: SliceId, k: u32) -> Result<BucketCheck>
                 s.1,
                 records.len()
             );
+            // A client binary-searches the pages: the order must hold across them, and the
+            // file must be the canonical (greedy, padded) encoding of its records.
+            ensure!(
+                records.windows(2).all(|w| w[0].fp <= w[1].fp),
+                "paged bucket {k} of ({}, {}): records not ascending across pages",
+                s.0,
+                s.1
+            );
+            ensure!(
+                bucket_pages_file(&records, first) == file,
+                "paged bucket {k} of ({}, {}): pages file not canonically encoded",
+                s.0,
+                s.1
+            );
             records
         }
     };
@@ -164,13 +190,25 @@ async fn check_bucket(r: IndexReader, s: SliceId, k: u32) -> Result<BucketCheck>
             Entries::Spilled { count, spill_ref } => {
                 let file = r.file(&spill_ref).await?;
                 c.files += 1;
-                let n: usize = pages(&file)?
+                let entries = pages(&file)?
                     .into_iter()
-                    .map(|p| decode_spill_page(p, first, last).map(|e| e.len()))
-                    .sum::<Result<usize>>()?;
+                    .map(|p| decode_spill_page(p, first, last))
+                    .collect::<Result<Vec<_>>>()?
+                    .concat();
                 ensure!(
-                    n as u64 == count,
-                    "spill file {spill_ref} states {count} entries, holds {n}"
+                    entries.len() as u64 == count,
+                    "spill file {spill_ref} states {count} entries, holds {}",
+                    entries.len()
+                );
+                ensure!(
+                    entries
+                        .windows(2)
+                        .all(|w| (w[0].block, w[0].slot) < (w[1].block, w[1].slot)),
+                    "spill file {spill_ref}: entries not ascending across pages"
+                );
+                ensure!(
+                    spill_file(&entries) == file,
+                    "spill file {spill_ref} not canonically encoded"
                 );
                 count
             }
@@ -194,6 +232,13 @@ pub async fn verify_published(r: &IndexReader, units: Option<u64>) -> Result<Rep
         origin.units
     );
     let head = r.head(units - origin.units).await?;
+    // The origin is a copy of head update 0.
+    let head0 = if units == origin.units {
+        head.clone()
+    } else {
+        r.head(0).await?
+    };
+    ensure!(head0 == origin, "the origin differs from head update 0");
     ensure!(
         head.units == units,
         "head update {} announces {} units, expected {units}",
@@ -203,6 +248,7 @@ pub async fn verify_published(r: &IndexReader, units: Option<u64>) -> Result<Rep
     let mut report = Report {
         units,
         pending: head.pending.clone(),
+        last_block_timestamp: head.last_block_timestamp,
         ..Default::default()
     };
     let mut roles = None;
@@ -216,8 +262,9 @@ pub async fn verify_published(r: &IndexReader, units: Option<u64>) -> Result<Rep
             rec.roles,
             roles.unwrap_or_default()
         );
-        let mut checks: Vec<Option<BucketCheck>> = Vec::new();
-        checks.resize_with(rec.bucket_count as usize, || None);
+        // Results arrive out of order; nothing is sized from the descriptor before the buckets
+        // are read.
+        let mut checks: std::collections::BTreeMap<u32, BucketCheck> = Default::default();
         let mut set = tokio::task::JoinSet::new();
         let mut next = 0u32;
         while next < rec.bucket_count || !set.is_empty() {
@@ -228,10 +275,10 @@ pub async fn verify_published(r: &IndexReader, units: Option<u64>) -> Result<Rep
             }
             if let Some(done) = set.join_next().await {
                 let (k, c) = done.context("bucket check panicked")?;
-                checks[k as usize] = Some(c?);
+                checks.insert(k, c?);
             }
         }
-        let checks: Vec<BucketCheck> = checks.into_iter().map(|c| c.expect("checked")).collect();
+        let checks: Vec<BucketCheck> = checks.into_values().collect();
         let leaves: Vec<B256> = checks.iter().map(|c| c.leaf).collect();
         let root = Tree::new(&leaves, depth_for(leaves.len())).root();
         ensure!(
@@ -272,7 +319,7 @@ pub async fn verify_published(r: &IndexReader, units: Option<u64>) -> Result<Rep
 /// Checks every slice's last block against the chain: the index is about this chain, and
 /// its slices all lie on it.
 pub async fn check_chain(provider: &impl Provider, report: &Report) -> Result<()> {
-    for ((level, index), _, hash) in &report.slices {
+    for (i, ((level, index), _, hash)) in report.slices.iter().enumerate() {
         let n = last_block(*level, *index);
         let block = provider
             .get_block_by_number(n.into())
@@ -284,6 +331,15 @@ pub async fn check_chain(provider: &impl Provider, report: &Report) -> Result<()
             "slice ({level}, {index}) ends in block {hash}, the chain's block {n} is {}",
             block.header.hash
         );
+        // The newest slice ends in the head's last block, whose timestamp clients act on.
+        if i + 1 == report.slices.len() {
+            ensure!(
+                block.header.timestamp == report.last_block_timestamp,
+                "the head states timestamp {} for block {n}, the chain {}",
+                report.last_block_timestamp,
+                block.header.timestamp
+            );
+        }
     }
     Ok(())
 }
