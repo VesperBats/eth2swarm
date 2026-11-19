@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 
 use super::fetch::fetch_appearances;
 use super::layout::{Entries, Entry, HeadRecord, UNIT_BLOCKS};
-use super::slice::{SliceId, bucket_of, fingerprint, resolve, resolve_after};
+use super::slice::{SliceId, bucket_of, fingerprint, resolve_after};
 use super::verify::IndexReader;
 
 /// The newest existing update in `0..=aim`, by `exists(n)` (`Ok(Err(reason))` for a miss):
@@ -80,22 +80,33 @@ pub struct Found {
     pub files: u64,
     /// The role bits the index detects (the same in every slice read).
     pub roles: u8,
+    /// The first block the entries cover: the index's start, or the incremental sync's.
+    /// Nothing before it was looked at.
+    pub first_block: u64,
 }
 
 /// Slices read at the same time.
 const CONCURRENCY: usize = 8;
 
-/// The entries of the address with hash `h` in slice `s`, with the files read.
-async fn in_slice(r: IndexReader, s: SliceId, h: B256) -> Result<(Vec<Entry>, u64, u8)> {
-    let rec = r.slice(s).await?;
+/// The entries of the address with hash `h` in slice `s` of an index from unit `first_unit`,
+/// with the files read.
+async fn in_slice(
+    r: IndexReader,
+    s: SliceId,
+    first_unit: u64,
+    h: B256,
+) -> Result<(Vec<Entry>, u64, u8)> {
+    let rec = r.slice(s, first_unit).await?;
     let fp = fingerprint(&h);
-    let (_, records, mut files) = r.bucket_records(s, bucket_of(&h, rec.bucket_count)).await?;
+    let (_, records, mut files) = r
+        .bucket_records(&rec, bucket_of(&h, rec.bucket_count))
+        .await?;
     let mut entries = Vec::new();
-    for rec in records.into_iter().filter(|x| x.fp == fp) {
-        match rec.entries {
+    for address_rec in records.into_iter().filter(|x| x.fp == fp) {
+        match address_rec.entries {
             Entries::Inline(e) => entries.extend(e),
             Entries::Spilled { count, spill_ref } => {
-                entries.extend(r.spill_entries(s, &spill_ref, count).await?);
+                entries.extend(r.spill_entries(&rec, &spill_ref, count).await?);
                 files += 1;
             }
         }
@@ -104,8 +115,9 @@ async fn in_slice(r: IndexReader, s: SliceId, h: B256) -> Result<(Vec<Entry>, u6
 }
 
 /// The appearances of `address` in the index as of `head`, newest first, reading the slices
-/// in parallel. With `since`, only the slices that end after unit `since` are read
-/// (incremental sync), and entries before that unit are dropped. Records are matched by
+/// in parallel. The index covers the units from the head's `first_unit` on; with `since`,
+/// only the slices that end after unit `since` are read (incremental sync), and entries
+/// before that unit are dropped. [`Found::first_block`] says where the entries start. Records are matched by
 /// fingerprint, so in rare cases entries of another address with the same 64-bit fingerprint
 /// come along; [`against_chain`] reports them as entries the chain lacks for this address.
 pub async fn lookup(
@@ -115,18 +127,17 @@ pub async fn lookup(
     since: Option<u64>,
 ) -> Result<Found> {
     let h = keccak256(address.as_slice());
-    let slices = match since {
-        Some(m) => resolve_after(m, head.units, &head.pending),
-        None => resolve(head.units, &head.pending),
-    };
-    let min_block = since.map_or(0, |m| m * UNIT_BLOCKS);
+    let from = since.map_or(head.first_unit, |m| m.max(head.first_unit));
+    let slices = resolve_after(from, head.units, &head.pending);
+    let min_block = from * UNIT_BLOCKS;
     let mut results = std::collections::BTreeMap::new();
     let mut set = tokio::task::JoinSet::new();
     let mut next = 0;
     while next < slices.len() || !set.is_empty() {
         while set.len() < CONCURRENCY && next < slices.len() {
             let (reader, s, i) = (r.clone(), slices[next], next);
-            set.spawn(async move { (i, in_slice(reader, s, h).await) });
+            let first_unit = head.first_unit;
+            set.spawn(async move { (i, in_slice(reader, s, first_unit, h).await) });
             next += 1;
         }
         if let Some(done) = set.join_next().await {
@@ -136,6 +147,7 @@ pub async fn lookup(
     }
     let mut found = Found {
         slices: slices.len(),
+        first_block: min_block,
         ..Default::default()
     };
     // Newest slice first; within a slice, newest entry first.
@@ -163,8 +175,9 @@ pub struct ChainCheck {
     pub missing: Vec<Entry>,
 }
 
-/// Detects every block of `[from_block, units · 64)` directly and compares the appearances of
-/// `address` with `found`, as multisets: an entry listed twice by the index is a difference.
+/// Detects every block of `[found.first_block, units · 64)` directly and compares the
+/// appearances of `address` with `found`, as multisets: an entry listed twice by the index is
+/// a difference.
 /// Both lists empty means the index is sound and complete for this address.
 /// The detection follows the index: with traces if its slices detect `TRACE`. The chain must
 /// be the index's: the endpoint's chain ID equals `chain_id`, and its block at the head's last
@@ -175,7 +188,6 @@ pub async fn against_chain<P>(
     found: &Found,
     head: &HeadRecord,
     chain_id: u64,
-    from_block: u64,
 ) -> Result<ChainCheck>
 where
     P: Provider + Clone + 'static,
@@ -189,7 +201,7 @@ where
     let mut last_hash = None;
     let traces = found.roles & super::detect::role::TRACE != 0;
     let mut chain = Vec::new();
-    fetch_appearances(provider, from_block..=last, traces, 16, |b| {
+    fetch_appearances(provider, found.first_block..=last, traces, 16, |b| {
         if b.number == last {
             last_hash = Some(b.hash);
         }

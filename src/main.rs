@@ -87,6 +87,11 @@ enum Command {
         /// Start a new index (first run, no state yet). Refused if the key already has one.
         #[arg(long)]
         init: bool,
+        /// With --init: the index covers the 64-block unit of this block and everything after
+        /// it, instead of the whole chain. Lookups report the blocks before it as not covered.
+        /// The start is fixed for the life of the index (an earlier start needs another key).
+        #[arg(long)]
+        from_block: Option<u64>,
         /// Also read `trace_block` (see `appearances`).
         #[arg(long)]
         traces: bool,
@@ -306,6 +311,7 @@ async fn main() -> Result<()> {
             units,
             follow,
             init,
+            from_block,
             traces,
             batch,
             defer_level,
@@ -317,6 +323,7 @@ async fn main() -> Result<()> {
                 units,
                 follow,
                 init,
+                from_block,
                 traces,
                 batch,
                 defer_level,
@@ -391,9 +398,10 @@ async fn main() -> Result<()> {
                 println!("  slice ({level}, {index}): buckets root {root}");
             }
             println!(
-                "Verified head for {} units (pending {:?}): {} slices, {} buckets, {} files, \
-                 {} addresses, {} appearances",
+                "Verified head for {} units from block {} (pending {:?}): {} slices, {} \
+                 buckets, {} files, {} addresses, {} appearances",
                 r.units,
+                r.first_unit * addr::layout::UNIT_BLOCKS,
                 r.pending,
                 r.slices.len(),
                 r.buckets,
@@ -578,7 +586,7 @@ where
 
     ensure!(level <= L_MAX, "slice level {level} above {L_MAX}");
     let (first, last) = (first_block(level, index), last_block(level, index));
-    let built = addr::fetch::fetch_slice(provider, (level, index), traces, 16, None)
+    let built = addr::fetch::fetch_slice(provider, (level, index), 0, traces, 16, None)
         .await?
         .built;
     let r = &built.record;
@@ -683,7 +691,6 @@ where
     P: Provider + Clone + 'static,
 {
     use addr::detect::role;
-    use addr::layout::UNIT_BLOCKS;
 
     let reader = addr::verify::IndexReader {
         bee: bee.clone(),
@@ -716,19 +723,24 @@ where
         println!("{:>10}  {:>5}  {}", e.block, e.slot, role::names(e.roles));
     }
     println!(
-        "{address}: {} appearances in the index up to block {} ({} units{}; {} slices, {} \
+        "{address}: {} appearances in the index in blocks {}..={} ({} units{}; {} slices, {} \
          files read)",
         found.entries.len(),
+        found.first_block,
         head.last_block(),
         head.units,
         since.map_or(String::new(), |m| format!(", new since unit {m}")),
         found.slices,
         found.files
     );
+    if head.first_unit > 0 {
+        println!(
+            "The index starts at block {}: blocks before it are not covered.",
+            head.first_block()
+        );
+    }
     if against_chain {
-        let from = since.map_or(0, |m| m * UNIT_BLOCKS);
-        let c =
-            addr::lookup::against_chain(provider, address, &found, &head, chain_id, from).await?;
+        let c = addr::lookup::against_chain(provider, address, &found, &head, chain_id).await?;
         ensure!(
             c.not_on_chain.is_empty() && c.missing.is_empty(),
             "index and chain differ for {address}: {} entries not on the chain {:?}, {} \

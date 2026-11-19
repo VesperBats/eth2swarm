@@ -7,10 +7,10 @@ use anyhow::{Context, Result, ensure};
 
 use super::layout::{
     AddressRecord, BucketBody, BucketRecord, Entries, Entry, HeadRecord, SliceRecord, bucket_id,
-    bucket_pages_file, decode_bucket_page, decode_spill_page, first_block, head_id, last_block,
-    origin_id, pages, slice_id, spill_file,
+    bucket_pages_file, decode_bucket_page, decode_spill_page, head_id, held_first_block,
+    last_block, origin_id, pages, slice_id, spill_file,
 };
-use super::slice::{SliceId, resolve};
+use super::slice::{SliceId, resolve_after};
 use crate::accumulator::{Tree, depth_for};
 use crate::swarm::bee::Bee;
 use crate::swarm::file::file_reference;
@@ -53,7 +53,9 @@ impl IndexReader {
         )
     }
 
-    pub async fn slice(&self, s: SliceId) -> Result<SliceRecord> {
+    /// The descriptor of slice `s` in an index from unit `first_unit` (the head's): it must
+    /// start where that index makes it start.
+    pub async fn slice(&self, s: SliceId, first_unit: u64) -> Result<SliceRecord> {
         let rec = SliceRecord::decode(
             &self
                 .soc(slice_id(self.chain_id, s.0, s.1))
@@ -68,26 +70,35 @@ impl IndexReader {
             rec.level,
             rec.index
         );
+        let first = held_first_block(s.0, s.1, first_unit);
+        ensure!(
+            rec.first_block == first,
+            "slice ({}, {}) starts at block {}, the index makes it start at {first}",
+            s.0,
+            s.1,
+            rec.first_block
+        );
         Ok(rec)
     }
 
-    /// Bucket `k` of slice `s`: its payload (for `buckets_root`) and its record.
-    pub async fn bucket(&self, s: SliceId, k: u32) -> Result<(Vec<u8>, BucketRecord)> {
+    /// Bucket `k` of the slice `rec` describes: its payload (for `buckets_root`) and its record.
+    pub async fn bucket(&self, rec: &SliceRecord, k: u32) -> Result<(Vec<u8>, BucketRecord)> {
+        let s = (rec.level, rec.index);
         let payload = self
             .soc(bucket_id(self.chain_id, s.0, s.1, k))
             .await
             .with_context(|| format!("reading bucket {k} of slice ({}, {})", s.0, s.1))?;
-        let rec = BucketRecord::decode(&payload)?;
+        let b = BucketRecord::decode(&payload, rec.first_block)?;
         ensure!(
-            (rec.level, rec.index, rec.bucket) == (s.0, s.1, k),
+            (b.level, b.index, b.bucket) == (s.0, s.1, k),
             "bucket {k} of slice ({}, {}) holds bucket {} of ({}, {})",
             s.0,
             s.1,
-            rec.bucket,
-            rec.level,
-            rec.index
+            b.bucket,
+            b.level,
+            b.index
         );
-        Ok((payload, rec))
+        Ok((payload, b))
     }
 
     /// A spill or pages file, checked against its reference.
@@ -100,17 +111,19 @@ impl IndexReader {
         Ok(data)
     }
 
-    /// The address records of bucket `k` of slice `s`, from the bucket or its pages file,
+    /// The address records of bucket `k` of the slice `rec` describes, from the bucket or its
+    /// pages file,
     /// with the bucket payload (for `buckets_root`) and the number of files read. A pages
     /// file must state the page count the bucket gives, keep the records ascending across
     /// its pages, and be their canonical encoding: what a client's page search relies on.
     pub async fn bucket_records(
         &self,
-        s: SliceId,
+        rec: &SliceRecord,
         k: u32,
     ) -> Result<(Vec<u8>, Vec<AddressRecord>, u64)> {
-        let (first, last) = (first_block(s.0, s.1), last_block(s.0, s.1));
-        let (payload, bucket) = self.bucket(s, k).await?;
+        let s = (rec.level, rec.index);
+        let (first, last) = (rec.first_block, rec.last_block());
+        let (payload, bucket) = self.bucket(rec, k).await?;
         let (records, files) = match bucket.body {
             BucketBody::Inline(records) => (records, 0),
             BucketBody::Paged {
@@ -157,15 +170,15 @@ impl IndexReader {
         Ok((payload, records, files))
     }
 
-    /// The entries of a spilled address record of slice `s`, checked: the stated count,
-    /// ascending across pages, and the canonical encoding.
+    /// The entries of a spilled address record of the slice `rec` describes, checked: the
+    /// stated count, ascending across pages, and the canonical encoding.
     pub async fn spill_entries(
         &self,
-        s: SliceId,
+        rec: &SliceRecord,
         spill_ref: &B256,
         count: u64,
     ) -> Result<Vec<Entry>> {
-        let (first, last) = (first_block(s.0, s.1), last_block(s.0, s.1));
+        let (first, last) = (rec.first_block, rec.last_block());
         let file = self.file(spill_ref).await?;
         let entries = pages(&file)?
             .into_iter()
@@ -204,6 +217,7 @@ impl IndexReader {
             units - origin.units,
             head.units
         );
+        same_start(&head, origin, units - origin.units)?;
         Ok(head)
     }
 
@@ -229,13 +243,27 @@ impl IndexReader {
             head.units,
             origin.units + n
         );
+        same_start(&head, origin, n)?;
         Ok(Ok(head))
     }
+}
+
+/// Every head of an index states the origin's start.
+fn same_start(head: &HeadRecord, origin: &HeadRecord, n: u64) -> Result<()> {
+    ensure!(
+        head.first_unit == origin.first_unit,
+        "head update {n} starts at block {}, the origin at {}",
+        head.first_block(),
+        origin.first_block()
+    );
+    Ok(())
 }
 
 /// What `addr-verify` read.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Report {
+    /// The first unit the index covers.
+    pub first_unit: u64,
     pub units: u64,
     pub pending: Vec<SliceId>,
     /// The head's `last_block_timestamp`, checked against the chain by [`check_chain`].
@@ -259,20 +287,21 @@ struct BucketCheck {
     files: u64,
 }
 
-/// Reads bucket `k` of slice `s` with every file it references, and checks them.
-async fn check_bucket(r: IndexReader, s: SliceId, k: u32) -> Result<BucketCheck> {
-    let (payload, records, mut files) = r.bucket_records(s, k).await?;
+/// Reads bucket `k` of the slice `rec` describes with every file it references, and checks
+/// them.
+async fn check_bucket(r: IndexReader, rec: SliceRecord, k: u32) -> Result<BucketCheck> {
+    let (payload, records, mut files) = r.bucket_records(&rec, k).await?;
     let mut c = BucketCheck {
         leaf: keccak256(&payload),
         addresses: records.len() as u64,
         appearances: 0,
         files: 0,
     };
-    for rec in records {
-        c.appearances += match rec.entries {
+    for address_rec in records {
+        c.appearances += match address_rec.entries {
             Entries::Inline(e) => e.len() as u64,
             Entries::Spilled { count, spill_ref } => {
-                r.spill_entries(s, &spill_ref, count).await?;
+                r.spill_entries(&rec, &spill_ref, count).await?;
                 files += 1;
                 count
             }
@@ -300,14 +329,16 @@ pub async fn verify_published(r: &IndexReader, units: Option<u64>) -> Result<Rep
     };
     ensure!(head0 == origin, "the origin differs from head update 0");
     let mut report = Report {
+        first_unit: head.first_unit,
         units,
         pending: head.pending.clone(),
         last_block_timestamp: head.last_block_timestamp,
         ..Default::default()
     };
     let mut roles = None;
-    for s in resolve(units, &head.pending) {
-        let rec = r.slice(s).await?;
+    // The slices of the cover that hold units from the index's start on.
+    for s in resolve_after(head.first_unit, units, &head.pending) {
+        let rec = r.slice(s, head.first_unit).await?;
         ensure!(
             *roles.get_or_insert(rec.roles) == rec.roles,
             "slice ({}, {}) detects roles {:#04x}, another slice {:#04x}",
@@ -323,8 +354,8 @@ pub async fn verify_published(r: &IndexReader, units: Option<u64>) -> Result<Rep
         let mut next = 0u32;
         while next < rec.bucket_count || !set.is_empty() {
             while set.len() < CONCURRENCY && next < rec.bucket_count {
-                let (reader, k) = (r.clone(), next);
-                set.spawn(async move { (k, check_bucket(reader, s, k).await) });
+                let (reader, rec, k) = (r.clone(), rec.clone(), next);
+                set.spawn(async move { (k, check_bucket(reader, rec, k).await) });
                 next += 1;
             }
             if let Some(done) = set.join_next().await {

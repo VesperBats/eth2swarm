@@ -27,7 +27,7 @@ use super::fetch::{FetchedSlice, fetch_slice};
 use super::layout::{
     HeadRecord, L_MAX, MAX_UNITS, UNIT_BLOCKS, bucket_id, first_block, head_id, origin_id, slice_id,
 };
-use super::slice::{BuiltSlice, SliceId, cover, new_slice, units};
+use super::slice::{BuiltSlice, SliceId, cover, held, new_slice, units};
 use crate::swarm::{bee::Bee, soc};
 
 /// Name of the state file in the state directory.
@@ -117,6 +117,9 @@ pub struct State {
     pub chain_id: u64,
     pub owner: Address,
     pub roles: u8,
+    /// The first unit the index covers (`S`, 0 from genesis), fixed by the first run.
+    #[serde(default)]
+    pub first_unit: u64,
     /// Units of head update 0 (`N0`); update `n` announces `N0 + n` units.
     pub n0: u64,
     /// Units of the last head known to be published.
@@ -174,13 +177,23 @@ impl State {
         let mut keep: std::collections::BTreeSet<u64> =
             cover(n).iter().map(|s| units(*s).end - 1).collect();
         for s in &self.schedule.pending {
-            let r = units(*s);
+            let r = held(*s, self.first_unit);
             keep.insert(r.end - 1);
-            if r.start > 0 {
+            if r.start > self.first_unit {
                 keep.insert(r.start - 1);
             }
         }
         self.unit_hashes.retain(|u, _| keep.contains(u));
+    }
+
+    /// The hash a slice holding units from `start` on must continue: the published unit before
+    /// it, or none for a slice that starts with the index.
+    fn parent_of(&self, start: u64) -> Result<Option<B256>> {
+        if start == self.first_unit {
+            Ok(None)
+        } else {
+            self.unit_hash(start - 1).map(Some)
+        }
     }
 
     fn unit_hash(&self, unit: u64) -> Result<B256> {
@@ -232,6 +245,9 @@ pub struct ImportOptions {
     pub follow: bool,
     /// A first run: start a new index. Without it, a missing state file is an error.
     pub init: bool,
+    /// The first run's start: the index covers the unit of this block and every later one
+    /// (default: from genesis). A later run must state the same unit or nothing.
+    pub from_block: Option<u64>,
     pub traces: bool,
     pub batch: Option<B256>,
     /// Merges of this level and above are built in the background.
@@ -249,6 +265,8 @@ struct Ctx<P> {
     signer: PrivateKeySigner,
     batch: B256,
     chain_id: u64,
+    /// The first unit the index covers.
+    first_unit: u64,
     traces: bool,
     max_level: u8,
     concurrency: usize,
@@ -264,7 +282,15 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
             slice.1,
             self.max_level
         );
-        fetch_slice(&self.provider, slice, self.traces, self.concurrency, parent).await
+        fetch_slice(
+            &self.provider,
+            slice,
+            self.first_unit,
+            self.traces,
+            self.concurrency,
+            parent,
+        )
+        .await
     }
 
     /// Uploads a built slice: files first, then the buckets, the descriptor last.
@@ -401,12 +427,9 @@ impl MergeWorker {
         else {
             return Ok(());
         };
-        let r = units(slice);
+        let r = held(slice, state.first_unit);
         let end = state.unit_hash(r.end - 1)?;
-        let before = match r.start {
-            0 => None,
-            start => Some(state.unit_hash(start - 1)?),
-        };
+        let before = state.parent_of(r.start)?;
         let ctx = ctx.clone();
         self.running
             .spawn(async move { ctx.merge(slice, end, before).await });
@@ -497,18 +520,33 @@ where
         None => bee.usable_batch().await?,
     };
     let roles = role::mask(opts.traces);
+    let existing = State::load(dir)?;
+    let requested = opts.from_block.map(|b| b / UNIT_BLOCKS);
+    let first_unit = match &existing {
+        Some(s) => {
+            ensure!(
+                requested.is_none_or(|u| u == s.first_unit),
+                "the index in {} starts at block {}; --from-block cannot move it",
+                dir.display(),
+                s.first_unit * UNIT_BLOCKS
+            );
+            s.first_unit
+        }
+        None => requested.unwrap_or(0),
+    };
     let ctx = Ctx {
         provider: provider.clone(),
         bee: bee.clone(),
         signer: signer.clone(),
         batch,
         chain_id,
+        first_unit,
         traces: opts.traces,
         max_level: opts.max_level,
         concurrency: opts.concurrency,
     };
 
-    let mut state = match State::load(dir)? {
+    let mut state = match existing {
         Some(s) => {
             ensure!(
                 s.chain_id == chain_id && s.owner == signer.address() && s.roles == roles,
@@ -621,11 +659,7 @@ async fn import_unit<P: Provider + Clone + 'static>(
             opts.max_level
         );
     }
-    let start = units(now).start;
-    let parent = match start {
-        0 => None,
-        s => Some(state.unit_hash(s - 1)?),
-    };
+    let parent = state.parent_of(held(now, state.first_unit).start)?;
     let f = ctx.fetch(now, parent).await?;
     ctx.upload_slice(&f.built).await?;
     state.unit_hashes.insert(n - 1, f.last_hash);
@@ -639,6 +673,7 @@ async fn import_unit<P: Provider + Clone + 'static>(
         merges.kick(ctx, state)?;
     }
     state.prepared = Some(HeadRecord {
+        first_unit: state.first_unit,
         units: n,
         last_block_hash: f.last_hash,
         last_block_timestamp: f.last_timestamp,
@@ -649,16 +684,25 @@ async fn import_unit<P: Provider + Clone + 'static>(
     ctx.publish_prepared(state, &opts.state_dir).await
 }
 
-/// First run: publishes the cover of `[0, target)` (every other past slice would never be
-/// read), then head update 0 and the origin, written ahead like every head.
+/// First run: publishes the slices of the cover of `[0, target)` that hold units from the
+/// index's start on (every other past slice would never be read), then head update 0 and the
+/// origin, written ahead like every head.
 async fn backfill<P: Provider + Clone + 'static>(
     ctx: &Ctx<P>,
     target: u64,
     roles: u8,
     dir: &Path,
 ) -> Result<State> {
-    ensure!(target >= 1, "nothing to import: no complete unit");
-    let slices = cover(target);
+    ensure!(
+        target > ctx.first_unit,
+        "nothing to import: {target} complete units, the index starts at unit {} (block {})",
+        ctx.first_unit,
+        ctx.first_unit * UNIT_BLOCKS
+    );
+    let slices: Vec<SliceId> = cover(target)
+        .into_iter()
+        .filter(|s| !held(*s, ctx.first_unit).is_empty())
+        .collect();
     if let Some(s) = slices.iter().find(|s| s.0 > ctx.max_level) {
         bail!(
             "the cover of {target} units contains slice ({}, {}), above --max-level {}; a \
@@ -672,6 +716,7 @@ async fn backfill<P: Provider + Clone + 'static>(
         chain_id: ctx.chain_id,
         owner: ctx.signer.address(),
         roles,
+        first_unit: ctx.first_unit,
         n0: target,
         units: target,
         schedule: Schedule::default(),
@@ -689,6 +734,7 @@ async fn backfill<P: Provider + Clone + 'static>(
     }
     let last = last.expect("a cover of at least one unit");
     state.prepared = Some(HeadRecord {
+        first_unit: ctx.first_unit,
         units: target,
         last_block_hash: last.last_hash,
         last_block_timestamp: last.last_timestamp,
@@ -698,6 +744,7 @@ async fn backfill<P: Provider + Clone + 'static>(
     state.save(dir)?;
     info!(
         units = target,
+        first_block = ctx.first_unit * UNIT_BLOCKS,
         "backfill uploaded; publishing head 0 and the origin"
     );
     Ok(state)
@@ -706,7 +753,7 @@ async fn backfill<P: Provider + Clone + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addr::slice::resolve;
+    use crate::addr::slice::resolve_after;
     use std::collections::BTreeSet;
 
     #[test]
@@ -730,17 +777,25 @@ mod tests {
     }
 
     /// Simulates the importer: every head must only reference slices that are written, every
-    /// pending list must encode, and every merge must eventually leave the heads.
+    /// pending list must encode, and every merge must eventually leave the heads. Also for an
+    /// index that starts after genesis, whose backfill writes only the slices after its start.
     #[test]
     fn every_head_references_written_slices() {
-        for defer_level in [1u8, 2, 3, 5] {
-            for delay in [0u64, 1, 2, 5, 17] {
-                let n0 = 3;
-                let mut written: BTreeSet<SliceId> = cover(n0).into_iter().collect();
+        for (first_unit, defer_level, delay) in [0u64, 2, 5, 37]
+            .into_iter()
+            .flat_map(|f| [1u8, 2, 3, 5].map(move |d| (f, d)))
+            .flat_map(|(f, d)| [0u64, 1, 2, 5, 17].map(move |x| (f, d, x)))
+        {
+            {
+                let n0 = first_unit + 3;
+                let mut written: BTreeSet<SliceId> = cover(n0)
+                    .into_iter()
+                    .filter(|s| !held(*s, first_unit).is_empty())
+                    .collect();
                 let mut schedule = Schedule::default();
                 // (finishes after unit, slice)
                 let mut running: Vec<(u64, SliceId)> = Vec::new();
-                for n in n0 + 1..=300 {
+                for n in n0 + 1..=first_unit + 300 {
                     running.retain(|(at, s)| {
                         if *at <= n {
                             written.insert(*s);
@@ -763,17 +818,18 @@ mod tests {
                     }
                     let pending = schedule.next_head_pending();
                     let head = HeadRecord {
+                        first_unit,
                         units: n,
                         last_block_hash: B256::ZERO,
                         last_block_timestamp: 0,
                         pending: pending.clone(),
                     };
                     assert_eq!(HeadRecord::decode(&head.encode()).unwrap(), head);
-                    for s in resolve(n, &pending) {
+                    for s in resolve_after(first_unit, n, &pending) {
                         assert!(
                             written.contains(&s),
-                            "defer {defer_level}, delay {delay}: head {n} reads {s:?}, \
-                             not written (pending {pending:?})"
+                            "start {first_unit}, defer {defer_level}, delay {delay}: head {n} \
+                             reads {s:?}, not written (pending {pending:?})"
                         );
                     }
                 }
@@ -793,6 +849,7 @@ mod tests {
             chain_id: 1337,
             owner: Address::repeat_byte(1),
             roles: 0xdf,
+            first_unit: 0,
             n0: 5,
             units: 9,
             schedule: Schedule {
@@ -801,6 +858,7 @@ mod tests {
             },
             unit_hashes: BTreeMap::new(),
             prepared: Some(HeadRecord {
+                first_unit: 0,
                 units: 10,
                 last_block_hash: B256::repeat_byte(2),
                 last_block_timestamp: 1_800_000_000,
@@ -846,5 +904,28 @@ mod tests {
         assert!(s2.unit_hash(top - 1).is_ok(), "the unit before the merge");
         assert!(s2.unit_hash(2 * top - 1).is_ok(), "the merge's last unit");
         assert!(s2.unit_hash(top - 2).is_err());
+
+        // An index from unit 5: a slice that starts with the index continues nothing; every
+        // other slice continues a kept unit.
+        let mut s3 = State {
+            first_unit: 5,
+            schedule: Schedule::default(),
+            unit_hashes: (5..13).map(|u| (u, B256::ZERO)).collect(),
+            ..s.clone()
+        };
+        assert_eq!(s3.parent_of(5).unwrap(), None);
+        s3.prune(13);
+        for n in 14..80 {
+            let start = held(new_slice(n), 5).start;
+            assert!(s3.parent_of(start).is_ok(), "unit {}: no parent", n - 1);
+            s3.unit_hashes.insert(n - 1, B256::ZERO);
+            s3.prune(n);
+        }
+        // A pending merge the start falls into keeps its last unit, and nothing before it.
+        s3.schedule.defer((7, 0)); // units 0..128, held from 5
+        s3.unit_hashes = (5..130).map(|u| (u, B256::ZERO)).collect();
+        s3.prune(130);
+        assert!(s3.unit_hash(127).is_ok());
+        assert!(s3.unit_hash(4).is_err());
     }
 }

@@ -271,6 +271,47 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
     || { echo "FAIL: head discovery found $FOUND_UNITS units, the index has $ACT_UNITS"; exit 1; }
   rm -rf "$ACT_STATE"
   echo "ok: busy address ($N appearances, $BUSY_FILES spill file), emitter, authority and an unrelated address match the chain since unit $U1; the full lookup agrees; the sender's incremental lookup reads $SINCE_SLICES of $FULL_SLICES slices; head discovery finds $ACT_UNITS units"
+
+  echo "== address index from a later block (--from-block): import, verify, lookups checked against the chain"
+  # Starts inside the activity's first unit, so that the slice holding the activity begins at
+  # the index's start (unit U1) rather than at its own first unit whenever L > 0.
+  LATE_FROM=$((U1 * 64 + 10))
+  LATE_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+  LATE_STATE=$(mktemp -d)
+  OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$LATE_KEY" --state "$LATE_STATE" --init \
+    --from-block "$LATE_FROM" --units "$ACT_UNITS" "${TRACE_FLAG[@]}") \
+    || { echo "FAIL: addr-import --from-block $LATE_FROM"; exit 1; }
+  LATE_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
+  OUT=$($BIN --bee "$READ_BEE" addr-verify --owner "$LATE_OWNER" --chain-id "$CHAIN_ID" \
+    --units "$ACT_UNITS") || { echo "FAIL: addr-verify of the late index"; echo "$OUT"; exit 1; }
+  echo "$OUT" | tail -1
+  echo "$OUT" | tail -1 | grep -q "from block $((U1 * 64)) " \
+    || { echo "FAIL: the late index does not start at block $((U1 * 64)): $OUT"; exit 1; }
+  late_lookup() {
+    $BIN --bee "$READ_BEE" addr-lookup "$1" --owner "$LATE_OWNER" --chain-id "$CHAIN_ID" \
+      --units "$ACT_UNITS" --limit 0 "${@:2}"
+  }
+  # Without --since: the whole late index, checked against the chain from its start. The
+  # sender has appearances before the start, which the late index must not hold.
+  for A in "$BUSY" "$OWNER"; do
+    OUT=$(late_lookup "$A" --against-chain) \
+      || { echo "FAIL: addr-lookup $A in the late index"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "The index starts at block $((U1 * 64))" \
+      || { echo "FAIL: the lookup does not report the late start: $OUT"; exit 1; }
+  done
+  LATE_N=$(late_lookup "$BUSY" | count)
+  [ "$LATE_N" = "$N" ] || { echo "FAIL: the late index has $LATE_N busy entries, the full one $N"; exit 1; }
+  LATE_SENDER=$(late_lookup "$OWNER" | count)
+  SINCE_SENDER=$(lookup "$OWNER" --since "$U1" | count)
+  [ "$LATE_SENDER" = "$SINCE_SENDER" ] \
+    || { echo "FAIL: the late index has $LATE_SENDER sender entries, the full one $SINCE_SENDER since unit $U1"; exit 1; }
+  # The start is fixed: a later run cannot move it.
+  if $BIN --bee "$UPLOAD_BEE" addr-import --key "$LATE_KEY" --state "$LATE_STATE" \
+    --from-block 0 --units "$ACT_UNITS" >/dev/null 2>&1; then
+    echo "FAIL: addr-import moved the start of an existing index"; exit 1
+  fi
+  rm -rf "$LATE_STATE"
+  echo "ok: the index from block $((U1 * 64)) verifies, holds the busy address's $N entries and the sender's $LATE_SENDER since its start, matches the chain from there, and keeps its start"
 fi
 
 echo "== inspector (ethswarm serve) verifies a block via $READ_BEE"

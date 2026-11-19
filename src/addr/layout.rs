@@ -38,6 +38,12 @@ pub fn last_block(level: u8, index: u32) -> u64 {
     ((index as u64 + 1) << level) * UNIT_BLOCKS - 1
 }
 
+/// First block slice `(level, index)` holds in an index that starts at unit `first_unit`: its
+/// own first block, or the index's for the slice the start falls into.
+pub fn held_first_block(level: u8, index: u32, first_unit: u64) -> u64 {
+    first_block(level, index).max(first_unit * UNIT_BLOCKS)
+}
+
 pub fn slice_id(chain_id: u64, level: u8, index: u32) -> B256 {
     keccak256(format!("eth:{chain_id}:addr1:slice:{level}:{index}"))
 }
@@ -361,6 +367,9 @@ pub fn decode_bucket_page(page: &[u8], base: u64, last: u64) -> Result<Vec<Addre
 pub struct SliceRecord {
     pub level: u8,
     pub index: u32,
+    /// The first block the slice holds: [`first_block`] of `(level, index)`, or the index's
+    /// first block for the slice its start falls into ([`held_first_block`]).
+    pub first_block: u64,
     pub last_block_hash: B256,
     pub bucket_count: u32,
     pub addresses: u32,
@@ -374,20 +383,23 @@ impl SliceRecord {
     #[cfg_attr(not(test), allow(dead_code))]
     pub const LEN: usize = 111;
 
-    pub fn first_block(&self) -> u64 {
-        first_block(self.level, self.index)
-    }
-
     pub fn last_block(&self) -> u64 {
         last_block(self.level, self.index)
     }
 
     pub fn encode(&self) -> Vec<u8> {
+        assert!(
+            valid_first_block(self.level, self.index, self.first_block),
+            "slice ({}, {}) cannot start at block {}",
+            self.level,
+            self.index,
+            self.first_block
+        );
         let mut w = Writer::new(KIND_SLICE);
         w.u32(UNIT_BLOCKS as u32);
         w.u8(self.level);
         w.u32(self.index);
-        w.u64(self.first_block());
+        w.u64(self.first_block);
         w.u64(self.last_block());
         w.hash(&self.last_block_hash);
         w.u32(self.bucket_count);
@@ -410,12 +422,13 @@ impl SliceRecord {
         let index = r.u32()?;
         let (first, last) = (r.u64()?, r.u64()?);
         ensure!(
-            first == first_block(level, index) && last == last_block(level, index),
+            valid_first_block(level, index, first) && last == last_block(level, index),
             "slice ({level}, {index}) states blocks {first}..={last}"
         );
         let rec = Self {
             level,
             index,
+            first_block: first,
             last_block_hash: r.hash()?,
             bucket_count: r.u32()?,
             addresses: r.u32()?,
@@ -427,6 +440,13 @@ impl SliceRecord {
         r.finish()?;
         Ok(rec)
     }
+}
+
+/// A slice can start at a unit boundary inside its own units (the index's first block), not
+/// before them and not after its last unit.
+fn valid_first_block(level: u8, index: u32, first: u64) -> bool {
+    first.is_multiple_of(UNIT_BLOCKS)
+        && (first_block(level, index)..=last_block(level, index)).contains(&first)
 }
 
 /// What a bucket holds: its address records, or the reference of the pages file with them.
@@ -446,6 +466,9 @@ pub struct BucketRecord {
     pub level: u8,
     pub index: u32,
     pub bucket: u32,
+    /// The slice's first block (its `SliceRecord`'s `first_block`): the base of the block
+    /// deltas. Not part of the encoding.
+    pub base: u64,
     pub body: BucketBody,
 }
 
@@ -456,7 +479,7 @@ impl BucketRecord {
     pub const INLINE_HEADER: usize = 19;
 
     pub fn encode(&self) -> Vec<u8> {
-        let base = first_block(self.level, self.index);
+        let base = self.base;
         let mut w = Writer::new(KIND_BUCKET);
         w.u8(self.level);
         w.u32(self.index);
@@ -483,7 +506,8 @@ impl BucketRecord {
         w.0
     }
 
-    pub fn decode(buf: &[u8]) -> Result<Self> {
+    /// Decodes a bucket of a slice whose first block is `base` (from its `SliceRecord`).
+    pub fn decode(buf: &[u8], base: u64) -> Result<Self> {
         ensure!(
             buf.len() <= PAGE_SIZE,
             "bucket of {} bytes (should have been paged)",
@@ -494,7 +518,11 @@ impl BucketRecord {
         ensure!(level <= L_MAX, "bucket level {level} above {L_MAX}");
         let index = r.u32()?;
         let bucket = r.u32()?;
-        let (base, last) = (first_block(level, index), last_block(level, index));
+        ensure!(
+            valid_first_block(level, index, base),
+            "bucket of slice ({level}, {index}) decoded from block {base}"
+        );
+        let last = last_block(level, index);
         let body = match r.u8()? {
             0 => {
                 let count = r.u32()?;
@@ -529,14 +557,17 @@ impl BucketRecord {
             level,
             index,
             bucket,
+            base,
             body,
         })
     }
 }
 
-/// A head feed update, or the origin (kind 6, 62 + 5·p bytes).
+/// A head feed update, or the origin (kind 6, 70 + 5·p bytes).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeadRecord {
+    /// `S`, the first unit the index covers (0: from genesis). The same in every head.
+    pub first_unit: u64,
     /// `N`, the number of complete units.
     pub units: u64,
     pub last_block_hash: B256,
@@ -556,6 +587,10 @@ fn pending_key(slice: &(u8, u32)) -> (u64, u8) {
 }
 
 impl HeadRecord {
+    pub fn first_block(&self) -> u64 {
+        self.first_unit * UNIT_BLOCKS
+    }
+
     pub fn last_block(&self) -> u64 {
         self.units * UNIT_BLOCKS - 1
     }
@@ -567,12 +602,25 @@ impl HeadRecord {
             self.units
         );
         assert!(
+            self.first_unit < self.units,
+            "head starting at unit {} with {} units",
+            self.first_unit,
+            self.units
+        );
+        assert!(
+            self.pending
+                .iter()
+                .all(|(level, index)| ((*index as u64 + 1) << level) > self.first_unit),
+            "a pending merge ends before the index starts"
+        );
+        assert!(
             self.pending
                 .windows(2)
                 .all(|w| pending_key(&w[0]) < pending_key(&w[1])),
             "pending merges not strictly ascending by (first unit, level)"
         );
         let mut w = Writer::new(KIND_HEAD);
+        w.u64(self.first_block());
         w.u64(self.units);
         w.u64(self.last_block());
         w.hash(&self.last_block_hash);
@@ -587,10 +635,20 @@ impl HeadRecord {
 
     pub fn decode(buf: &[u8]) -> Result<Self> {
         let mut r = Reader::new(buf, KIND_HEAD)?;
+        let first = r.u64()?;
+        ensure!(
+            first.is_multiple_of(UNIT_BLOCKS),
+            "head starting at block {first}, not at a unit boundary"
+        );
+        let first_unit = first / UNIT_BLOCKS;
         let units = r.u64()?;
         ensure!(
             (1..=MAX_UNITS).contains(&units),
             "head with {units} units (1..={MAX_UNITS})"
+        );
+        ensure!(
+            first_unit < units,
+            "head starting at unit {first_unit} with {units} units"
         );
         let last = r.u64()?;
         ensure!(
@@ -623,8 +681,15 @@ impl HeadRecord {
                 .all(|(level, index)| ((*index as u64 + 1) << level) <= units),
             "a pending merge ends after unit {units}"
         );
+        ensure!(
+            pending
+                .iter()
+                .all(|(level, index)| ((*index as u64 + 1) << level) > first_unit),
+            "a pending merge ends before the index starts at unit {first_unit}"
+        );
         r.finish()?;
         Ok(Self {
+            first_unit,
             units,
             last_block_hash,
             last_block_timestamp,
@@ -684,6 +749,7 @@ mod tests {
         let s = SliceRecord {
             level: 3,
             index: 2,
+            first_block: first_block(3, 2),
             last_block_hash: B256::repeat_byte(7),
             bucket_count: 5,
             addresses: 900,
@@ -694,12 +760,20 @@ mod tests {
         let enc = s.encode();
         assert_eq!(enc.len(), SliceRecord::LEN);
         assert_eq!(SliceRecord::decode(&enc).unwrap(), s);
+        // A slice the index's start falls into begins at that unit.
+        let held = SliceRecord {
+            first_block: held_first_block(3, 2, 19),
+            ..s.clone()
+        };
+        assert_eq!(held.first_block, 19 * UNIT_BLOCKS);
+        assert_eq!(SliceRecord::decode(&held.encode()).unwrap(), held);
 
         let base = first_block(3, 2);
         let b = BucketRecord {
             level: 3,
             index: 2,
             bucket: 4,
+            base,
             body: BucketBody::Inline(vec![
                 AddressRecord {
                     fp: [1; 8],
@@ -726,7 +800,10 @@ mod tests {
             enc.len(),
             BucketRecord::INLINE_HEADER + recs.iter().map(|r| r.encoded_len(base)).sum::<usize>()
         );
-        assert_eq!(BucketRecord::decode(&enc).unwrap(), b);
+        assert_eq!(BucketRecord::decode(&enc, base).unwrap(), b);
+        // Deltas are relative to the slice's first block: the same bytes read from another
+        // base are other blocks, or invalid.
+        assert_ne!(BucketRecord::decode(&enc, base + 64).ok(), Some(b.clone()));
 
         let paged = BucketRecord {
             body: BucketBody::Paged {
@@ -736,17 +813,23 @@ mod tests {
             },
             ..b
         };
-        assert_eq!(BucketRecord::decode(&paged.encode()).unwrap(), paged);
+        assert_eq!(BucketRecord::decode(&paged.encode(), base).unwrap(), paged);
 
         let h = HeadRecord {
+            first_unit: 0,
             units: 412_950,
             last_block_hash: B256::repeat_byte(5),
             last_block_timestamp: 1_800_000_000,
             pending: vec![(14, 24), (8, 1612)],
         };
         let enc = h.encode();
-        assert_eq!(enc.len(), 62 + 5 * 2);
+        assert_eq!(enc.len(), 70 + 5 * 2);
         assert_eq!(HeadRecord::decode(&enc).unwrap(), h);
+        let late = HeadRecord {
+            first_unit: 390_000,
+            ..h
+        };
+        assert_eq!(HeadRecord::decode(&late.encode()).unwrap(), late);
     }
 
     #[test]
@@ -760,6 +843,7 @@ mod tests {
             level: 0,
             index: 0,
             bucket: 0,
+            base: 0,
             body: BucketBody::Inline(records),
         };
         // Entries out of order, duplicated, or without roles.
@@ -786,17 +870,17 @@ mod tests {
         // Trailing bytes.
         let mut enc = bucket(vec![rec(vec![e(1, 1, 1)])]).encode();
         enc.push(0);
-        assert!(BucketRecord::decode(&enc).is_err());
+        assert!(BucketRecord::decode(&enc, 0).is_err());
         // Records out of fingerprint order.
         let mut a_rec = rec(vec![e(1, 1, 1)]);
         a_rec.fp = [9; 8];
         assert!(
-            BucketRecord::decode(&bucket(vec![a_rec, rec(vec![e(1, 1, 1)])]).encode()).is_err()
+            BucketRecord::decode(&bucket(vec![a_rec, rec(vec![e(1, 1, 1)])]).encode(), 0).is_err()
         );
         // An inline record that should have been spilled.
         let long: Vec<Entry> = (0..100).map(|i| e(i * 200, 1, 1)).collect();
         assert!(entries_len(&long, 0) > SPILL_INLINE_MAX);
-        assert!(BucketRecord::decode(&bucket(vec![rec(long)]).encode()).is_err());
+        assert!(BucketRecord::decode(&bucket(vec![rec(long)]).encode(), 0).is_err());
         // A spilled record with no entries; a paged bucket with no records.
         let spilled0 = AddressRecord {
             fp: [0; 8],
@@ -805,18 +889,19 @@ mod tests {
                 spill_ref: B256::ZERO,
             },
         };
-        assert!(BucketRecord::decode(&bucket(vec![spilled0]).encode()).is_err());
+        assert!(BucketRecord::decode(&bucket(vec![spilled0]).encode(), 0).is_err());
         let paged0 = BucketRecord {
             level: 0,
             index: 0,
             bucket: 0,
+            base: 0,
             body: BucketBody::Paged {
                 count: 0,
                 pages: 1,
                 pages_ref: B256::ZERO,
             },
         };
-        assert!(BucketRecord::decode(&paged0.encode()).is_err());
+        assert!(BucketRecord::decode(&paged0.encode(), 0).is_err());
         // An inline bucket over one chunk (it should have been paged): canonical but for its
         // size, so only the size check can reject it.
         let many: Vec<AddressRecord> = (0..400u64)
@@ -827,36 +912,54 @@ mod tests {
             .collect();
         let big = bucket(many).encode();
         assert!(big.len() > PAGE_SIZE);
-        assert!(BucketRecord::decode(&big).is_err());
+        assert!(BucketRecord::decode(&big, 0).is_err());
         // An entry after the slice's last block (slice (0, 0) ends at block 63).
-        assert!(BucketRecord::decode(&bucket(vec![rec(vec![e(64, 1, 1)])]).encode()).is_err());
+        assert!(BucketRecord::decode(&bucket(vec![rec(vec![e(64, 1, 1)])]).encode(), 0).is_err());
+        // A base outside the slice, or not at a unit boundary.
+        let one = bucket(vec![rec(vec![e(1, 1, 1)])]).encode();
+        assert!(BucketRecord::decode(&one, 64).is_err());
+        assert!(BucketRecord::decode(&one, 1).is_err());
         // More pages than records.
         let pages_over = BucketRecord {
             level: 0,
             index: 0,
             bucket: 0,
+            base: 0,
             body: BucketBody::Paged {
                 count: 2,
                 pages: 3,
                 pages_ref: B256::ZERO,
             },
         };
-        assert!(BucketRecord::decode(&pages_over.encode()).is_err());
+        assert!(BucketRecord::decode(&pages_over.encode(), 0).is_err());
         // Units beyond the format's bound, and a pending merge that ends after the head.
         let head = |units, pending| HeadRecord {
+            first_unit: 0,
             units,
             last_block_hash: B256::ZERO,
             last_block_timestamp: 0,
             pending,
         };
         let mut over = head(1, vec![]).encode();
-        over[5..13].copy_from_slice(&(MAX_UNITS + 1).to_be_bytes());
-        over[13..21].copy_from_slice(&((MAX_UNITS + 1) * UNIT_BLOCKS - 1).to_be_bytes());
+        over[13..21].copy_from_slice(&(MAX_UNITS + 1).to_be_bytes());
+        over[21..29].copy_from_slice(&((MAX_UNITS + 1) * UNIT_BLOCKS - 1).to_be_bytes());
         assert!(HeadRecord::decode(&over).is_err());
         assert!(HeadRecord::decode(&head(3, vec![(2, 0)]).encode()).is_err());
+        // A start off a unit boundary, at or after the head's units, or after a pending merge.
+        let start = |first: u64, units: u64, pending: Vec<(u8, u32)>| {
+            let mut h = head(units, pending).encode();
+            h[5..13].copy_from_slice(&first.to_be_bytes());
+            h
+        };
+        assert!(HeadRecord::decode(&start(64 * 5, 10, vec![])).is_ok());
+        assert!(HeadRecord::decode(&start(64 * 5 + 1, 10, vec![])).is_err());
+        assert!(HeadRecord::decode(&start(64 * 10, 10, vec![])).is_err());
+        assert!(HeadRecord::decode(&start(64 * 4, 10, vec![(1, 1)])).is_err());
+        assert!(HeadRecord::decode(&start(64 * 3, 10, vec![(1, 1)])).is_ok());
         // A head with a level-0 or out-of-range pending merge.
         for level in [0u8, 17, 200] {
             let mut h = HeadRecord {
+                first_unit: 0,
                 units: 10,
                 last_block_hash: B256::ZERO,
                 last_block_timestamp: 0,
@@ -871,6 +974,7 @@ mod tests {
         let mut s = SliceRecord {
             level: 0,
             index: 1,
+            first_block: 64,
             last_block_hash: B256::ZERO,
             bucket_count: 1,
             addresses: 0,
@@ -879,7 +983,10 @@ mod tests {
             roles: 0,
         }
         .encode();
-        s[14] ^= 1; // first_block
+        s[21] ^= 1; // first_block, off a unit boundary
+        assert!(SliceRecord::decode(&s).is_err());
+        s[21] ^= 1;
+        s[21] ^= 64; // first_block 0, before the slice
         assert!(SliceRecord::decode(&s).is_err());
     }
 
@@ -888,6 +995,7 @@ mod tests {
     #[test]
     fn nested_pending_merges() {
         let h = HeadRecord {
+            first_unit: 0,
             units: 4,
             last_block_hash: B256::ZERO,
             last_block_timestamp: 0,
@@ -911,6 +1019,7 @@ mod tests {
     #[should_panic(expected = "strictly ascending")]
     fn encoding_unordered_pending_panics() {
         HeadRecord {
+            first_unit: 0,
             units: 4,
             last_block_hash: B256::ZERO,
             last_block_timestamp: 0,
@@ -928,6 +1037,7 @@ mod tests {
             level: 1,
             index: 3,
             bucket: 2,
+            base,
             body: BucketBody::Inline(vec![
                 AddressRecord {
                     fp: [0x11; 8],
@@ -954,6 +1064,7 @@ mod tests {
         let slice = SliceRecord {
             level: 1,
             index: 3,
+            first_block: base,
             last_block_hash: B256::repeat_byte(0xcd),
             bucket_count: 3,
             addresses: 2,
@@ -963,18 +1074,44 @@ mod tests {
         };
         assert_eq!(hex::encode(slice.encode()), SLICE_HEX);
         let head = HeadRecord {
+            first_unit: 0,
             units: 8,
             last_block_hash: B256::repeat_byte(0x01),
             last_block_timestamp: 0x6000_0000,
             pending: vec![(2, 1)],
         };
         assert_eq!(hex::encode(head.encode()), HEAD_HEX);
+        // An index from unit 7 (block 448): the start in the head, the slice the start falls
+        // into from there, and its entries' deltas from that block.
+        let late = HeadRecord {
+            first_unit: 7,
+            ..head
+        };
+        assert_eq!(hex::encode(late.encode()), HEAD_LATE_HEX);
+        let held = SliceRecord {
+            first_block: held_first_block(1, 3, 7),
+            ..slice
+        };
+        assert_eq!(hex::encode(held.encode()), SLICE_LATE_HEX);
+        let held_bucket = BucketRecord {
+            base: held.first_block,
+            body: BucketBody::Inline(vec![AddressRecord {
+                fp: [0x11; 8],
+                entries: Entries::Inline(vec![e(450, 1, 0x01), e(500, 300, 0x18)]),
+            }]),
+            ..bucket
+        };
+        assert_eq!(hex::encode(held_bucket.encode()), BUCKET_LATE_HEX);
     }
 
     const BUCKET_HEX: &str = "453253010501000000030000000200000000021111111111111111040001018201ac021822222222222222228d01abababababababababababababababababababababababababababababababab";
     const SPILL_HEX: &str = "000300001388000240000901640040";
     const SLICE_HEX: &str = "4532530104000000400100000003000000000000018000000000000001ffcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd00000003000000020000000000000048efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefdf";
-    const HEAD_HEX: &str = "4532530106000000000000000800000000000001ff01010101010101010101010101010101010101010101010101010101010101010000000060000000010200000001";
+    const HEAD_LATE_HEX: &str = "453253010600000000000001c0000000000000000800000000000001ff01010101010101010101010101010101010101010101010101010101010101010000000060000000010200000001";
+    const SLICE_LATE_HEX: &str = "453253010400000040010000000300000000000001c000000000000001ffcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd00000003000000020000000000000048efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefdf";
+    const BUCKET_LATE_HEX: &str =
+        "4532530105010000000300000002000000000111111111111111110402010132ac0218";
+    const HEAD_HEX: &str = "45325301060000000000000000000000000000000800000000000001ff01010101010101010101010101010101010101010101010101010101010101010000000060000000010200000001";
 
     #[test]
     fn spill_pages() {
