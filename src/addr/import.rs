@@ -22,14 +22,16 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use super::build::{Output, SliceBuilder};
 use super::detect::role;
 use super::export::{self, ExportLog, ExportMeta};
-use super::fetch::{FetchedSlice, fetch_slice};
+use super::fetch::fetch_appearances;
 use super::io::{join_one, write_atomic};
 use super::layout::{
-    HeadRecord, L_MAX, MAX_UNITS, UNIT_BLOCKS, bucket_id, first_block, head_id, origin_id, slice_id,
+    HeadRecord, L_MAX, MAX_UNITS, UNIT_BLOCKS, bucket_id, first_block, head_id, held_first_block,
+    last_block, origin_id, slice_id,
 };
-use super::slice::{BuiltSlice, SliceId, cover, held, held_level, new_slice, resolve_after, units};
+use super::slice::{SliceId, cover, held, held_level, new_slice, resolve_after, units};
 use crate::swarm::{bee::Bee, soc};
 
 /// Name of the state file in the state directory.
@@ -258,9 +260,13 @@ pub struct ImportOptions {
     pub out: Option<PathBuf>,
     /// Merges of this level and above are built in the background.
     pub defer_level: u8,
-    /// Highest level built in memory (part 4b of #8 lifts this limit).
+    /// Highest slice level the importer builds (a cap on the work one slice may take).
     pub max_level: u8,
     pub concurrency: usize,
+    /// Where slices keep their sort runs (default: `sort` in the state directory).
+    pub sort_dir: Option<PathBuf>,
+    /// Bytes of one sort buffer.
+    pub sort_buffer: usize,
 }
 
 /// Where the importer's records go: a Bee node, or an export directory's log, written in
@@ -288,88 +294,137 @@ struct Ctx<P> {
     traces: bool,
     max_level: u8,
     concurrency: usize,
+    /// Where slices keep their sort runs while they are built.
+    sort_dir: PathBuf,
+    /// Bytes of one sort buffer (a background merge and a unit can each hold one).
+    sort_buffer: usize,
+}
+
+/// The last block of a published slice.
+struct Published {
+    last_hash: B256,
+    last_timestamp: u64,
 }
 
 impl<P: Provider + Clone + 'static> Ctx<P> {
-    async fn fetch(&self, slice: SliceId, parent: Option<B256>) -> Result<FetchedSlice> {
+    /// Builds slice `slice` and publishes it as it is built: its blocks go into a
+    /// [`SliceBuilder`] (sort runs on disk under the sort directory), then every file and
+    /// bucket goes to the sink as it is made, the descriptor last. With `parent`, the slice's
+    /// first block must be its child; with `end`, its last block must be that one. Both are
+    /// checked before anything is published.
+    async fn publish(
+        &self,
+        slice: SliceId,
+        parent: Option<B256>,
+        end: Option<B256>,
+    ) -> Result<Published> {
         check_level(slice, self.first_unit, self.max_level)?;
-        fetch_slice(
-            &self.provider,
+        let (level, index) = slice;
+        let mut builder = SliceBuilder::new(
             slice,
             self.first_unit,
+            role::mask(self.traces),
+            &self.sort_dir,
+            self.sort_buffer,
+        )?;
+        let (first, last) = (
+            held_first_block(level, index, self.first_unit),
+            last_block(level, index),
+        );
+        let (mut first_parent, mut last_hash, mut last_timestamp) = (None, B256::ZERO, 0);
+        fetch_appearances(
+            &self.provider,
+            first..=last,
             self.traces,
             self.concurrency,
-            parent,
+            |b| {
+                first_parent.get_or_insert(b.parent_hash);
+                last_hash = b.hash;
+                last_timestamp = b.timestamp;
+                b.appearances.iter().try_for_each(|a| builder.push(a))
+            },
         )
-        .await
-    }
+        .await?;
+        if let (Some(expected), Some(got)) = (parent, first_parent) {
+            ensure!(
+                got == expected,
+                "slice ({level}, {index}): block {first}'s parent is {got}, not the published \
+                 {expected} (reorg or another chain?)"
+            );
+        }
+        if let Some(end) = end {
+            ensure!(
+                last_hash == end,
+                "slice ({level}, {index}) ends in block {last_hash}, not the published {end}"
+            );
+        }
 
-    /// Uploads a built slice: files first, then the buckets, the descriptor last. Every SOC is
-    /// signed here, once, whichever the sink.
-    async fn upload_slice(&self, built: &BuiltSlice) -> Result<()> {
-        let (level, index) = (built.record.level, built.record.index);
-        let buckets = built
-            .buckets
-            .iter()
-            .enumerate()
-            .map(|(k, payload)| {
-                let id = bucket_id(self.chain_id, level, index, k as u32);
-                soc::sign(&self.signer, id, payload.clone())
+        // The build runs on a blocking thread and hands out files and buckets through a
+        // channel; they are signed and sent here as they come.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Output>(256);
+        let build = tokio::task::spawn_blocking(move || {
+            builder.finish(last_hash, None, &mut |out| {
+                tx.blocking_send(out)
+                    .map_err(|_| anyhow::anyhow!("publishing stopped"))
             })
-            .collect::<Result<Vec<_>>>()?;
-        let descriptor = soc::sign(
-            &self.signer,
-            slice_id(self.chain_id, level, index),
-            built.record.encode(),
-        )?;
+        });
         let owner = self.signer.address();
-        let (bee, batch) = match &self.sink {
-            Sink::Bee { bee, batch } => (bee, *batch),
-            Sink::Dir(log) => {
-                let mut log = lock(log)?;
-                for (reference, file) in &built.files {
-                    log.append(export::FILE, reference, file)?;
-                }
-                for soc in buckets.iter().chain([&descriptor]) {
-                    log.append_soc(export::SOC, &owner, soc)?;
-                }
-                return Ok(());
-            }
-        };
         let mut set = tokio::task::JoinSet::new();
         let limit = self.concurrency.max(1);
-        for (reference, file) in &built.files {
-            if set.len() >= limit {
-                join_one(&mut set).await?;
+        while let Some(out) = rx.recv().await {
+            match (&self.sink, out) {
+                (Sink::Dir(log), Output::File(reference, file)) => {
+                    lock(log)?.append(export::FILE, &reference, &file)?
+                }
+                (Sink::Dir(log), Output::Bucket(k, payload)) => {
+                    let soc = soc::sign(
+                        &self.signer,
+                        bucket_id(self.chain_id, level, index, k),
+                        payload,
+                    )?;
+                    lock(log)?.append_soc(export::SOC, &owner, &soc)?
+                }
+                (Sink::Bee { bee, batch }, out) => {
+                    if set.len() >= limit {
+                        join_one(&mut set).await?;
+                    }
+                    let (bee, batch) = (bee.clone(), *batch);
+                    match out {
+                        Output::File(reference, file) => set.spawn(async move {
+                            let got = bee.upload_file(&batch, file).await?;
+                            ensure!(
+                                got == reference,
+                                "Bee stored a file under {got}, the bucket names {reference}"
+                            );
+                            Ok(())
+                        }),
+                        Output::Bucket(k, payload) => {
+                            let id = bucket_id(self.chain_id, level, index, k);
+                            let soc = soc::sign(&self.signer, id, payload)?;
+                            set.spawn(async move {
+                                bee.upload_soc(&batch, &owner, &soc).await?;
+                                Ok(())
+                            })
+                        }
+                    };
+                }
             }
-            let (bee, file, reference) = (bee.clone(), file.clone(), *reference);
-            set.spawn(async move {
-                let got = bee.upload_file(&batch, file).await?;
-                ensure!(
-                    got == reference,
-                    "Bee stored a file under {got}, the bucket names {reference}"
-                );
-                Ok(())
-            });
         }
+        let built = build.await.context("slice build panicked")??;
         while !set.is_empty() {
             join_one(&mut set).await?;
         }
-        for soc in buckets {
-            if set.len() >= limit {
-                join_one(&mut set).await?;
-            }
-            let bee = bee.clone();
-            set.spawn(async move {
-                bee.upload_soc(&batch, &owner, &soc).await?;
-                Ok(())
-            });
-        }
-        while !set.is_empty() {
-            join_one(&mut set).await?;
-        }
-        bee.upload_soc(&batch, &owner, &descriptor).await?;
-        Ok(())
+        // The descriptor last: once it is there, the slice is complete.
+        self.upload_soc(
+            export::SOC,
+            slice_id(self.chain_id, level, index),
+            built.record.encode(),
+        )
+        .await?;
+        Ok(Published {
+            last_hash,
+            last_timestamp,
+        })
     }
 
     /// Uploads one SOC; `kind` says, for an export, whether it is a head ([`export::HEAD`]).
@@ -433,29 +488,42 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
     /// Builds and uploads a deferred merge. It must continue the published chain (`before`,
     /// the hash of the unit before it) and end on it (`end`, the hash of its last unit).
     async fn merge(&self, slice: SliceId, end: B256, before: Option<B256>) -> Result<SliceId> {
-        let f = self.fetch(slice, before).await?;
-        ensure!(
-            f.last_hash == end,
-            "merge ({}, {}) ends in block {}, not the published {end}",
-            slice.0,
-            slice.1,
-            f.last_hash
-        );
-        self.upload_slice(&f.built).await?;
+        self.publish(slice, before, Some(end)).await?;
         info!(level = slice.0, index = slice.1, "deferred merge uploaded");
         Ok(slice)
     }
 }
 
-/// A slice is built in memory only up to `max_level`, measured by what it holds
-/// ([`held_level`]): the slice a later start falls into holds less than its grid level.
+/// The sort directory of this run, emptied of what a stopped run left there (the runs of a
+/// slice are removed when it is built, so anything there is from a run that did not finish).
+fn sort_dir(opts: &ImportOptions) -> Result<PathBuf> {
+    let dir = opts
+        .sort_dir
+        .clone()
+        .unwrap_or_else(|| opts.state_dir.join("sort"));
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    for entry in std::fs::read_dir(&dir)? {
+        let path = entry?.path();
+        let stale = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("slice-"));
+        if stale {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("removing {}", path.display()))?;
+        }
+    }
+    Ok(dir)
+}
+
+/// A slice is built only up to `max_level`, measured by what it holds ([`held_level`]): the
+/// slice a later start falls into holds less than its grid level. Memory is bounded at any
+/// level; the cap bounds the time and the temporary disk one slice takes.
 fn check_level(slice: SliceId, first_unit: u64, max_level: u8) -> Result<()> {
     let level = held_level(slice, first_unit);
     ensure!(
         level <= max_level,
-        "slice ({}, {}) holds {} units (level {level}), above --max-level {max_level}: \
-         building it in memory would need too much memory (external-memory building is part \
-         4b of #8)",
+        "slice ({}, {}) holds {} units (level {level}), above --max-level {max_level}",
         slice.0,
         slice.1,
         held(slice, first_unit).count()
@@ -656,6 +724,13 @@ where
         traces: opts.traces,
         max_level: opts.max_level,
         concurrency: opts.concurrency,
+        sort_dir: sort_dir(&opts)?,
+        // Test hook: a tiny buffer makes even a dev chain's slices take many runs and merge
+        // rounds (`scripts/e2e-bee-factory.sh`).
+        sort_buffer: std::env::var("ETH2SWARM_ADDR_SORT_BUFFER_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(opts.sort_buffer),
     };
 
     let mut state = match existing {
@@ -773,8 +848,7 @@ async fn import_unit<P: Provider + Clone + 'static>(
             .with_context(|| format!("publishing unit {}", n - 1))?;
     }
     let parent = state.parent_of(held(now, state.first_unit).start)?;
-    let f = ctx.fetch(now, parent).await?;
-    ctx.upload_slice(&f.built).await?;
+    let f = ctx.publish(now, parent, None).await?;
     state.unit_hashes.insert(n - 1, f.last_hash);
     if let Some(merge) = deferred {
         // Backpressure: not more than MAX_PENDING_MERGES listed at a time.
@@ -843,8 +917,7 @@ async fn backfill<P: Provider + Clone + 'static>(
     let (mut parent, mut last) = (None, None);
     for s in slices {
         info!(level = s.0, index = s.1, "backfill");
-        let f = ctx.fetch(s, parent).await?;
-        ctx.upload_slice(&f.built).await?;
+        let f = ctx.publish(s, parent, None).await?;
         failpoint("backfill-slice")?;
         parent = Some(f.last_hash);
         state.unit_hashes.insert(units(s).end - 1, f.last_hash);

@@ -194,6 +194,7 @@ impl AddressRecord {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn encoded_len(&self, base: u64) -> usize {
         8 + match &self.entries {
             Entries::Inline(e) => varint_len((e.len() as u64) << 1) + entries_len(e, base),
@@ -202,7 +203,7 @@ impl AddressRecord {
     }
 
     /// Decodes a record of a slice whose blocks are `base..=last`.
-    fn decode(buf: &mut &[u8], base: u64, last: u64) -> Result<Self> {
+    pub fn decode(buf: &mut &[u8], base: u64, last: u64) -> Result<Self> {
         ensure!(buf.len() >= 8, "address record truncated");
         let fp: [u8; 8] = buf[..8].try_into()?;
         *buf = &buf[8..];

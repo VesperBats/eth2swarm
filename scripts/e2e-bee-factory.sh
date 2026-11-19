@@ -223,8 +223,10 @@ EXP_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
 EXP_STATE=$(mktemp -d)
 EXP_DIR=$(mktemp -d)/export
 # No Bee node: the export must not need one (port 9 refuses connections).
+# A sort buffer of four appearances: every slice is built from many runs on disk, merged in
+# rounds, and must still match the in-memory build (slice (2, 0) below).
 exp_import() {
-  $BIN --bee http://127.0.0.1:9 addr-import --key "$EXP_KEY" --state "$EXP_STATE" \
+  ETH2SWARM_ADDR_SORT_BUFFER_BYTES=180 $BIN --bee http://127.0.0.1:9 addr-import --key "$EXP_KEY" --state "$EXP_STATE" \
     --out "$EXP_DIR" --defer-level 1 "${TRACE_FLAG[@]}" "$@"
 }
 exp_upload() { $BIN --bee "$UPLOAD_BEE" addr-upload "$EXP_DIR" "$@"; }
@@ -392,7 +394,7 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   LATE_STATE=$(mktemp -d)
   LATE_DIR=$(mktemp -d)/export
   # Exported and uploaded later: this index has spill files, so files take that path too.
-  OUT=$($BIN --bee http://127.0.0.1:9 addr-import --key "$LATE_KEY" --state "$LATE_STATE" --init \
+  OUT=$(ETH2SWARM_ADDR_SORT_BUFFER_BYTES=180 $BIN --bee http://127.0.0.1:9 addr-import --key "$LATE_KEY" --state "$LATE_STATE" --init \
     --from-block "$LATE_FROM" --units "$ACT_UNITS" --max-level 16 --out "$LATE_DIR" "${TRACE_FLAG[@]}") \
     || { echo "FAIL: addr-import --from-block $LATE_FROM --out"; exit 1; }
   LATE_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')

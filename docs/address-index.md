@@ -10,10 +10,9 @@ genesis (`addr-import --from-block`, *Starting at a later block*), and an import
 written to a directory and uploaded later (`--out`, `addr-upload`). `ethswarm devnet-activity` generates test traffic on
 a dev chain. The client reads every slice and whole spill and pages files; steps 3–5 of
 *Client lookup* (page search, last page first, stopping when the screen is full) and the
-time-based head estimate are not implemented. Still open:
-building the large levels of a mainnet import from disk (the importer builds in memory up to
-`--max-level`, 8 by default), postage batches grouped by lifetime (*Lifetime* below; one
-`--batch` so far), and re-measuring with traces. Design issue: #5.
+time-based head estimate are not implemented. Slices of any level are built with bounded
+memory (*Building large slices*). Still open: postage batches grouped by lifetime (*Lifetime*
+below; one `--batch` so far), and re-measuring with traces. Design issue: #5.
 
 An index from an **address** to the transactions it **appears in**, stored on Swarm next to
 the [SOC block store](soc-block-store.md). A mobile wallet uses it to list an address's
@@ -235,6 +234,28 @@ slices are written for every index.
 publishes the head (below) with `N`. A lower level `L` gets a slice for one unit in
 `2^(L+1)`. Over its life a block is uploaded about 9 times: in about half of levels 0–15,
 and once at level 16.
+
+**Building large slices.** A slice can only be written once it is complete: its records
+group each address's entries from all of its blocks, and its bucket count depends on the
+size of all its records. A top-level slice holds billions of appearances, and published
+buckets carry fingerprints, not addresses, so a merge cannot be made from the slices it
+replaces: it is built from the blocks again. The importer does that with bounded memory
+(`src/addr/build.rs`), and the result is byte for byte the slice an in-memory build gives:
+
+1. Each appearance becomes a 45-byte item `h[0..12] ‖ address ‖ block ‖ slot ‖ roles`,
+   whose byte order is the order needed. Full sort buffers are sorted and written to disk as
+   runs (`--sort-memory-mb`, 512 by default, in `--sort-dir`).
+2. A merge of the runs yields each address's entries together, in hash order. Each address
+   becomes its record (spill files are handed out as they are made), written to a spool.
+   Only now is the total size known, and with it `B`.
+3. One pass over the spool makes the buckets in order: `(h[0..4] · B) >> 32` never decreases
+   along it, so a bucket's records are consecutive; they are ordered by (fingerprint,
+   address), encoded, paged if needed, and published at once. The descriptor goes last.
+
+Memory is the sort buffer, one bucket and the entries of the busiest address; temporary disk
+is about 45 bytes per appearance of the slice being built, plus its records. Measured on
+synthetic data: 100 M appearances (about a week of mainnet) in one slice with a 64 MB buffer
+peaked at 91 MiB and took 95 s, against about 10 GB in memory before.
 
 **Large merges in the background.** The new slice cannot be prepared ahead (its buckets
 depend on the last unit), and it can be large: about 60 K chunks at level 8, 1 M at level 12,
