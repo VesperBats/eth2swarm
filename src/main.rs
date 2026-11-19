@@ -284,13 +284,16 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8090")]
         listen: std::net::SocketAddr,
         /// Listen on this machine's Tailscale IPv4 address instead (the port from --listen),
-        /// reachable only from the tailnet, and accept its MagicDNS name as Host.
+        /// not on the LAN or loopback addresses, and accept its MagicDNS name as Host. On
+        /// Linux a host on the same LAN can still route to that address unless a host firewall
+        /// drops it: the bind alone does not make the UI tailnet-only.
         #[arg(long)]
         tailscale: bool,
-        /// Further host names or IP addresses the UI is opened by (repeatable, without a
-        /// port), e.g. a DNS name of this machine or the address of a port forward. The
-        /// address listened on needs no entry, nor does any IP address when listening on
-        /// every address; unknown names are refused (DNS rebinding).
+        /// Further hosts the UI is opened by (repeatable), as `name`, `name:port`, `ip` or
+        /// `ip:port`: a DNS name of this machine, a port forward (`localhost:9000` for
+        /// `ssh -L 9000:…`), a proxy (`name:443`). The port defaults to the listen port. The
+        /// address listened on needs no entry, nor does any IP address on the listen port when
+        /// listening on every address; unknown names are refused (DNS rebinding).
         #[arg(long = "allow-host")]
         allow_hosts: Vec<String>,
         /// Nodes to read from, as `name=url` (repeatable). Defaults to antd on :1733 and the

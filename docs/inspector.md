@@ -84,18 +84,32 @@ antd --network-id 1337 --api-addr 127.0.0.1:1733 --allow-private-dials --no-disk
 
 Peer IDs: `curl -s localhost:1633/addresses` (use the `/ip4/127.0.0.1/…` underlay).
 
+## Opening it from another machine
+
 The UI has no authentication. It listens on `127.0.0.1:8090` by default and warns when it
 listens anywhere else. To open it from another machine:
 
 ```sh
-cargo run -- serve --tailscale        # this machine's Tailscale IPv4, port 8090: tailnet only
+cargo run -- serve --tailscale        # this machine's Tailscale IPv4, port 8090
 cargo run -- serve --listen 0.0.0.0:8090   # every address (LAN included)
 ```
 
-`--tailscale` also accepts the machine's MagicDNS name (`http://<host>.<tailnet>.ts.net:8090/`);
-when `tailscale status` gives none, the inspector says so at startup and accepts only the IP.
-Requests are answered only for a `Host` header that is an IP address (the listen address, a
-loopback address, any when listening on `0.0.0.0`, or one given with `--allow-host`, e.g. a
-port forward's), a loopback name, or a name given with `--allow-host` (without a port: the
-port is always the one listened on); other names are rejected, which keeps a web page from
-reaching the inspector through a DNS name it controls (DNS rebinding).
+`--tailscale` listens on the Tailscale address only, not on the LAN or loopback addresses.
+That alone does not make it tailnet-only: Linux accepts a packet for any of its addresses on
+any interface, so a host on the same LAN can add a route to the Tailscale address via this
+machine and reach the port. Tailscale's ACLs do not see that path; a host firewall that drops
+traffic to the port from anything but `tailscale0` closes it.
+
+`--tailscale` also accepts the machine's full MagicDNS name
+(`http://<host>.<tailnet>.ts.net:8090/`); when `tailscale status` gives none, the inspector
+says so at startup and accepts only the IP. The short host name, which most tailnets resolve
+too, is not accepted unless given with `--allow-host <host>`.
+
+Requests are answered only for a `Host` header that is, on the listen port, the listen
+address, a loopback address or `localhost` (any IP address when listening on `0.0.0.0`), or
+one given with `--allow-host` on its own port: `name`, `name:port`, `ip` or `ip:port`, the
+port defaulting to the listen port. A port forward or proxy on another port needs its entry,
+e.g. `--allow-host localhost:9000` for `ssh -L 9000:127.0.0.1:8090`, or `--allow-host
+inspector.example:443` for a TLS proxy that passes the `Host` on (a `Host` without a port
+matches an entry on 80 or 443). Other names are rejected, which keeps a web page from reaching
+the inspector through a DNS name it controls (DNS rebinding).

@@ -337,7 +337,7 @@ const runners = {
     const a = $('addrA').value.trim();
     // A slice, bucket or spill view opened by a link or the URL; a lookup from the form
     // clears it.
-    const sub = /^(slice|bucket|spill|examples):/.test(addrView) ? addrView
+    const sub = /^((slice|bucket|spill):|examples(:|$))/.test(addrView) ? addrView
       : a ? `lookup:${a}:${$('addrUnits').value}:${$('addrSince').value}` : `index:${$('addrUnits').value}:${$('addrSince').value}`;
     setHash('addr', sub); busy('out-addr');
     const parts = sub.split(':');

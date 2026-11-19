@@ -9,9 +9,7 @@ use crate::addr::detect::role;
 use crate::addr::layout::{
     AddressRecord, BucketBody, BucketRecord, Entries, Entry, HeadRecord, SliceRecord,
 };
-use crate::addr::lookup::{
-    CONCURRENCY, address_records, lookup as addr_lookup, newest_head_by_probing, read_plan,
-};
+use crate::addr::lookup::{CONCURRENCY, lookup as addr_lookup, newest_head_by_probing, read_plan};
 use crate::addr::slice::{SliceId, bucket_of, fingerprint, held};
 use crate::addr::verify::IndexReader;
 use crate::chain::{Body, check_body, header_field_count};
@@ -154,40 +152,40 @@ pub async fn serve(
 pub struct HostPolicy {
     port: u16,
     listen_ip: std::net::IpAddr,
-    /// Further IP addresses the UI is opened by (a port forward, a proxy).
-    ips: Vec<std::net::IpAddr>,
-    names: Vec<String>,
+    /// Hosts allowed explicitly (`--allow-host`, the MagicDNS name), lowercase, with the port
+    /// they are opened on: the listen port unless given (a port forward or a proxy).
+    extra: Vec<(String, u16)>,
 }
 
 impl HostPolicy {
     /// The policy for a server bound to `listen`, accepting `extra` too: host names or IP
-    /// addresses, without a port (the port is always the listen port).
+    /// addresses, each with the port it is opened on (`name:port`, `[v6]:port`; the listen
+    /// port when left out).
     pub fn new(listen: SocketAddr, extra: &[String]) -> Result<Self> {
-        let mut names: Vec<String> = ["localhost".to_string()].into();
-        let mut ips = Vec::new();
+        let mut allowed = Vec::new();
         for h in extra {
             let h = h.trim();
-            let bare = h
-                .strip_prefix('[')
-                .and_then(|v| v.strip_suffix(']'))
-                .unwrap_or(h);
-            if let Ok(ip) = bare.parse() {
-                ips.push(ip);
-                continue;
-            }
+            // A bare IPv6 address has colons of its own.
+            let (name, port) = match h.parse::<std::net::IpAddr>() {
+                Ok(_) => (h, None),
+                Err(_) => split_host(h)
+                    .with_context(|| format!("--allow-host {h:?}: a host and an optional port"))?,
+            };
+            let name = canonical(name);
             anyhow::ensure!(
-                !h.is_empty()
-                    && h.chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "-.".contains(c)),
-                "--allow-host {h:?}: a host name or IP address, without a port"
+                name.parse::<std::net::IpAddr>().is_ok()
+                    || (!name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "-.".contains(c))),
+                "--allow-host {h:?}: not a host name or IP address"
             );
-            names.push(h.trim_end_matches('.').to_ascii_lowercase());
+            allowed.push((name, port.unwrap_or(listen.port())));
         }
         Ok(Self {
             port: listen.port(),
             listen_ip: listen.ip(),
-            ips,
-            names,
+            extra: allowed,
         })
     }
 
@@ -196,22 +194,30 @@ impl HostPolicy {
         let Some((name, port)) = split_host(host) else {
             return false;
         };
-        // A missing port is the scheme's default, which is ours only on port 80.
-        if port.unwrap_or(80) != self.port {
+        let name = canonical(name);
+        // A missing port is the scheme's default: 80, or 443 behind a TLS proxy.
+        let on = |p: u16| port.map_or(p == 80 || p == 443, |q| q == p);
+        // Explicit entries, on their own port.
+        if self.extra.iter().any(|(n, p)| *n == name && on(*p)) {
+            return true;
+        }
+        // Otherwise only on the listen port: the listen address, loopback, any IP literal
+        // when listening on every address, and `localhost`.
+        if !on(self.port) {
             return false;
         }
         match name.parse::<std::net::IpAddr>() {
-            Ok(ip) => {
-                ip.is_loopback()
-                    || ip == self.listen_ip
-                    || self.listen_ip.is_unspecified()
-                    || self.ips.contains(&ip)
-            }
-            Err(_) => {
-                let name = name.trim_end_matches('.').to_ascii_lowercase();
-                self.names.contains(&name)
-            }
+            Ok(ip) => ip.is_loopback() || ip == self.listen_ip || self.listen_ip.is_unspecified(),
+            Err(_) => name == "localhost",
         }
+    }
+}
+
+/// A host as compared: lowercase, without a trailing dot, an IP address in its standard form.
+fn canonical(name: &str) -> String {
+    match name.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => name.trim_end_matches('.').to_ascii_lowercase(),
     }
 }
 
@@ -271,15 +277,20 @@ pub fn tailscale_identity() -> Result<(std::net::IpAddr, Option<String>)> {
         .output()
         .context("running `tailscale status --self --json`")
         .and_then(|o| {
-            anyhow::ensure!(o.status.success(), "it failed");
-            serde_json::from_slice::<Value>(&o.stdout).context("its output is not JSON")
+            anyhow::ensure!(
+                o.status.success(),
+                "`tailscale status --self --json` failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            serde_json::from_slice::<Value>(&o.stdout)
+                .context("`tailscale status --self --json` printed no JSON")
         })
         .and_then(|v| {
             v["Self"]["DNSName"]
                 .as_str()
                 .map(|s| s.trim_end_matches('.').to_string())
                 .filter(|s| !s.is_empty())
-                .context("it names no MagicDNS name (is MagicDNS on?)")
+                .context("`tailscale status` names no MagicDNS name (is MagicDNS on?)")
         });
     let name = match name {
         Ok(n) => Some(n),
@@ -935,6 +946,14 @@ async fn addr_examples_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
         let (r, origin) = index_origin(st, &q, &p).await?;
         let (head, index) = index_head(st, &q, &r, &origin, &p).await?;
         out["index"] = index;
+        let examples: Vec<(Address, &str)> = example_addresses(r.chain_id)
+            .iter()
+            .map(|(a, label)| Ok((a.parse()?, *label)))
+            .collect::<Result<_>>()?;
+        out["examples"] = json!([]);
+        if examples.is_empty() {
+            return Ok(());
+        }
         let (slices, _) = read_plan(&head, None)?;
         let first_unit = head.first_unit;
         let reads: Vec<_> = slices
@@ -945,46 +964,62 @@ async fn addr_examples_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
             })
             .collect();
         let descriptors = bounded(reads)
-            .await
+            .await?
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
-        let descriptors = Arc::new(descriptors);
-        let examples = example_addresses(r.chain_id);
-        // One job per address and slice; an address whose bucket cannot be read gets an
-        // error of its own, the others are still counted.
-        let mut jobs = Vec::new();
-        for (a, _) in examples {
-            let address: Address = a.parse().expect("example addresses are valid");
-            let h = keccak256(address.as_slice());
-            for i in 0..descriptors.len() {
-                let (r, descriptors) = (r.clone(), descriptors.clone());
-                jobs.push(async move {
-                    let (records, _) = address_records(&r, &descriptors[i], &h).await?;
-                    Ok::<u64, anyhow::Error>(
-                        records
-                            .iter()
-                            .map(|x| match &x.entries {
-                                Entries::Inline(e) => e.len() as u64,
-                                Entries::Spilled { count, .. } => *count,
-                            })
-                            .sum(),
-                    )
-                });
-            }
-        }
-        let counts = bounded(jobs).await;
-        let n = descriptors.len();
-        let rows: Vec<Value> = examples
+        // Each distinct (slice, bucket) the addresses fall into is read once; an address whose
+        // bucket cannot be read gets the error, the others are still counted.
+        let hashes: Vec<B256> = examples
+            .iter()
+            .map(|(a, _)| keccak256(a.as_slice()))
+            .collect();
+        let mut wanted: Vec<(usize, u32)> = descriptors
             .iter()
             .enumerate()
-            .map(|(k, (a, label))| {
-                let mine = &counts[k * n..(k + 1) * n];
-                match mine.iter().find_map(|c| c.as_ref().err()) {
-                    Some(e) => json!({ "address": a, "label": label, "entries": null,
-                                       "error": format!("{e:#}") }),
-                    None => json!({ "address": a, "label": label,
-                                    "entries": mine.iter().flatten().sum::<u64>() }),
+            .flat_map(|(i, rec)| {
+                hashes
+                    .iter()
+                    .map(move |h| (i, bucket_of(h, rec.bucket_count)))
+            })
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+        let descriptors = Arc::new(descriptors);
+        let reads: Vec<_> = wanted
+            .iter()
+            .map(|&(i, k)| {
+                let (r, descriptors) = (r.clone(), descriptors.clone());
+                async move {
+                    let (_, records, _) = r.bucket_records(&descriptors[i], k).await?;
+                    Ok::<_, anyhow::Error>(records)
                 }
+            })
+            .collect();
+        let buckets: std::collections::HashMap<(usize, u32), Result<Vec<AddressRecord>>> =
+            wanted.into_iter().zip(bounded(reads).await?).collect();
+        let rows: Vec<Value> = examples
+            .iter()
+            .zip(&hashes)
+            .map(|((a, label), h)| {
+                let fp = fingerprint(h);
+                let mut count = 0u64;
+                for (i, rec) in descriptors.iter().enumerate() {
+                    match &buckets[&(i, bucket_of(h, rec.bucket_count))] {
+                        Ok(records) => {
+                            for x in records.iter().filter(|x| x.fp == fp) {
+                                count += match &x.entries {
+                                    Entries::Inline(e) => e.len() as u64,
+                                    Entries::Spilled { count, .. } => *count,
+                                };
+                            }
+                        }
+                        Err(e) => {
+                            return json!({ "address": a, "label": label, "entries": null,
+                                           "error": format!("{e:#}") });
+                        }
+                    }
+                }
+                json!({ "address": a, "label": label, "entries": count })
             })
             .collect();
         out["examples"] = json!(rows);
@@ -993,8 +1028,9 @@ async fn addr_examples_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
     .await
 }
 
-/// Runs `jobs`, at most [`CONCURRENCY`] at a time, and returns their results in order.
-async fn bounded<T, F>(jobs: impl IntoIterator<Item = F>) -> Vec<T>
+/// Runs `jobs`, at most [`CONCURRENCY`] at a time, and returns their results in order; a job
+/// that panicked is an error (the request still answers with JSON).
+async fn bounded<T, F>(jobs: impl IntoIterator<Item = F>) -> Result<Vec<T>>
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -1011,12 +1047,10 @@ where
         let Some(done) = set.join_next().await else {
             break;
         };
-        match done {
-            Ok((i, v)) => out[i] = Some(v),
-            Err(e) => std::panic::resume_unwind(e.into_panic()),
-        }
+        let (i, v) = done.context("a read panicked")?;
+        out[i] = Some(v);
     }
-    out.into_iter().map(|v| v.expect("every job ran")).collect()
+    Ok(out.into_iter().map(|v| v.expect("every job ran")).collect())
 }
 
 async fn addr_spill_handler(
@@ -1493,6 +1527,22 @@ mod tests {
     }
 
     #[test]
+    fn example_addresses_parse() {
+        for chain in [1, 1337, 31337] {
+            let list = example_addresses(chain);
+            assert!(!list.is_empty(), "chain {chain}");
+            for (a, label) in list {
+                let parsed: Address = a.parse().unwrap_or_else(|e| panic!("{label}: {e}"));
+                // Mixed-case addresses carry an EIP-55 checksum: a typo fails it.
+                if a[2..].chars().any(|c| c.is_ascii_uppercase()) {
+                    assert_eq!(parsed.to_checksum(None), *a, "{label}");
+                }
+            }
+        }
+        assert!(example_addresses(5).is_empty());
+    }
+
+    #[test]
     fn host_policy() {
         let policy = |listen: &str, extra: &[&str]| {
             let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
@@ -1531,9 +1581,26 @@ mod tests {
         ] {
             assert!(!lo.allows(bad), "{bad}");
         }
-        // A name with a port is refused when the server starts, not silently never matched.
-        let with_port = vec!["nuc.lan:8090".to_string()];
-        assert!(HostPolicy::new("0.0.0.0:8090".parse().unwrap(), &with_port).is_err());
+        // Forwards and proxies on another port: `ssh -L 9000:127.0.0.1:8090`, a router or
+        // docker forward, a TLS proxy on 443 passing the Host on (no port in it).
+        let fwd = policy(
+            "127.0.0.1:8090",
+            &[
+                "localhost:9000",
+                "192.168.1.5:9000",
+                "inspector.example:443",
+                "fe80::3",
+            ],
+        );
+        assert!(fwd.allows("localhost:9000") && fwd.allows("192.168.1.5:9000"));
+        assert!(fwd.allows("inspector.example") && fwd.allows("[fe80::3]:8090"));
+        assert!(!fwd.allows("192.168.1.5:8090") && !fwd.allows("inspector.example:8090"));
+        assert!(!lo.allows("localhost:9000"), "another port needs an entry");
+        // A malformed entry is refused when the server starts.
+        for bad in ["nuc.lan:abc", "[::1", "evil/x", ""] {
+            let bad = vec![bad.to_string()];
+            assert!(HostPolicy::new("0.0.0.0:8090".parse().unwrap(), &bad).is_err());
+        }
     }
 
     #[test]
