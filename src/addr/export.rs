@@ -3,7 +3,9 @@
 //! upload").
 //!
 //! An export is one append-only log of records in upload order, `kind (u8) ‖ key (32) ‖
-//! life (u64 BE) ‖ len (u32 BE) ‖ data` (layout 2; layout 1 has no `life`):
+//! life (u64 BE) ‖ len (u32 BE) ‖ data` (layouts 2 and 3; layout 1 has no `life`, and only
+//! layout 3 has [`CHUNK`] records, so that a build that cannot upload them refuses the export
+//! up front):
 //!
 //! * [`FILE`]: a spill or pages file; the key is its Swarm reference.
 //! * [`SOC`]: a slice descriptor or a bucket, as a SOC in wire form
@@ -11,7 +13,7 @@
 //! * [`HEAD`]: a head update or the origin, the same way. A head is a barrier: everything
 //!   before it is uploaded before it, as the importer does with a Bee node.
 //! * [`CHUNK`]: one chunk of a spill file too large to be written whole, in wire form, under
-//!   its address; the file's root chunk comes after the others (layout 2).
+//!   its address; the file's root chunk comes after the others (layout 3).
 //!
 //! `life` is how many more units the record must stay retrievable after it was written
 //! (`u64::MAX`: permanently), which `addr-upload` matches with a batch's TTL
@@ -51,7 +53,7 @@ pub const FILE: u8 = 1;
 pub const SOC: u8 = 2;
 pub const HEAD: u8 = 3;
 /// One chunk of a large spill file, under its address, in wire form (`span ‖ payload`):
-/// such a file is never held whole (layout 2 only).
+/// such a file is never held whole (layout 3 only).
 pub const CHUNK: u8 = 4;
 
 /// Bytes before a record's data, in layout `format`.
@@ -81,9 +83,9 @@ const STATE_LOCK: &str = "addr-import.lock";
 pub const SORT_DIR: &str = "ethswarm-sort";
 /// The version of the export's layout, in its metadata: the log is a contract between two
 /// commands that may be different builds on different machines.
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
 /// Layouts this build reads (and goes on writing, for an export that started in one).
-const FORMATS: [u32; 2] = [1, 2];
+const FORMATS: [u32; 3] = [1, 2, 3];
 /// `addr-upload` saves its progress at least this often within a stretch without a head (a
 /// backfill, a large merge), so that a failed record does not send it back to the last head.
 const SAVE_EVERY: u64 = 2048;
@@ -383,7 +385,7 @@ impl Records {
             .with_context(|| format!("reading the record at {}", self.offset))?;
         let kind = head[0];
         ensure!(
-            matches!(kind, FILE | SOC | HEAD) || (kind == CHUNK && self.format >= 2),
+            matches!(kind, FILE | SOC | HEAD) || (kind == CHUNK && self.format >= 3),
             "record of unknown kind {kind} at {}",
             self.offset
         );

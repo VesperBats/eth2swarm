@@ -135,7 +135,8 @@ enum Command {
         defer_level: u8,
         /// Highest slice level built. Memory is bounded by --sort-memory-mb at any level (a
         /// busy address's spill file is written page by page, and above 1 MiB uploaded chunk
-        /// by chunk); the cap bounds the time and the temporary disk one slice takes.
+        /// by chunk; an export started before layout 3 writes it whole and refuses one above
+        /// 256 MB); the cap bounds the time and the temporary disk one slice takes.
         #[arg(long, default_value_t = 12)]
         max_level: u8,
         /// Directory for the sort runs of the slice being built (default: --state); they go in

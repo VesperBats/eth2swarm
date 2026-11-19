@@ -110,7 +110,18 @@ impl Spill {
         } = self;
         pages.finish(&mut |page| add_page(&mut file, &mut tree, page, stream_at, emit))?;
         match tree {
-            None => Ok((file_reference(&file), count, Some(file))),
+            None => {
+                // Not streamed (an export started before layout 3, or a build in memory): a
+                // file clients would have to read page by page cannot be uploaded whole.
+                ensure!(
+                    file.len() <= MAX_FILE,
+                    "an address with {count} entries needs a spill file of {} bytes, above the \
+                     {MAX_FILE} written whole; an export started before layout 3 cannot stream \
+                     it: start a new export",
+                    file.len()
+                );
+                Ok((file_reference(&file), count, Some(file)))
+            }
             Some(t) => Ok((t.finish(&mut chunk_out(emit))?, count, None)),
         }
     }

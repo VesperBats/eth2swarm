@@ -323,8 +323,8 @@ fn walk<'a, S: ChunkSource>(
     })
 }
 
-/// Leaf `i` of the file under `root` (span `span`, from [`file_span`]), walking down from the
-/// root: one chunk per tree level, each checked.
+/// Leaf `i` of the file under `root`, walking down from the root: one chunk per tree level,
+/// each checked. An `i` past the file's last leaf is an error.
 pub async fn read_leaf<S: ChunkSource>(src: &S, root: B256, i: u64) -> Result<Vec<u8>> {
     let (mut span, mut payload) = checked_chunk(&src.chunk(root).await?, &root, None)?;
     let leaves = span.div_ceil(CHUNK_SIZE as u64).max(1);
@@ -535,6 +535,35 @@ mod tests {
     #[ignore]
     fn matches_bee_two_levels_up() {
         check(BEE_REFERENCES_LARGE);
+    }
+
+    /// The reader on the trees of the two-levels-up vectors (a reference carried two levels
+    /// up, the shape of any spill file above 256 MB): 64 MiB, minutes in a debug build:
+    /// `cargo test --release -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn files_two_levels_up_are_read_leaf_by_leaf() {
+        for len in [67108865usize, 67112961] {
+            let d = data(len);
+            let (src, root) = store(&d);
+            let mut back = Vec::with_capacity(len);
+            read_leaves(&src, root, u64::MAX, 16, &mut |l| {
+                back.extend(l);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert!(back == d, "length {len}");
+            let leaves = len.div_ceil(4096) as u64;
+            for i in [0, 16383, 16384, leaves - 1] {
+                let start = i as usize * 4096;
+                let want = &d[start..(start + 4096).min(len)];
+                assert!(
+                    read_leaf(&src, root, i).await.unwrap() == want,
+                    "length {len}, leaf {i}"
+                );
+            }
+        }
     }
 
     fn check(vectors: &[(usize, &str)]) {

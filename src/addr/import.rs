@@ -856,8 +856,9 @@ where
         ),
     };
     let stream_file = match (&sink, std::env::var("ETH2SWARM_ADDR_STREAM_FILE_BYTES")) {
-        // A layout-1 export has no chunk records: its spill files stay whole.
-        (Sink::Dir(log), _) if lock(log)?.format() < 2 => usize::MAX,
+        // An export started before layout 3 has no chunk records: its spill files stay whole
+        // (and stay within MAX_FILE).
+        (Sink::Dir(log), _) if lock(log)?.format() < 3 => usize::MAX,
         // Test hook: a small value makes a dev chain's busy address go through the chunked
         // path (`scripts/e2e-bee-factory.sh`).
         (_, Ok(v)) => v

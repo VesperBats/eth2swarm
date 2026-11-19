@@ -7,13 +7,17 @@ use anyhow::{Context, Result, ensure};
 
 use super::layout::{
     AddressRecord, BucketBody, BucketRecord, Entries, Entry, HeadRecord, MAX_FILE, PAGE_SIZE,
-    SliceRecord, bucket_id, bucket_pages_file, decode_bucket_page, decode_spill_page, entries_len,
-    head_id, held_first_block, last_block, origin_id, pages, slice_id, spill_file,
+    SliceRecord, SpillPageCheck, bucket_id, bucket_pages_file, decode_bucket_page,
+    decode_spill_page, head_id, held_first_block, last_block, origin_id, pages, slice_id,
+    spill_file, spill_page,
 };
 use super::slice::{SliceId, resolve_after};
 use crate::accumulator::{Tree, depth_for};
 use crate::swarm::bee::Bee;
-use crate::swarm::file::{CachedChunks, file_reference, file_span, read_leaf, read_leaves};
+use crate::swarm::file::{
+    CachedChunks, ChunkSource, file_reference, file_span, read_leaf, read_leaves,
+};
+use crate::swarm::soc::{self, soc_address};
 
 /// The largest spill file read whole (one `GET /bytes`); a larger one is read page by page
 /// through its chunk tree. `ETH2SWARM_ADDR_WHOLE_FILE_BYTES` lowers it, a test hook.
@@ -40,11 +44,59 @@ enum SpillRead {
 /// Chunks of a large spill file fetched at a time.
 const PAGE_READS: usize = 16;
 
-/// A spill page's bytes before its padding: `count`, `first_block` and its entries.
-fn page_content(entries: &[Entry]) -> usize {
-    6 + entries_len(entries, entries[0].block)
+/// A spill file read page by page through its chunk tree from `src`, each page's entries
+/// handed to `page` in order, every page checked ([`SpillPageCheck`]).
+pub async fn read_spill_pages<S: ChunkSource>(
+    src: &S,
+    rec: &SliceRecord,
+    spill_ref: &B256,
+    count: u64,
+    page: &mut (dyn FnMut(&[Entry]) + Send),
+) -> Result<()> {
+    let span = file_span(src, *spill_ref).await?;
+    let mut check = SpillPageCheck::new(rec.first_block, rec.last_block(), count, span)?;
+    read_leaves(src, *spill_ref, u64::MAX, PAGE_READS, &mut |leaf| {
+        page(&check.page(&leaf)?);
+        Ok(())
+    })
+    .await
+    .with_context(|| format!("spill file {spill_ref}"))?;
+    ensure!(check.done(), "spill file {spill_ref}: pages missing");
+    Ok(())
 }
-use crate::swarm::soc::{self, soc_address};
+
+/// Up to `limit` of the newest entries of a spill file read from its last page backwards
+/// through its chunk tree from `src`, newest first; only those pages are read and checked
+/// (each on its own, and in order against the newer one read before it).
+pub async fn newest_spill_pages<S: ChunkSource>(
+    src: &S,
+    rec: &SliceRecord,
+    spill_ref: &B256,
+    limit: usize,
+) -> Result<Vec<Entry>> {
+    let (first, last) = (rec.first_block, rec.last_block());
+    // The root and the intermediate chunks above the last pages are read once.
+    let src = CachedChunks::new(src.clone());
+    let span = file_span(&src, *spill_ref).await?;
+    let pages = span.div_ceil(PAGE_SIZE as u64);
+    let mut out: Vec<Entry> = Vec::new();
+    let mut i = pages;
+    while i > 0 && out.len() < limit {
+        i -= 1;
+        let page = read_leaf(&src, *spill_ref, i).await?;
+        let es = spill_page(&page, first, last, i + 1 == pages)?;
+        if let Some(newer) = out.last() {
+            let e = es.last().unwrap();
+            ensure!(
+                (e.block, e.slot) < (newer.block, newer.slot),
+                "spill file {spill_ref}: entries not ascending across pages"
+            );
+        }
+        out.extend(es.into_iter().rev());
+    }
+    out.truncate(limit);
+    Ok(out)
+}
 
 /// Reads `addr1` records of one owner on one chain, checking signatures and identities.
 #[derive(Clone)]
@@ -281,9 +333,7 @@ impl IndexReader {
     }
 
     /// A spill file read page by page through its chunk tree, each page's entries handed to
-    /// `page` in order, checked: every page decodes, the entries ascend across pages, each page
-    /// is full (the next one's first entry did not fit), only the last is unpadded, and the
-    /// count is the stated one.
+    /// `page` in order ([`read_spill_pages`]).
     async fn spill_pages(
         &self,
         rec: &SliceRecord,
@@ -291,43 +341,7 @@ impl IndexReader {
         count: u64,
         page: &mut (dyn FnMut(&[Entry]) + Send),
     ) -> Result<()> {
-        let (first, last) = (rec.first_block, rec.last_block());
-        let mut seen = 0u64;
-        // The previous page: its content length, its length, its last entry.
-        let mut prev: Option<(usize, usize, Entry)> = None;
-        read_leaves(&self.bee, *spill_ref, u64::MAX, PAGE_READS, &mut |leaf| {
-            let es = decode_spill_page(&leaf, first, last)?;
-            if let Some((content, _, e)) = prev {
-                let next = es[0];
-                ensure!(
-                    (e.block, e.slot) < (next.block, next.slot),
-                    "spill file {spill_ref}: entries not ascending across pages"
-                );
-                ensure!(
-                    content + entries_len(std::slice::from_ref(&next), e.block) > PAGE_SIZE,
-                    "spill file {spill_ref} not canonically encoded: a page ends early"
-                );
-            }
-            seen += es.len() as u64;
-            ensure!(
-                seen <= count,
-                "spill file {spill_ref} holds more than the {count} entries it states"
-            );
-            prev = Some((page_content(&es), leaf.len(), *es.last().unwrap()));
-            page(&es);
-            Ok(())
-        })
-        .await?;
-        let (content, len, _) = prev.context("an empty spill file")?;
-        ensure!(
-            content == len,
-            "spill file {spill_ref} not canonically encoded: its last page is padded"
-        );
-        ensure!(
-            seen == count,
-            "spill file {spill_ref} states {count} entries, holds {seen}"
-        );
-        Ok(())
+        read_spill_pages(&self.bee, rec, spill_ref, count, page).await
     }
 
     /// Up to `limit` of the newest entries of a spilled address record, newest first, and
@@ -345,29 +359,10 @@ impl IndexReader {
             let all = self.spill_whole(rec, spill_ref, count).await?;
             return Ok((all.into_iter().rev().take(limit).collect(), true));
         }
-        let (first, last) = (rec.first_block, rec.last_block());
-        // The root and the intermediate chunks above the last pages are read once.
-        let src = CachedChunks::new(self.bee.clone());
-        let pages = file_span(&src, *spill_ref)
-            .await?
-            .div_ceil(PAGE_SIZE as u64);
-        let mut out: Vec<Entry> = Vec::new();
-        let mut i = pages;
-        while i > 0 && out.len() < limit {
-            i -= 1;
-            let page = read_leaf(&src, *spill_ref, i).await?;
-            let es = decode_spill_page(&page, first, last)?;
-            if let Some(newer) = out.last() {
-                let e = es.last().unwrap();
-                ensure!(
-                    (e.block, e.slot) < (newer.block, newer.slot),
-                    "spill file {spill_ref}: entries not ascending across pages"
-                );
-            }
-            out.extend(es.into_iter().rev());
-        }
-        out.truncate(limit);
-        Ok((out, false))
+        Ok((
+            newest_spill_pages(&self.bee, rec, spill_ref, limit).await?,
+            false,
+        ))
     }
 
     /// The head announcing exactly `units` units, given the origin.
@@ -594,4 +589,80 @@ pub async fn check_chain(provider: &impl Provider, report: &Report) -> Result<()
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::swarm::file::{ChunkTree, chunk_wire};
+
+    /// Chunks in memory, as a node serves them.
+    #[derive(Clone, Default)]
+    struct Store(std::sync::Arc<std::collections::HashMap<B256, Vec<u8>>>);
+
+    impl ChunkSource for Store {
+        async fn chunk(&self, address: B256) -> Result<Vec<u8>> {
+            self.0
+                .get(&address)
+                .cloned()
+                .with_context(|| format!("no chunk {address}"))
+        }
+    }
+
+    fn store(file: &[u8]) -> (Store, B256) {
+        let mut chunks = std::collections::HashMap::new();
+        let mut tree = ChunkTree::default();
+        let mut out = |a: B256, span: u64, p: &[u8]| {
+            chunks.insert(a, chunk_wire(span, p));
+            Ok(())
+        };
+        for leaf in file.chunks(PAGE_SIZE) {
+            tree.push_leaf(leaf, &mut out).unwrap();
+        }
+        let root = tree.finish(&mut out).unwrap();
+        (Store(std::sync::Arc::new(chunks)), root)
+    }
+
+    #[tokio::test]
+    async fn a_spill_file_read_page_by_page_and_newest_first() {
+        // 200,000 entries: 147 pages, a root over two intermediate chunks.
+        let entries: Vec<Entry> = (0..200_000u64)
+            .map(|i| Entry {
+                block: 64 + i / 8,
+                slot: (i % 8) as u32 + 1,
+                roles: 1,
+            })
+            .collect();
+        let file = spill_file(&entries);
+        let (src, root) = store(&file);
+        let rec = SliceRecord {
+            level: 16,
+            index: 0,
+            first_block: 0,
+            last_block_hash: B256::ZERO,
+            bucket_count: 1,
+            addresses: 1,
+            appearances: entries.len() as u64,
+            buckets_root: B256::ZERO,
+            roles: 1,
+        };
+        let mut got = Vec::new();
+        read_spill_pages(&src, &rec, &root, entries.len() as u64, &mut |es| {
+            got.extend_from_slice(es)
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, entries);
+        // The stated count must be the file's.
+        let err = read_spill_pages(&src, &rec, &root, 199_999, &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("more than"), "{err:#}");
+        // The newest entries, from the last pages backwards, across a page boundary.
+        for limit in [1, 10, 2000] {
+            let newest = newest_spill_pages(&src, &rec, &root, limit).await.unwrap();
+            let want: Vec<Entry> = entries.iter().rev().take(limit).copied().collect();
+            assert_eq!(newest, want, "limit {limit}");
+        }
+    }
 }

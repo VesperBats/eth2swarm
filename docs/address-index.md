@@ -8,9 +8,10 @@ and a client (`ethswarm addr-lookup`, head discovery from a finalized block, inc
 sync, and a check against the chain). An index can start at a later block instead of
 genesis (`addr-import --from-block`, *Starting at a later block*), and an import can be
 written to a directory and uploaded later (`--out`, `addr-upload`). `ethswarm devnet-activity` generates test traffic on
-a dev chain. The client reads every slice and whole spill and pages files; steps 3–5 of
-*Client lookup* (page search, last page first, stopping when the screen is full) and the
-time-based head estimate are not implemented. Slices of any level are built with bounded
+a dev chain. The client reads every slice, whole pages files, and spill files whole up to
+256 MB and page by page above (every page for a lookup; the newest pages, stopping at its
+limit, in the inspector's spill view); the page search of a paged bucket, stopping a lookup
+when the screen is full, and the time-based head estimate are not implemented. Slices of any level are built with bounded
 memory (*Building large slices*), and stamped with postage batches by lifetime
 (`--lower-batch`, *Lifetime*). Still open: re-measuring with traces. Design issue: #5.
 
@@ -332,7 +333,9 @@ postage stamps come from the upload.
   data`): files under their reference (a spill file above 1 MiB as its chunks, each in wire
   form under its address, the root last), slice descriptors and buckets as SOCs in wire form
   under their address, and heads (and the origin) the same way; `life` is how many more
-  units the record must stay (layout 2, *Lifetime*; permanent: all ones). A head is a barrier:
+  units the record must stay (layouts 2 and 3, *Lifetime*; permanent: all ones; layout 3 adds
+  the chunk records, so a build that cannot upload them refuses the export up front). A head
+  is a barrier:
   `addr-upload` sends the records between two heads in parallel, and a head only after
   everything before it, as the importer does with a Bee node.
 - At every save of its state the importer syncs the log, records its length in the state,
@@ -349,6 +352,9 @@ postage stamps come from the upload.
   `--from-start`, which sends everything again. Lower batches can change between uploads; a
   resumed upload does not send again what went to a lower batch that has expired since
   (`--from-start` does).
+- An export keeps the layout it started in when it is continued. One started before layout 3
+  writes spill files whole, so an address whose spill file would exceed 256 MB stops it (start
+  a new export); one started before layout 2 has no lifetimes either.
 - Moving an export between machines while the importer runs: copy `committed` first and the
   log after it (every byte below `committed` is final), or stop the importer. Do not mirror
   with deletion (`rsync --delete`): `uploaded.json`, the upload's progress, lives in the
@@ -424,7 +430,7 @@ How the importer stamps (`addr-import` and `addr-upload`, `--batch` and `--lower
   one interval after it was written). Past the grace period the slice's batch
   can expire while a head still uses it; topping up that batch (or importing again) is the
   remedy.
-- An export records each record's remaining lifetime in the log (layout 2), so `addr-upload`
+- An export records each record's remaining lifetime in the log (layouts 2 and 3), so `addr-upload`
   chooses the batches; a layout-1 export (written before lifetimes) uploads as permanent, and
   `addr-upload` warns when it is given lower batches for one. A layout-1 export stays in
   layout 1 when it is continued: lifetimes need an export started by this build.
