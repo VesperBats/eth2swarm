@@ -10,7 +10,10 @@
 //! The address index needs this to put the reference of a spill or pages file into a bucket
 //! before anything is uploaded, and independent importers need it to agree byte for byte.
 
+use std::future::Future;
+
 use alloy::primitives::B256;
+use anyhow::{Result, ensure};
 
 use super::bmt::{CHUNK_SIZE, cac_address};
 
@@ -19,43 +22,103 @@ const BRANCHES: usize = CHUNK_SIZE / 32;
 
 /// Root reference of `data` as Bee computes it for `POST /bytes`.
 pub fn file_reference(data: &[u8]) -> B256 {
-    if data.len() <= CHUNK_SIZE {
-        return cac_address(data.len() as u64, data);
-    }
-    // levels[0] holds leaf references; each entry is (reference, span).
-    let mut levels: Vec<Vec<(B256, u64)>> = vec![Vec::new()];
+    let mut tree = ChunkTree::default();
+    let mut none = |_: B256, _: u64, _: &[u8]| Ok(());
     for leaf in data.chunks(CHUNK_SIZE) {
-        push(
-            &mut levels,
-            0,
-            (cac_address(leaf.len() as u64, leaf), leaf.len() as u64),
+        tree.push_leaf(leaf, &mut none)
+            .expect("full leaves before the last");
+    }
+    tree.finish(&mut none).expect("no sink errors")
+}
+
+/// Where [`ChunkTree`] hands each chunk it makes: its address, span and payload.
+pub type ChunkSink<'a> = dyn FnMut(B256, u64, &[u8]) -> Result<()> + 'a;
+
+/// A file's chunk tree built leaf by leaf, handing out every chunk as it is made (leaves,
+/// and each intermediate chunk once its references are complete): a file of any size is
+/// chunked with memory for one path of the tree, at most 128 references per level. It is
+/// the same tree as [`file_reference`]'s, which is built on it, so the chunks are the ones
+/// Bee stores for `POST /bytes` of the whole file.
+#[derive(Debug, Default)]
+pub struct ChunkTree {
+    /// References waiting on each level, with their spans.
+    levels: Vec<Vec<(B256, u64)>>,
+    leaves: u64,
+    /// A leaf shorter than a chunk was pushed: it must be the last.
+    short: bool,
+}
+
+impl ChunkTree {
+    /// Adds the next leaf (1 to 4096 bytes; only the last may be shorter than 4096).
+    pub fn push_leaf(&mut self, leaf: &[u8], out: &mut ChunkSink) -> Result<()> {
+        ensure!(
+            !leaf.is_empty() && leaf.len() <= CHUNK_SIZE,
+            "a leaf of {} bytes",
+            leaf.len()
         );
+        ensure!(!self.short, "a leaf after a short one");
+        self.short = leaf.len() < CHUNK_SIZE;
+        let span = leaf.len() as u64;
+        let address = cac_address(span, leaf);
+        out(address, span, leaf)?;
+        self.leaves += 1;
+        self.push(0, (address, span), out)
     }
-    // Finish from the bottom: an empty level is skipped, a single reference is carried up,
-    // anything else is wrapped into one chunk on the level above.
-    let mut l = 0;
-    loop {
-        let top = levels.iter().skip(l + 1).all(Vec::is_empty);
-        match levels[l].len() {
-            0 => {}
-            1 if top => return levels[l][0].0,
-            1 => {
-                let carried = levels[l].pop().unwrap();
-                levels[l + 1].push(carried);
-            }
-            _ => {
-                let wrapped = wrap(std::mem::take(&mut levels[l]));
-                if levels.len() == l + 1 {
-                    levels.push(Vec::new());
+
+    /// Appends a reference to level `l`, wrapping the level as soon as it is full.
+    fn push(&mut self, l: usize, r: (B256, u64), out: &mut ChunkSink) -> Result<()> {
+        if self.levels.len() == l {
+            self.levels.push(Vec::new());
+        }
+        self.levels[l].push(r);
+        if self.levels[l].len() == BRANCHES {
+            let wrapped = wrap(std::mem::take(&mut self.levels[l]), out)?;
+            self.push(l + 1, wrapped, out)?;
+        }
+        Ok(())
+    }
+
+    /// The root reference, after handing out the chunks still open. Finishing from the
+    /// bottom: an empty level is skipped, a single reference is carried up, anything else
+    /// is wrapped into one chunk on the level above.
+    pub fn finish(mut self, out: &mut ChunkSink) -> Result<B256> {
+        if self.leaves == 0 {
+            let address = cac_address(0, &[]);
+            out(address, 0, &[])?;
+            return Ok(address);
+        }
+        let mut l = 0;
+        loop {
+            let top = self.levels.iter().skip(l + 1).all(Vec::is_empty);
+            match self.levels[l].len() {
+                0 => {}
+                1 if top => return Ok(self.levels[l][0].0),
+                1 => {
+                    let carried = self.levels[l].pop().unwrap();
+                    self.levels[l + 1].push(carried);
                 }
-                levels[l + 1].push(wrapped);
+                _ => {
+                    let wrapped = wrap(std::mem::take(&mut self.levels[l]), out)?;
+                    if self.levels.len() == l + 1 {
+                        self.levels.push(Vec::new());
+                    }
+                    self.levels[l + 1].push(wrapped);
+                }
+            }
+            l += 1;
+            if self.levels.len() == l {
+                self.levels.push(Vec::new());
             }
         }
-        l += 1;
-        if levels.len() == l {
-            levels.push(Vec::new());
-        }
     }
+}
+
+/// A chunk in wire form: `span (u64 LE) ‖ payload`, as `POST /chunks` takes it.
+pub fn chunk_wire(span: u64, payload: &[u8]) -> Vec<u8> {
+    let mut w = Vec::with_capacity(8 + payload.len());
+    w.extend_from_slice(&span.to_le_bytes());
+    w.extend_from_slice(payload);
+    w
 }
 
 /// Number of chunks Bee stores for a file of `len` bytes (leaves and intermediate chunks;
@@ -76,23 +139,206 @@ pub fn file_chunks(len: usize) -> usize {
     chunks
 }
 
-/// Append a reference to level `l`, wrapping the level as soon as it is full.
-fn push(levels: &mut Vec<Vec<(B256, u64)>>, l: usize, r: (B256, u64)) {
-    if levels.len() == l {
-        levels.push(Vec::new());
+/// One intermediate chunk over `refs`, handed out.
+fn wrap(refs: Vec<(B256, u64)>, out: &mut ChunkSink) -> Result<(B256, u64)> {
+    let span: u64 = refs.iter().map(|(_, s)| s).sum();
+    let payload: Vec<u8> = refs.iter().flat_map(|(r, _)| r.0).collect();
+    let address = cac_address(span, &payload);
+    out(address, span, &payload)?;
+    Ok((address, span))
+}
+
+/// One chunk of a file's tree as fetched (wire form `span ‖ payload`), checked against the
+/// address it was fetched under, and its span against `expected` (what its parent says).
+pub fn checked_chunk(wire: &[u8], address: &B256, expected: Option<u64>) -> Result<(u64, Vec<u8>)> {
+    ensure!(
+        wire.len() >= 8 && wire.len() <= 8 + CHUNK_SIZE,
+        "chunk {address} of {} bytes",
+        wire.len()
+    );
+    let span = u64::from_le_bytes(wire[..8].try_into().unwrap());
+    let payload = &wire[8..];
+    ensure!(
+        cac_address(span, payload) == *address,
+        "chunk does not hash to {address}"
+    );
+    if let Some(e) = expected {
+        ensure!(
+            span == e,
+            "chunk {address} spans {span} bytes, its parent says {e}"
+        );
     }
-    levels[l].push(r);
-    if levels[l].len() == BRANCHES {
-        let wrapped = wrap(std::mem::take(&mut levels[l]));
-        push(levels, l + 1, wrapped);
+    if span <= CHUNK_SIZE as u64 {
+        ensure!(
+            payload.len() as u64 == span,
+            "leaf {address} of {} bytes states span {span}",
+            payload.len()
+        );
+    } else {
+        let n = child_count(span);
+        ensure!(
+            payload.len() == 32 * n,
+            "intermediate chunk {address} of span {span} has {} bytes of references, not {}",
+            payload.len(),
+            32 * n
+        );
+    }
+    Ok((span, payload.to_vec()))
+}
+
+/// Bytes each child of an intermediate chunk of `span` bytes covers: the largest power of 128
+/// leaves below the span (every child but the last covers exactly that).
+fn child_cap(span: u64) -> u64 {
+    let mut cap = CHUNK_SIZE as u64;
+    while cap.saturating_mul(BRANCHES as u64) < span {
+        cap *= BRANCHES as u64;
+    }
+    cap
+}
+
+fn child_count(span: u64) -> usize {
+    span.div_ceil(child_cap(span)) as usize
+}
+
+/// The spans of the children of an intermediate chunk.
+fn child_spans(span: u64) -> Vec<u64> {
+    let (cap, n) = (child_cap(span), child_count(span) as u64);
+    (0..n)
+        .map(|i| if i + 1 < n { cap } else { span - cap * (n - 1) })
+        .collect()
+}
+
+/// Fetches a chunk by address (wire form).
+pub trait ChunkSource: Clone + Send + Sync + 'static {
+    fn chunk(&self, address: B256) -> impl Future<Output = Result<Vec<u8>>> + Send;
+}
+
+impl ChunkSource for crate::swarm::bee::Bee {
+    async fn chunk(&self, address: B256) -> Result<Vec<u8>> {
+        self.get_chunk(&address).await
     }
 }
 
-/// One intermediate chunk over `refs`.
-fn wrap(refs: Vec<(B256, u64)>) -> (B256, u64) {
-    let span: u64 = refs.iter().map(|(_, s)| s).sum();
-    let payload: Vec<u8> = refs.iter().flat_map(|(r, _)| r.0).collect();
-    (cac_address(span, &payload), span)
+/// A chunk source that keeps the intermediate chunks it has fetched: a walk to several leaves
+/// of one file reads the path above them once.
+#[derive(Clone)]
+pub struct CachedChunks<S> {
+    inner: S,
+    cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<B256, Vec<u8>>>>,
+}
+
+impl<S> CachedChunks<S> {
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            cache: Default::default(),
+        }
+    }
+}
+
+impl<S: ChunkSource> ChunkSource for CachedChunks<S> {
+    async fn chunk(&self, address: B256) -> Result<Vec<u8>> {
+        if let Some(w) = self.cache.lock().unwrap().get(&address) {
+            return Ok(w.clone());
+        }
+        let w = self.inner.chunk(address).await?;
+        // Intermediate chunks (span above one chunk) only: leaves are read once.
+        if w.len() >= 8 && u64::from_le_bytes(w[..8].try_into().unwrap()) > CHUNK_SIZE as u64 {
+            self.cache.lock().unwrap().insert(address, w.clone());
+        }
+        Ok(w)
+    }
+}
+
+/// The span of the file under `root`: its size.
+pub async fn file_span<S: ChunkSource>(src: &S, root: B256) -> Result<u64> {
+    Ok(checked_chunk(&src.chunk(root).await?, &root, None)?.0)
+}
+
+/// Reads the file under `root` leaf by leaf through its chunk tree, handing each leaf to
+/// `leaf` in order, `concurrency` leaves fetched at a time; every chunk is checked against its
+/// address, its span against its parent's, and the root's against `max_span`. Returns the
+/// file's size. Memory is one tree path and the leaves in flight, whatever the file's size.
+pub async fn read_leaves<S: ChunkSource>(
+    src: &S,
+    root: B256,
+    max_span: u64,
+    concurrency: usize,
+    leaf: &mut (dyn FnMut(Vec<u8>) -> Result<()> + Send),
+) -> Result<u64> {
+    let (span, payload) = checked_chunk(&src.chunk(root).await?, &root, None)?;
+    ensure!(
+        span <= max_span,
+        "file {root} of {span} bytes, above the {max_span} read"
+    );
+    walk(src, span, payload, concurrency.max(1), leaf).await?;
+    Ok(span)
+}
+
+/// The leaves below a checked chunk, in order.
+fn walk<'a, S: ChunkSource>(
+    src: &'a S,
+    span: u64,
+    payload: Vec<u8>,
+    concurrency: usize,
+    leaf: &'a mut (dyn FnMut(Vec<u8>) -> Result<()> + Send),
+) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        if span <= CHUNK_SIZE as u64 {
+            return leaf(payload);
+        }
+        let children: Vec<(B256, u64)> = payload
+            .chunks(32)
+            .map(B256::from_slice)
+            .zip(child_spans(span))
+            .collect();
+        if child_cap(span) == CHUNK_SIZE as u64 {
+            // The children are leaves: fetched in parallel, handed out in order.
+            for group in children.chunks(concurrency) {
+                let mut set = tokio::task::JoinSet::new();
+                for (i, (address, s)) in group.iter().copied().enumerate() {
+                    let src = src.clone();
+                    set.spawn(async move {
+                        let wire = src.chunk(address).await?;
+                        Ok::<_, anyhow::Error>((i, checked_chunk(&wire, &address, Some(s))?.1))
+                    });
+                }
+                let mut got: Vec<Option<Vec<u8>>> = vec![None; group.len()];
+                while let Some(done) = set.join_next().await {
+                    let (i, p) =
+                        done.map_err(|e| anyhow::anyhow!("a chunk read panicked: {e}"))??;
+                    got[i] = Some(p);
+                }
+                for p in got {
+                    leaf(p.expect("every leaf of the group was read"))?;
+                }
+            }
+        } else {
+            for (address, s) in children {
+                let (s, p) = checked_chunk(&src.chunk(address).await?, &address, Some(s))?;
+                walk(src, s, p, concurrency, leaf).await?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Leaf `i` of the file under `root` (span `span`, from [`file_span`]), walking down from the
+/// root: one chunk per tree level, each checked.
+pub async fn read_leaf<S: ChunkSource>(src: &S, root: B256, i: u64) -> Result<Vec<u8>> {
+    let (mut span, mut payload) = checked_chunk(&src.chunk(root).await?, &root, None)?;
+    let leaves = span.div_ceil(CHUNK_SIZE as u64).max(1);
+    ensure!(i < leaves, "leaf {i} of a file of {leaves} leaves");
+    let mut offset = i * CHUNK_SIZE as u64;
+    while span > CHUNK_SIZE as u64 {
+        let cap = child_cap(span);
+        let k = (offset / cap) as usize;
+        let address = B256::from_slice(&payload[32 * k..32 * k + 32]);
+        let s = child_spans(span)[k];
+        (span, payload) = checked_chunk(&src.chunk(address).await?, &address, Some(s))?;
+        offset -= k as u64 * cap;
+    }
+    Ok(payload)
 }
 
 #[cfg(test)]
@@ -102,6 +348,142 @@ mod tests {
     /// Deterministic test data.
     fn data(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    /// Chunks by address: span and payload.
+    type Chunks = std::collections::HashMap<B256, (u64, Vec<u8>)>;
+
+    /// Every chunk the tree hands out, by address, how many it handed out (identical chunks
+    /// included), and the root.
+    fn tree(d: &[u8]) -> (Chunks, usize, B256) {
+        let mut chunks = std::collections::HashMap::new();
+        let mut n = 0;
+        let mut t = ChunkTree::default();
+        let mut out = |a: B256, span: u64, p: &[u8]| {
+            chunks.insert(a, (span, p.to_vec()));
+            n += 1;
+            Ok(())
+        };
+        for leaf in d.chunks(CHUNK_SIZE) {
+            t.push_leaf(leaf, &mut out).unwrap();
+        }
+        let root = t.finish(&mut out).unwrap();
+        (chunks, n, root)
+    }
+
+    /// The data below `r`, read through the chunks as a reader walks the tree.
+    fn walk(chunks: &Chunks, r: &B256, out: &mut Vec<u8>) {
+        let (span, payload) = &chunks[r];
+        assert_eq!(cac_address(*span, payload), *r);
+        if *span as usize <= CHUNK_SIZE {
+            out.extend_from_slice(payload);
+        } else {
+            for c in payload.chunks(32) {
+                walk(chunks, &B256::from_slice(c), out);
+            }
+        }
+    }
+
+    #[test]
+    fn the_chunk_tree_hands_out_every_chunk_of_the_file() {
+        for len in [
+            0,
+            1,
+            4096,
+            4097,
+            128 * 4096,
+            128 * 4096 + 1,
+            129 * 4096 + 5,
+            300 * 4096,
+        ] {
+            let d = data(len);
+            let (chunks, n, root) = tree(&d);
+            assert_eq!(root, file_reference(&d), "length {len}");
+            assert_eq!(n, file_chunks(len), "length {len}");
+            let mut back = Vec::new();
+            walk(&chunks, &root, &mut back);
+            assert_eq!(back, d, "length {len}");
+        }
+        // Only the last leaf may be short.
+        let mut t = ChunkTree::default();
+        let mut none = |_: B256, _: u64, _: &[u8]| Ok(());
+        t.push_leaf(&[1; 10], &mut none).unwrap();
+        assert!(t.push_leaf(&[1; 10], &mut none).is_err());
+    }
+
+    /// Chunks in memory, as a node serves them.
+    #[derive(Clone, Default)]
+    struct Store(std::sync::Arc<std::collections::HashMap<B256, Vec<u8>>>);
+
+    impl ChunkSource for Store {
+        async fn chunk(&self, address: B256) -> Result<Vec<u8>> {
+            self.0
+                .get(&address)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no chunk {address}"))
+        }
+    }
+
+    fn store(d: &[u8]) -> (Store, B256) {
+        let (chunks, _, root) = tree(d);
+        let wire = chunks
+            .into_iter()
+            .map(|(a, (span, p))| (a, chunk_wire(span, &p)))
+            .collect();
+        (Store(std::sync::Arc::new(wire)), root)
+    }
+
+    #[tokio::test]
+    async fn a_file_is_read_leaf_by_leaf_through_its_tree() {
+        for len in [
+            1usize,
+            4096,
+            4097,
+            128 * 4096,
+            128 * 4096 + 1,
+            300 * 4096 + 7,
+        ] {
+            let d: Vec<u8> = (0..len)
+                .map(|i| (i * 7 % 253) as u8 ^ (i / 4096) as u8)
+                .collect();
+            let (src, root) = store(&d);
+            let mut back = Vec::new();
+            let span = read_leaves(&src, root, u64::MAX, 8, &mut |l| {
+                back.extend(l);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!((span, &back), (len as u64, &d), "length {len}");
+            assert_eq!(file_span(&src, root).await.unwrap(), len as u64);
+            let leaves = len.div_ceil(4096) as u64;
+            for i in [0, leaves / 2, leaves - 1] {
+                let start = i as usize * 4096;
+                let want = &d[start..(start + 4096).min(len)];
+                assert_eq!(
+                    read_leaf(&src, root, i).await.unwrap(),
+                    want,
+                    "length {len}, leaf {i}"
+                );
+            }
+            assert!(read_leaf(&src, root, leaves).await.is_err());
+        }
+        // A file above the limit, a chunk under the wrong address: refused.
+        let (src, root) = store(&[1u8; 5000]);
+        assert!(
+            read_leaves(&src, root, 4999, 8, &mut |_| Ok(()))
+                .await
+                .is_err()
+        );
+        let mut bad = (*src.0).clone();
+        let leaf = cac_address(4096, &[1u8; 4096]);
+        bad.insert(leaf, chunk_wire(4096, &[2u8; 4096]));
+        let bad = Store(std::sync::Arc::new(bad));
+        assert!(
+            read_leaves(&bad, root, u64::MAX, 8, &mut |_| Ok(()))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

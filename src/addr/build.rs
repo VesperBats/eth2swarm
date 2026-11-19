@@ -13,9 +13,10 @@
 //!    decreases along it, so each bucket's records are consecutive. They are ordered by
 //!    (fingerprint, address), encoded, paged if too large, and handed out.
 //!
-//! Memory: the sort buffer (given back once the runs are written), one bucket, the entries and
-//! spill file of the busiest address, and 32 bytes per bucket (for `buckets_root`) and per
-//! file (to list each once). A slice that fits one buffer keeps its spool in memory beside it
+//! Memory: the sort buffer (given back once the runs are written), one bucket, one page and
+//! one path of chunk references of the spill file being written (a spill file above
+//! [`STREAM_FILE`] is handed out chunk by chunk as it is written, never whole), and 32 bytes
+//! per bucket (for `buckets_root`) and per file (to list each once). A slice that fits one buffer keeps its spool in memory beside it
 //! (the records plus 36 bytes per address), so it peaks at up to about twice the buffer.
 //! Disk: 45 bytes per appearance for the runs, up to twice that during a merge round (a
 //! group is written before its inputs are removed), then the spool.
@@ -34,12 +35,12 @@ use anyhow::{Context, Result, ensure};
 use super::detect::Appearance;
 use super::layout::{
     AddressRecord, BUCKET_TARGET, BucketBody, BucketRecord, Entries, Entry, L_MAX, MAX_FILE,
-    PAGE_SIZE, SPILL_INLINE_MAX, SliceRecord, bucket_pages_file, entries_len, held_first_block,
-    last_block, spill_file,
+    PAGE_SIZE, SPILL_INLINE_MAX, SliceRecord, SpillPages, bucket_pages_file, entries_len,
+    held_first_block, last_block,
 };
 use super::slice::{SliceId, bucket_of_prefix, held};
 use crate::accumulator::{depth_for, root_of};
-use crate::swarm::file::file_reference;
+use crate::swarm::file::{ChunkTree, chunk_wire, file_reference};
 
 /// Bytes of one sort item.
 const ITEM: usize = 12 + 20 + 8 + 4 + 1;
@@ -51,11 +52,137 @@ const FAN_IN: usize = 128;
 /// Items or buckets between two looks at the cancel flag.
 const CANCEL_EVERY: u64 = 1 << 16;
 
-/// What building hands out, in order: files before the buckets that name them.
+/// A spill file larger than this is handed out as its chunks while it is written (never held
+/// whole); a smaller one whole, as one file.
+pub const STREAM_FILE: usize = 1 << 20;
+
+/// What building hands out, in order: files (or a large file's chunks) before the buckets that
+/// name them.
 #[derive(Debug)]
 pub enum Output {
+    /// A whole spill or pages file under its reference.
     File(B256, Vec<u8>),
+    /// One chunk of a large spill file, under its address, in wire form (`span ‖ payload`).
+    /// The file's root chunk comes last.
+    Chunk(B256, Vec<u8>),
     Bucket(u32, Vec<u8>),
+}
+
+/// The spill file of the address being read from the merge, written page by page: kept whole
+/// while it is small, else chunked as it grows.
+#[derive(Default)]
+struct Spill {
+    pages: SpillPages,
+    /// The full pages so far, while the file is at most [`STREAM_FILE`].
+    file: Vec<u8>,
+    /// Once the file is larger: its chunk tree, every chunk handed out as it is made.
+    tree: Option<ChunkTree>,
+    count: u64,
+}
+
+impl Spill {
+    fn push(
+        &mut self,
+        e: &Entry,
+        stream_at: usize,
+        emit: &mut dyn FnMut(Output) -> Result<()>,
+    ) -> Result<()> {
+        let Spill {
+            pages, file, tree, ..
+        } = self;
+        pages.push(e, &mut |page| add_page(file, tree, page, stream_at, emit))?;
+        self.count += 1;
+        Ok(())
+    }
+
+    /// The file's reference and entry count, and the file itself unless it was handed out as
+    /// chunks.
+    fn finish(
+        self,
+        stream_at: usize,
+        emit: &mut dyn FnMut(Output) -> Result<()>,
+    ) -> Result<(B256, u64, Option<Vec<u8>>)> {
+        let Spill {
+            pages,
+            mut file,
+            mut tree,
+            count,
+        } = self;
+        pages.finish(&mut |page| add_page(&mut file, &mut tree, page, stream_at, emit))?;
+        match tree {
+            None => Ok((file_reference(&file), count, Some(file))),
+            Some(t) => Ok((t.finish(&mut chunk_out(emit))?, count, None)),
+        }
+    }
+}
+
+/// A finished page (a leaf of the file: a page is one chunk) into the file kept whole, or into
+/// its chunk tree once the file outgrows `stream_at`.
+fn add_page(
+    file: &mut Vec<u8>,
+    tree: &mut Option<ChunkTree>,
+    page: &[u8],
+    stream_at: usize,
+    emit: &mut dyn FnMut(Output) -> Result<()>,
+) -> Result<()> {
+    match tree {
+        Some(t) => t.push_leaf(page, &mut chunk_out(emit)),
+        None => {
+            file.extend_from_slice(page);
+            if file.len() > stream_at {
+                // Every page but the last is full, so the pages so far are whole leaves.
+                let mut t = ChunkTree::default();
+                for leaf in file.chunks(PAGE_SIZE) {
+                    t.push_leaf(leaf, &mut chunk_out(emit))?;
+                }
+                file.clear();
+                file.shrink_to_fit();
+                *tree = Some(t);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A chunk sink handing chunks out as [`Output::Chunk`].
+fn chunk_out<'a>(
+    emit: &'a mut dyn FnMut(Output) -> Result<()>,
+) -> impl FnMut(B256, u64, &[u8]) -> Result<()> + 'a {
+    move |address, span, payload| emit(Output::Chunk(address, chunk_wire(span, payload)))
+}
+
+/// One address's entries as they come from the merge: inline while they fit
+/// [`SPILL_INLINE_MAX`], then a spill file.
+enum Acc {
+    Inline(Vec<Entry>, usize),
+    Spill(Box<Spill>),
+}
+
+impl Acc {
+    fn push(
+        &mut self,
+        e: Entry,
+        first: u64,
+        stream_at: usize,
+        emit: &mut dyn FnMut(Output) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            Acc::Inline(entries, bytes) => {
+                let prev = entries.last().map_or(first, |x| x.block);
+                *bytes += entries_len(std::slice::from_ref(&e), prev);
+                entries.push(e);
+                if *bytes > SPILL_INLINE_MAX {
+                    let mut spill = Box::<Spill>::default();
+                    for x in entries.iter() {
+                        spill.push(x, stream_at, emit)?;
+                    }
+                    *self = Acc::Spill(spill);
+                }
+                Ok(())
+            }
+            Acc::Spill(spill) => spill.push(&e, stream_at, emit),
+        }
+    }
 }
 
 /// The descriptor and counts of a built slice; its buckets and files went to the caller.
@@ -103,6 +230,8 @@ pub struct SliceBuilder {
     tmp: Option<TempDir>,
     runs: Vec<PathBuf>,
     cancel: Arc<AtomicBool>,
+    /// Spill files above this many bytes are handed out as chunks ([`STREAM_FILE`]).
+    stream_file: usize,
 }
 
 fn check(cancel: &AtomicBool) -> Result<()> {
@@ -148,8 +277,16 @@ impl SliceBuilder {
             tmp_parent: tmp_parent.to_path_buf(),
             tmp: None,
             runs: Vec::new(),
+            stream_file: STREAM_FILE,
             cancel: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Hands out spill files above `bytes` as chunks (default [`STREAM_FILE`]); a test hook
+    /// for small slices.
+    pub fn with_stream_file(mut self, bytes: usize) -> Self {
+        self.stream_file = bytes;
+        self
     }
 
     /// A flag that, once set, makes the build stop at its next look (it looks every
@@ -254,49 +391,51 @@ impl SliceBuilder {
         };
         let mut seen = HashSet::new();
         let (mut addresses, mut appearances, mut total, mut spilled) = (0u64, 0u64, 0usize, 0u32);
-        let mut current: Option<[u8; 32]> = None; // h[0..12] ‖ address
-        let mut entries: Vec<Entry> = Vec::new();
-        let mut flush = |key: [u8; 32], entries: &mut Vec<Entry>| -> Result<()> {
-            appearances += entries.len() as u64;
-            addresses += 1;
-            let h: [u8; 12] = key[..12].try_into().unwrap();
-            let fp: [u8; 8] = h[4..12].try_into().unwrap();
-            let rec = if entries_len(entries, first) > SPILL_INLINE_MAX {
-                let file = spill_file(entries);
-                ensure!(
-                    file.len() <= MAX_FILE,
-                    "slice ({level}, {index}): an address with {} entries needs a spill file of \
-                     {} bytes, above the {MAX_FILE} a client reads",
-                    entries.len(),
-                    file.len()
-                );
-                let spill_ref = file_reference(&file);
-                if seen.insert(spill_ref) {
-                    emit(Output::File(spill_ref, file))?;
-                }
-                spilled += 1;
-                AddressRecord {
-                    fp,
-                    entries: Entries::Spilled {
-                        count: entries.len() as u64,
-                        spill_ref,
-                    },
-                }
-            } else {
-                AddressRecord {
-                    fp,
-                    entries: Entries::Inline(std::mem::take(entries)),
-                }
+        let stream_at = self.stream_file;
+        let mut flush =
+            |key: [u8; 32], acc: Acc, emit: &mut dyn FnMut(Output) -> Result<()>| -> Result<()> {
+                addresses += 1;
+                let h: [u8; 12] = key[..12].try_into().unwrap();
+                let fp: [u8; 8] = h[4..12].try_into().unwrap();
+                let rec = match acc {
+                    Acc::Inline(entries, _) => {
+                        appearances += entries.len() as u64;
+                        AddressRecord {
+                            fp,
+                            entries: Entries::Inline(entries),
+                        }
+                    }
+                    Acc::Spill(spill) => {
+                        let (spill_ref, count, whole) = spill.finish(stream_at, emit)?;
+                        appearances += count;
+                        // A whole file is listed once (two addresses can have the same entries);
+                        // a streamed one was handed out as it was written, so two identical
+                        // streamed files (identical entries above STREAM_FILE, which hardly
+                        // ever happens) upload their chunks twice. Uploads are idempotent.
+                        if let Some(file) = whole
+                            && seen.insert(spill_ref)
+                        {
+                            emit(Output::File(spill_ref, file))?;
+                        }
+                        spilled += 1;
+                        AddressRecord {
+                            fp,
+                            entries: Entries::Spilled { count, spill_ref },
+                        }
+                    }
+                };
+                let mut bytes = Vec::new();
+                rec.encode(&mut bytes, first);
+                total += bytes.len();
+                spool.write_all(&key)?;
+                spool.write_all(&(bytes.len() as u32).to_be_bytes())?;
+                spool.write_all(&bytes)?;
+                Ok(())
             };
-            entries.clear();
-            let mut bytes = Vec::new();
-            rec.encode(&mut bytes, first);
-            total += bytes.len();
-            spool.write_all(&key)?;
-            spool.write_all(&(bytes.len() as u32).to_be_bytes())?;
-            spool.write_all(&bytes)?;
-            Ok(())
-        };
+        // The address being read, its entries so far, and its last entry, which an item of
+        // the same block and slot can still add roles to.
+        let mut current: Option<([u8; 32], Acc)> = None; // h[0..12] ‖ address
+        let mut pending: Option<Entry> = None;
         let mut items = 0u64;
         while let Some(item) = source.next_item()? {
             items += 1;
@@ -304,25 +443,37 @@ impl SliceBuilder {
                 check(&self.cancel)?;
             }
             let key: [u8; 32] = item[..32].try_into().unwrap();
-            if current != Some(key) {
-                if let Some(k) = current {
-                    flush(k, &mut entries)?;
-                }
-                current = Some(key);
-            }
             let block = u64::from_be_bytes(item[32..40].try_into().unwrap());
             let slot = u32::from_be_bytes(item[40..44].try_into().unwrap());
-            match entries.last_mut() {
+            if current.as_ref().map(|c| c.0) != Some(key) {
+                if let Some((k, mut acc)) = current.take() {
+                    if let Some(e) = pending.take() {
+                        acc.push(e, first, stream_at, emit)?;
+                    }
+                    flush(k, acc, emit)?;
+                }
+                current = Some((key, Acc::Inline(Vec::new(), 0)));
+            }
+            match &mut pending {
                 Some(e) if (e.block, e.slot) == (block, slot) => e.roles |= item[44],
-                _ => entries.push(Entry {
-                    block,
-                    slot,
-                    roles: item[44],
-                }),
+                _ => {
+                    let next = Entry {
+                        block,
+                        slot,
+                        roles: item[44],
+                    };
+                    if let Some(e) = pending.replace(next) {
+                        let acc = &mut current.as_mut().expect("an address is being read").1;
+                        acc.push(e, first, stream_at, emit)?;
+                    }
+                }
             }
         }
-        if let Some(k) = current {
-            flush(k, &mut entries)?;
+        if let Some((k, mut acc)) = current.take() {
+            if let Some(e) = pending.take() {
+                acc.push(e, first, stream_at, emit)?;
+            }
+            flush(k, acc, emit)?;
         }
         // The runs are read: close them and free their disk while the spool is read.
         if let Source::Runs(m) = source {
@@ -570,6 +721,96 @@ mod tests {
     use super::*;
     use alloy::primitives::Address;
 
+    /// Files or chunks by reference or address.
+    type Blobs = Vec<(B256, Vec<u8>)>;
+
+    /// Builds `apps` into slice (0, 1), with spill files above `stream_at` streamed: the
+    /// descriptor, the buckets, the files and the chunks.
+    fn build(apps: &[Appearance], stream_at: usize) -> (Built, Vec<Vec<u8>>, Blobs, Blobs) {
+        let mut b = SliceBuilder::new((0, 1), 0, 0xdf, &std::env::temp_dir(), 1 << 20)
+            .unwrap()
+            .with_stream_file(stream_at);
+        for a in apps {
+            b.push(a).unwrap();
+        }
+        let (mut buckets, mut files, mut chunks) = (Vec::new(), Vec::new(), Vec::new());
+        let built = b
+            .finish(B256::ZERO, None, &mut |out| {
+                match out {
+                    Output::File(r, f) => files.push((r, f)),
+                    Output::Chunk(a, w) => chunks.push((a, w)),
+                    Output::Bucket(_, p) => buckets.push(p),
+                }
+                Ok(())
+            })
+            .unwrap();
+        (built, buckets, files, chunks)
+    }
+
+    /// The bytes below `r` among `chunks` (wire form), walking the tree as a reader does.
+    fn read_tree(chunks: &std::collections::HashMap<B256, Vec<u8>>, r: &B256, out: &mut Vec<u8>) {
+        let w = &chunks[r];
+        let span = u64::from_le_bytes(w[..8].try_into().unwrap());
+        assert_eq!(crate::swarm::bmt::cac_address(span, &w[8..]), *r);
+        if span as usize <= PAGE_SIZE {
+            out.extend_from_slice(&w[8..]);
+        } else {
+            for c in w[8..].chunks(32) {
+                read_tree(chunks, &B256::from_slice(c), out);
+            }
+        }
+    }
+
+    #[test]
+    fn a_large_spill_file_is_streamed_as_the_chunks_of_the_same_file() {
+        // A busy address of 3000 entries (three pages, some entries sharing a block and
+        // slot, whose roles merge) and a quiet one.
+        let busy = Address::repeat_byte(0x42);
+        let mut apps: Vec<Appearance> = (0..3000u64)
+            .map(|i| Appearance {
+                block: 64 + i / 50,
+                slot: (i % 50) as u32 + 1,
+                address: busy,
+                roles: 1,
+            })
+            .collect();
+        apps.push(Appearance {
+            block: 64,
+            slot: 1,
+            address: busy,
+            roles: 4,
+        });
+        apps.push(Appearance {
+            block: 70,
+            slot: 2,
+            address: Address::repeat_byte(0x07),
+            roles: 2,
+        });
+        let (whole, buckets_whole, files, none) = build(&apps, STREAM_FILE);
+        assert!(none.is_empty());
+        assert_eq!(files.len(), 1);
+        let file = &files[0].1;
+        assert_eq!(pages_of(file), 3);
+        for stream_at in [0, PAGE_SIZE, 2 * PAGE_SIZE] {
+            let (streamed, buckets, files, chunks) = build(&apps, stream_at);
+            assert!(files.is_empty(), "stream at {stream_at}");
+            // The same buckets (the record names the same reference), the same descriptor.
+            assert_eq!(buckets, buckets_whole, "stream at {stream_at}");
+            assert_eq!(streamed.record, whole.record);
+            // The chunks are the file's: its root last, the tree read back gives the file.
+            let root = chunks.last().unwrap().0;
+            assert_eq!(root, file_reference(file));
+            let map: std::collections::HashMap<_, _> = chunks.into_iter().collect();
+            let mut back = Vec::new();
+            read_tree(&map, &root, &mut back);
+            assert_eq!(&back, file, "stream at {stream_at}");
+        }
+    }
+
+    fn pages_of(file: &[u8]) -> usize {
+        file.len().div_ceil(PAGE_SIZE)
+    }
+
     fn peak_rss_kb() -> u64 {
         std::fs::read_to_string("/proc/self/status")
             .ok()
@@ -618,7 +859,7 @@ mod tests {
         let built = b
             .finish(B256::ZERO, None, &mut |out| {
                 match out {
-                    Output::File(_, f) => bytes += f.len() as u64,
+                    Output::File(_, f) | Output::Chunk(_, f) => bytes += f.len() as u64,
                     Output::Bucket(_, p) => {
                         buckets += 1;
                         bytes += p.len() as u64

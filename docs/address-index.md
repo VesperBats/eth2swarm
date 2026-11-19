@@ -252,13 +252,15 @@ replaces: it is built from the blocks again. The importer does that with bounded
    along it, so a bucket's records are consecutive; they are ordered by (fingerprint,
    address), encoded, paged if needed, and published at once. The descriptor goes last.
 
-Memory is the sort buffer, one bucket, the entries (16 bytes each) and spill file of the
-busiest address, and 32 bytes per bucket and per file of the slice; temporary disk is about
-45 bytes per appearance of the slice being built, plus its records. The busiest address is
-the one part that grows with the slice: a token contract in a top-level slice has tens of
-millions of entries, which is several GB and a spill file beyond the client's 256 MB read
-limit. Writing spill files as a stream, and paging them for the client, is still open; up to
-level 12 (about a month) it stays in the hundreds of MB. Measured on
+Memory is the sort buffer, one bucket, and 32 bytes per bucket and per file of the slice;
+temporary disk is about 45 bytes per appearance of the slice being built, plus its records.
+A busy address does not add to it: its entries go into its spill file page by page as the
+merge yields them, and a spill file above 1 MiB is chunked as it is written (the chunks of
+Bee's tree for the whole file, its root last) and handed out chunk by chunk, so memory holds
+one page and one path of the tree. A token contract in a top-level slice, tens of millions of
+entries and several GB of spill file, takes no more memory than a quiet address. Such a file
+is above the 256 MB a client reads whole: a client reads it page by page (*Client lookup*,
+step 4). Measured on
 synthetic data: 100 M appearances (about a week of mainnet) in one slice with a 64 MB buffer
 peaked at 91 MiB and took 95 s, against about 10 GB in memory before.
 
@@ -327,7 +329,8 @@ locally, so the uploaded index is the one a direct import would have published; 
 postage stamps come from the upload.
 
 - The export is one append-only log of records in upload order (`kind ‖ key ‖ life ‖ length ‖
-  data`): files under their reference, slice descriptors and buckets as SOCs in wire form
+  data`): files under their reference (a spill file above 1 MiB as its chunks, each in wire
+  form under its address, the root last), slice descriptors and buckets as SOCs in wire form
   under their address, and heads (and the origin) the same way; `life` is how many more
   units the record must stay (layout 2, *Lifetime*; permanent: all ones). A head is a barrier:
   `addr-upload` sends the records between two heads in parallel, and a head only after
@@ -643,7 +646,9 @@ Newest first, for address `A`:
    `k` and `fp`, read bucket `k`, and scan it for `fp` (records have variable length, so the
    2.8 KB are read front to back). For a paged bucket, binary-search its pages.
 4. For a spilled address, walk the spill file's tree from its root chunk to the last page,
-   then earlier pages as the user scrolls. Each tree level is one chunk and one round
+   then earlier pages as the user scrolls. (`ethswarm` reads a spill file of up to 256 MB
+   whole; a larger one page by page, every page for a lookup, the newest pages in the
+   inspector's spill view.) Each tree level is one chunk and one round
    trip: root and page for up to 128 pages, one intermediate level more up to 16,384 pages
    (≈ 16 million entries). A binary search over pages costs such a path per probe.
 5. Stop when the screen is full; continue with older slices on demand.

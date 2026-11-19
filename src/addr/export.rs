@@ -10,6 +10,8 @@
 //!   (`identifier ‖ signature ‖ span ‖ payload`); the key is its address.
 //! * [`HEAD`]: a head update or the origin, the same way. A head is a barrier: everything
 //!   before it is uploaded before it, as the importer does with a Bee node.
+//! * [`CHUNK`]: one chunk of a spill file too large to be written whole, in wire form, under
+//!   its address; the file's root chunk comes after the others (layout 2).
 //!
 //! `life` is how many more units the record must stay retrievable after it was written
 //! (`u64::MAX`: permanently), which `addr-upload` matches with a batch's TTL
@@ -48,6 +50,9 @@ use crate::swarm::soc::{self, SignedSoc, soc_address};
 pub const FILE: u8 = 1;
 pub const SOC: u8 = 2;
 pub const HEAD: u8 = 3;
+/// One chunk of a large spill file, under its address, in wire form (`span ‖ payload`):
+/// such a file is never held whole (layout 2 only).
+pub const CHUNK: u8 = 4;
 
 /// Bytes before a record's data, in layout `format`.
 fn record_header(format: u32) -> u64 {
@@ -254,6 +259,11 @@ impl ExportLog {
         Ok(())
     }
 
+    /// The layout this log is written in.
+    pub fn format(&self) -> u32 {
+        self.format
+    }
+
     pub fn append_soc(
         &mut self,
         kind: u8,
@@ -373,7 +383,7 @@ impl Records {
             .with_context(|| format!("reading the record at {}", self.offset))?;
         let kind = head[0];
         ensure!(
-            matches!(kind, FILE | SOC | HEAD),
+            matches!(kind, FILE | SOC | HEAD) || (kind == CHUNK && self.format >= 2),
             "record of unknown kind {kind} at {}",
             self.offset
         );
@@ -434,6 +444,8 @@ pub struct UploadSummary {
     pub owner: Address,
     pub chain_id: u64,
     pub files: u64,
+    /// Chunks of large spill files.
+    pub chunks: u64,
     pub socs: u64,
     pub heads: u64,
     /// The log offset uploaded to, of `committed`.
@@ -445,6 +457,11 @@ pub struct UploadSummary {
 /// address and the export's owner. Returns the SOC for SOC records.
 fn check(rec: &Record, owner: &Address) -> Result<Option<SignedSoc>> {
     match rec.kind {
+        CHUNK => {
+            crate::swarm::file::checked_chunk(&rec.data, &rec.key, None)
+                .with_context(|| format!("chunk record at {}", rec.offset))?;
+            Ok(None)
+        }
         FILE => {
             let got = file_reference(&rec.data);
             ensure!(
@@ -539,6 +556,7 @@ async fn upload_one(
     soc: Option<SignedSoc>,
 ) -> Result<()> {
     let got = match soc {
+        None if rec.kind == CHUNK => bee.upload_chunk(&batch, rec.data).await?,
         None => bee.upload_file(&batch, rec.data).await?,
         Some(soc) => bee.upload_soc(&batch, &owner, &soc).await?,
     };
@@ -677,6 +695,7 @@ pub async fn upload(
             }
             match kind {
                 FILE => summary.files += 1,
+                CHUNK => summary.chunks += 1,
                 _ => summary.socs += 1,
             }
             let b = stamps.batch_for(rec.life).await?;

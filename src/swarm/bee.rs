@@ -151,6 +151,13 @@ impl Bee {
         .await
     }
 
+    /// Upload one content-addressed chunk in wire form (`span ‖ payload`); returns its address
+    /// as reported by Bee.
+    pub async fn upload_chunk(&self, batch: &B256, wire: Vec<u8>) -> Result<B256> {
+        self.post_with_retry(self.url("chunks")?, batch, wire, &[])
+            .await
+    }
+
     /// Upload a signed SOC; returns its address as reported by Bee.
     pub async fn upload_soc(&self, batch: &B256, owner: &Address, soc: &SignedSoc) -> Result<B256> {
         let path = format!(

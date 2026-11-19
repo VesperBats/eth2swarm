@@ -6,14 +6,44 @@ use alloy::providers::Provider;
 use anyhow::{Context, Result, ensure};
 
 use super::layout::{
-    AddressRecord, BucketBody, BucketRecord, Entries, Entry, HeadRecord, MAX_FILE, SliceRecord,
-    bucket_id, bucket_pages_file, decode_bucket_page, decode_spill_page, head_id, held_first_block,
-    last_block, origin_id, pages, slice_id, spill_file,
+    AddressRecord, BucketBody, BucketRecord, Entries, Entry, HeadRecord, MAX_FILE, PAGE_SIZE,
+    SliceRecord, bucket_id, bucket_pages_file, decode_bucket_page, decode_spill_page, entries_len,
+    head_id, held_first_block, last_block, origin_id, pages, slice_id, spill_file,
 };
 use super::slice::{SliceId, resolve_after};
 use crate::accumulator::{Tree, depth_for};
 use crate::swarm::bee::Bee;
-use crate::swarm::file::file_reference;
+use crate::swarm::file::{CachedChunks, file_reference, file_span, read_leaf, read_leaves};
+
+/// The largest spill file read whole (one `GET /bytes`); a larger one is read page by page
+/// through its chunk tree. `ETH2SWARM_ADDR_WHOLE_FILE_BYTES` lowers it, a test hook.
+fn whole_file_limit() -> Result<usize> {
+    match std::env::var("ETH2SWARM_ADDR_WHOLE_FILE_BYTES") {
+        Ok(v) => Ok(v
+            .parse::<usize>()
+            .with_context(|| format!("ETH2SWARM_ADDR_WHOLE_FILE_BYTES={v}"))?
+            .min(MAX_FILE)),
+        Err(_) => Ok(MAX_FILE),
+    }
+}
+
+/// Bytes an entry takes at most in a spill page: a 10-byte block delta, a 5-byte slot, roles.
+const ENTRY_MAX: u64 = 16;
+
+/// How a spill file is read: whole, or page by page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpillRead {
+    Whole,
+    Paged,
+}
+
+/// Chunks of a large spill file fetched at a time.
+const PAGE_READS: usize = 16;
+
+/// A spill page's bytes before its padding: `count`, `first_block` and its entries.
+fn page_content(entries: &[Entry]) -> usize {
+    6 + entries_len(entries, entries[0].block)
+}
 use crate::swarm::soc::{self, soc_address};
 
 /// Reads `addr1` records of one owner on one chain, checking signatures and identities.
@@ -167,9 +197,59 @@ impl IndexReader {
         Ok((payload, records, files))
     }
 
+    /// Whether the spill file of a record of `count` entries is read whole or page by page. A
+    /// count small enough that the file cannot exceed the whole-file limit needs no request;
+    /// otherwise its root chunk says the size.
+    async fn spill_read(&self, spill_ref: &B256, count: u64) -> Result<SpillRead> {
+        let limit = whole_file_limit()? as u64;
+        // Pages hold at least 255 entries each, plus their header and padding.
+        if count
+            .saturating_mul(ENTRY_MAX + 1)
+            .saturating_add(PAGE_SIZE as u64)
+            <= limit
+        {
+            return Ok(SpillRead::Whole);
+        }
+        Ok(if file_span(&self.bee, *spill_ref).await? > limit {
+            SpillRead::Paged
+        } else {
+            SpillRead::Whole
+        })
+    }
+
     /// The entries of a spilled address record of the slice `rec` describes, checked: the
-    /// stated count, ascending across pages, and the canonical encoding.
+    /// stated count, ascending across pages, and the canonical encoding. A file above the
+    /// whole-file limit is read page by page (the same checks, page against page).
     pub async fn spill_entries(
+        &self,
+        rec: &SliceRecord,
+        spill_ref: &B256,
+        count: u64,
+    ) -> Result<Vec<Entry>> {
+        match self.spill_read(spill_ref, count).await? {
+            SpillRead::Whole => self.spill_whole(rec, spill_ref, count).await,
+            SpillRead::Paged => {
+                let mut entries = Vec::new();
+                self.spill_pages(rec, spill_ref, count, &mut |es| {
+                    entries.extend_from_slice(es)
+                })
+                .await?;
+                Ok(entries)
+            }
+        }
+    }
+
+    /// Checks a spilled record's file as [`Self::spill_entries`] does, without keeping its
+    /// entries: a file read page by page takes one page of memory, whatever its size.
+    pub async fn check_spill(&self, rec: &SliceRecord, spill_ref: &B256, count: u64) -> Result<()> {
+        match self.spill_read(spill_ref, count).await? {
+            SpillRead::Whole => self.spill_whole(rec, spill_ref, count).await.map(drop),
+            SpillRead::Paged => self.spill_pages(rec, spill_ref, count, &mut |_| {}).await,
+        }
+    }
+
+    /// A spill file read whole, checked.
+    async fn spill_whole(
         &self,
         rec: &SliceRecord,
         spill_ref: &B256,
@@ -198,6 +278,96 @@ impl IndexReader {
             "spill file {spill_ref} not canonically encoded"
         );
         Ok(entries)
+    }
+
+    /// A spill file read page by page through its chunk tree, each page's entries handed to
+    /// `page` in order, checked: every page decodes, the entries ascend across pages, each page
+    /// is full (the next one's first entry did not fit), only the last is unpadded, and the
+    /// count is the stated one.
+    async fn spill_pages(
+        &self,
+        rec: &SliceRecord,
+        spill_ref: &B256,
+        count: u64,
+        page: &mut (dyn FnMut(&[Entry]) + Send),
+    ) -> Result<()> {
+        let (first, last) = (rec.first_block, rec.last_block());
+        let mut seen = 0u64;
+        // The previous page: its content length, its length, its last entry.
+        let mut prev: Option<(usize, usize, Entry)> = None;
+        read_leaves(&self.bee, *spill_ref, u64::MAX, PAGE_READS, &mut |leaf| {
+            let es = decode_spill_page(&leaf, first, last)?;
+            if let Some((content, _, e)) = prev {
+                let next = es[0];
+                ensure!(
+                    (e.block, e.slot) < (next.block, next.slot),
+                    "spill file {spill_ref}: entries not ascending across pages"
+                );
+                ensure!(
+                    content + entries_len(std::slice::from_ref(&next), e.block) > PAGE_SIZE,
+                    "spill file {spill_ref} not canonically encoded: a page ends early"
+                );
+            }
+            seen += es.len() as u64;
+            ensure!(
+                seen <= count,
+                "spill file {spill_ref} holds more than the {count} entries it states"
+            );
+            prev = Some((page_content(&es), leaf.len(), *es.last().unwrap()));
+            page(&es);
+            Ok(())
+        })
+        .await?;
+        let (content, len, _) = prev.context("an empty spill file")?;
+        ensure!(
+            content == len,
+            "spill file {spill_ref} not canonically encoded: its last page is padded"
+        );
+        ensure!(
+            seen == count,
+            "spill file {spill_ref} states {count} entries, holds {seen}"
+        );
+        Ok(())
+    }
+
+    /// Up to `limit` of the newest entries of a spilled address record, newest first, and
+    /// whether the whole file was read and checked ([`Self::spill_entries`]). A file above the
+    /// whole-file limit is read from its last page backwards, as a client shows a busy
+    /// address: only those pages are read and checked.
+    pub async fn spill_newest(
+        &self,
+        rec: &SliceRecord,
+        spill_ref: &B256,
+        count: u64,
+        limit: usize,
+    ) -> Result<(Vec<Entry>, bool)> {
+        if self.spill_read(spill_ref, count).await? == SpillRead::Whole {
+            let all = self.spill_whole(rec, spill_ref, count).await?;
+            return Ok((all.into_iter().rev().take(limit).collect(), true));
+        }
+        let (first, last) = (rec.first_block, rec.last_block());
+        // The root and the intermediate chunks above the last pages are read once.
+        let src = CachedChunks::new(self.bee.clone());
+        let pages = file_span(&src, *spill_ref)
+            .await?
+            .div_ceil(PAGE_SIZE as u64);
+        let mut out: Vec<Entry> = Vec::new();
+        let mut i = pages;
+        while i > 0 && out.len() < limit {
+            i -= 1;
+            let page = read_leaf(&src, *spill_ref, i).await?;
+            let es = decode_spill_page(&page, first, last)?;
+            if let Some(newer) = out.last() {
+                let e = es.last().unwrap();
+                ensure!(
+                    (e.block, e.slot) < (newer.block, newer.slot),
+                    "spill file {spill_ref}: entries not ascending across pages"
+                );
+            }
+            out.extend(es.into_iter().rev());
+        }
+        out.truncate(limit);
+        Ok((out, false))
     }
 
     /// The head announcing exactly `units` units, given the origin.
@@ -298,7 +468,7 @@ async fn check_bucket(r: IndexReader, rec: SliceRecord, k: u32) -> Result<Bucket
         c.appearances += match address_rec.entries {
             Entries::Inline(e) => e.len() as u64,
             Entries::Spilled { count, spill_ref } => {
-                r.spill_entries(&rec, &spill_ref, count).await?;
+                r.check_spill(&rec, &spill_ref, count).await?;
                 files += 1;
                 count
             }

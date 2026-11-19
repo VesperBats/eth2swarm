@@ -280,33 +280,72 @@ fn check_padding(rest: &[u8], page_len: usize) -> Result<()> {
 /// `first_block` (so 0), every other entry's to the previous entry.
 pub fn spill_file(entries: &[Entry]) -> Vec<u8> {
     let mut file = Vec::new();
-    let mut body = Vec::new();
-    let mut count = 0u16;
-    let mut prev = 0;
+    let mut pages = SpillPages::default();
+    let mut out = |page: &[u8]| -> Result<()> {
+        file.extend_from_slice(page);
+        Ok(())
+    };
     for e in entries {
-        let len = if count == 0 {
+        pages
+            .push(e, &mut out)
+            .expect("collecting pages cannot fail");
+    }
+    pages
+        .finish(&mut out)
+        .expect("collecting pages cannot fail");
+    file
+}
+
+/// A spill file built entry by entry ([`spill_file`]'s pages): every full page is handed out
+/// padded to [`PAGE_SIZE`] as soon as the next entry does not fit, the last one unpadded at
+/// [`SpillPages::finish`]. Memory is one page, whatever the number of entries.
+#[derive(Debug, Default)]
+pub struct SpillPages {
+    /// The page being filled: `first_block ‖ entries`.
+    body: Vec<u8>,
+    count: u16,
+    prev: u64,
+}
+
+impl SpillPages {
+    /// Adds the next entry (ascending by block and slot).
+    pub fn push(&mut self, e: &Entry, out: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        let len = if self.count == 0 {
             0
         } else {
-            entries_len(std::slice::from_ref(e), prev)
+            entries_len(std::slice::from_ref(e), self.prev)
         };
-        if count == 0 || 2 + body.len() + len > PAGE_SIZE {
-            if count > 0 {
-                flush_page(&mut file, &body, count, false);
+        if self.count == 0 || 2 + self.body.len() + len > PAGE_SIZE {
+            if self.count > 0 {
+                out(&page(&self.body, self.count, false))?;
             }
-            body.clear();
-            count = 0;
-            let first = u32::try_from(e.block).expect("block number beyond u32 in a spill page");
-            body.extend(first.to_be_bytes());
-            prev = e.block;
+            self.body.clear();
+            self.count = 0;
+            let first =
+                u32::try_from(e.block).context("block number beyond u32 in a spill page")?;
+            self.body.extend(first.to_be_bytes());
+            self.prev = e.block;
         }
-        put_entries(&mut body, std::slice::from_ref(e), prev);
-        count += 1;
-        prev = e.block;
+        put_entries(&mut self.body, std::slice::from_ref(e), self.prev);
+        self.count += 1;
+        self.prev = e.block;
+        Ok(())
     }
-    if count > 0 {
-        flush_page(&mut file, &body, count, true);
+
+    /// Hands out the last page (unpadded), if there is one.
+    pub fn finish(self, out: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        if self.count > 0 {
+            out(&page(&self.body, self.count, true))?;
+        }
+        Ok(())
     }
-    file
+}
+
+/// One page: `count (u16) ‖ body`, zero-padded to [`PAGE_SIZE`] unless it is the last.
+fn page(body: &[u8], count: u16, last: bool) -> Vec<u8> {
+    let mut p = Vec::with_capacity(PAGE_SIZE);
+    flush_page(&mut p, body, count, last);
+    p
 }
 
 /// Decodes one spill page of a slice whose blocks are `first..=last`.
