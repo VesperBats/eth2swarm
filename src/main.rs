@@ -96,9 +96,21 @@ enum Command {
         /// Also read `trace_block` (see `appearances`).
         #[arg(long)]
         traces: bool,
-        /// Postage batch ID. Defaults to the Bee node's first usable batch.
+        /// Postage batch ID for the permanent records (everything, without --lower-batch).
+        /// Defaults to the Bee node's first usable batch.
         #[arg(long)]
         batch: Option<B256>,
+        /// A batch for the lower slices, which die once the head has passed them (repeatable).
+        /// Each lower slice goes to the one that expires soonest after the slice is dead plus
+        /// --grace-days, or to --batch if none lives that long. Heads, the origin and the
+        /// top-level slices always go to --batch. The importer never buys or tops up batches.
+        #[arg(long = "lower-batch")]
+        lower_batches: Vec<B256>,
+        /// Days a lower batch must outlive a slice (default 7): for clients holding an older
+        /// head, a deferred merge still being built (whose expansion stays in use meanwhile),
+        /// and the importer being stopped (its head's slices stay in use).
+        #[arg(long)]
+        grace_days: Option<u64>,
         /// Write everything to this directory instead of uploading it (no Bee node needed);
         /// `addr-upload` pushes it through a Bee node later. Every run of the index then
         /// passes the same directory. Keep it apart from --state.
@@ -152,10 +164,22 @@ enum Command {
     AddrUpload {
         /// The export directory.
         dir: std::path::PathBuf,
-        /// Postage batch ID. Defaults to the batch of the earlier uploads of this directory,
-        /// else the Bee node's first usable batch.
+        /// Postage batch ID for the permanent records (everything, without --lower-batch).
+        /// Defaults to the batch of the earlier uploads of this directory, else the Bee node's
+        /// first usable batch.
         #[arg(long)]
         batch: Option<B256>,
+        /// A batch for the lower slices, which die once the head has passed them (repeatable).
+        /// Each lower slice goes to the one that expires soonest after the slice is dead plus
+        /// --grace-days, or to --batch if none lives that long. Heads, the origin and the
+        /// top-level slices always go to --batch. The importer never buys or tops up batches.
+        #[arg(long = "lower-batch")]
+        lower_batches: Vec<B256>,
+        /// Days a lower batch must outlive a slice (default 7): for clients holding an older
+        /// head, a deferred merge still being built (whose expansion stays in use meanwhile),
+        /// and the importer being stopped (its head's slices stay in use).
+        #[arg(long)]
+        grace_days: Option<u64>,
         /// Records uploaded in parallel (between two heads).
         #[arg(long, default_value_t = 16)]
         concurrency: usize,
@@ -364,6 +388,8 @@ async fn main() -> Result<()> {
             from_block,
             traces,
             batch,
+            lower_batches,
+            grace_days,
             out,
             defer_level,
             max_level,
@@ -379,6 +405,8 @@ async fn main() -> Result<()> {
                 from_block,
                 traces,
                 batch,
+                lower_batches,
+                grace_days,
                 out,
                 defer_level,
                 max_level,
@@ -391,6 +419,7 @@ async fn main() -> Result<()> {
                 "Address index of owner {} on chain {}: {} units, head update {}",
                 s.owner, s.chain_id, s.units, s.head_index
             );
+            print_batches(&s.batches, s.fell_back, "slices and heads", "lower slices");
         }
         Command::DevnetActivity {
             key,
@@ -421,14 +450,27 @@ async fn main() -> Result<()> {
         Command::AddrUpload {
             dir,
             batch,
+            lower_batches,
+            grace_days,
             concurrency,
             from_start,
         } => {
-            let s = addr::export::upload(&bee, batch, &dir, concurrency, from_start).await?;
+            let batches = addr::export::Batches {
+                permanent: batch,
+                lower: lower_batches,
+                grace_days: grace_days.unwrap_or(addr::stamps::GRACE_DAYS),
+            };
+            let s = addr::export::upload(&bee, batches, &dir, concurrency, from_start).await?;
             println!(
                 "Uploaded the export of owner {} on chain {}: {} files, {} SOCs, {} heads \
                  ({} of {} bytes)",
                 s.owner, s.chain_id, s.files, s.socs, s.heads, s.offset, s.committed
+            );
+            print_batches(
+                &s.batches,
+                s.fell_back,
+                "records",
+                "records of lower slices",
             );
         }
         Command::AddrLookup {
@@ -829,4 +871,22 @@ where
         println!("Matches the chain: every entry is on it, none is missing.");
     }
     Ok(())
+}
+
+/// The batches a run stamped with, and how many lower-slice items fell back to the permanent
+/// batch.
+fn print_batches(
+    batches: &std::collections::BTreeMap<B256, u64>,
+    fell_back: u64,
+    what: &str,
+    lower: &str,
+) {
+    for (b, n) in batches {
+        println!("  batch {b}: {n} {what}");
+    }
+    if fell_back > 0 {
+        println!(
+            "  {fell_back} {lower} went to the permanent batch: no --lower-batch lived long enough"
+        );
+    }
 }

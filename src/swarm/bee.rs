@@ -45,6 +45,16 @@ struct Stamps {
     stamps: Vec<Stamp>,
 }
 
+/// What Bee says about one postage batch.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchInfo {
+    pub usable: bool,
+    /// Seconds until the batch expires at the current price (`-1`: unknown).
+    #[serde(rename = "batchTTL")]
+    pub ttl: i64,
+}
+
 impl Bee {
     pub fn new(mut base: Url) -> Result<Self> {
         // `Url::join` replaces the last path segment unless the base ends with '/'.
@@ -95,6 +105,18 @@ impl Bee {
             .find(|s| s.usable)
             .map(|s| s.batch_id)
             .context("Bee node has no usable postage batch (pass --batch)")
+    }
+
+    /// A postage batch of this node: whether it is usable and how long it lives.
+    pub async fn batch(&self, id: &B256) -> Result<BatchInfo> {
+        self.http
+            .get(self.url(&format!("stamps/{}", hex::encode(id)))?)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("parsing /stamps/{batch}")
     }
 
     /// Upload arbitrary bytes as a Swarm file (chunk tree); returns its root reference.

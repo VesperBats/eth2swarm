@@ -442,6 +442,77 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   echo "ok: the index from block $((S * 64)) verifies, holds the busy address's $N entries and the sender's $LATE_SENDER since its start, matches the chain from there, and keeps its start"
 fi
 
+echo "== postage batches by lifetime: lower slices go to the batch that expires soonest after them"
+# Two lower batches on the upload node: one at the minimum validity (about 17,000 s on
+# bee-factory) and a long one. With no grace period, the backfill of 40 units writes (5, 0),
+# which lives 24 more units (18,432 s: the long batch), and (3, 4), 8 units (the short
+# one); units 41..44 write slices of levels 0-2, which live at most 4 units (the short one);
+# heads and the origin go to the permanent batch.
+buy_batch() {
+  curl -sf -X POST "$UPLOAD_BEE/stamps/$1/17" \
+    | python3 -c 'import json, sys; print("0x" + json.load(sys.stdin)["batchID"])'
+}
+batch_info() {
+  curl -sf "$UPLOAD_BEE/stamps/${1#0x}" \
+    | python3 -c 'import json, sys; d = json.load(sys.stdin); print(d["usable"], d["batchTTL"])'
+}
+PERM=0x$(curl -sf "$UPLOAD_BEE/stamps" \
+  | python3 -c 'import json, sys; print(next(s["batchID"] for s in json.load(sys.stdin)["stamps"] if s["usable"]))')
+SHORT=$(buy_batch 420000000) || { echo "FAIL: buying a short batch"; exit 1; }
+LONG=$(buy_batch 5000000000) || { echo "FAIL: buying a long batch"; exit 1; }
+USABLE=""
+for i in $(seq 1 60); do
+  if [ "$(batch_info "$SHORT" | cut -d' ' -f1)" = True ] && [ "$(batch_info "$LONG" | cut -d' ' -f1)" = True ]; then
+    USABLE=1; break
+  fi
+  sleep 2
+done
+[ -n "$USABLE" ] || { echo "FAIL: the bought batches $SHORT and $LONG are not usable after 120 s"; exit 1; }
+read -r _ SHORT_TTL <<<"$(batch_info "$SHORT")"
+read -r _ LONG_TTL <<<"$(batch_info "$LONG")"
+[ "$SHORT_TTL" -gt 6144 ] && [ "$SHORT_TTL" -lt 18432 ] && [ "$LONG_TTL" -gt 18432 ] \
+  || { echo "FAIL: batch TTLs $SHORT_TTL and $LONG_TTL do not bracket the slices' 6,144 and 18,432 s"; exit 1; }
+LT_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+LT_STATE=$(mktemp -d)
+lt_import() {
+  $BIN --bee "$UPLOAD_BEE" addr-import --key "$LT_KEY" --state "$LT_STATE" --batch "$PERM" \
+    --lower-batch "$SHORT" --lower-batch "$LONG" --grace-days 0 "${TRACE_FLAG[@]}" "$@"
+}
+# "<batch>: <count>" per batch the run stamped, sorted, as one line.
+stamped() {
+  awk -v p="$PERM" -v s="$SHORT" -v l="$LONG" '$1 == "batch" {
+      b = tolower($2); sub(":", "", b)
+      n = (b == tolower(p)) ? "permanent" : (b == tolower(s)) ? "short" : (b == tolower(l)) ? "long" : b
+      print n "=" $3 }
+    /went to the permanent batch/ { print "fell_back=" $1 }' | sort | tr '\n' ' '
+}
+OUT=$(lt_import --init --units 40) || { echo "FAIL: addr-import with lower batches"; echo "$OUT"; exit 1; }
+LT_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
+GOT=$(echo "$OUT" | stamped)
+[ "$GOT" = "long=1 permanent=2 short=1 " ] \
+  || { echo "FAIL: the backfill stamped '$GOT', expected (5, 0) long, (3, 4) short, head 0 and the origin permanent"; echo "$OUT"; exit 1; }
+OUT=$(lt_import --units 44) || { echo "FAIL: addr-import 44 units with lower batches"; echo "$OUT"; exit 1; }
+GOT=$(echo "$OUT" | stamped)
+[ "$GOT" = "permanent=4 short=4 " ] \
+  || { echo "FAIL: units 41-44 stamped '$GOT', expected four short-lived slices and four heads"; echo "$OUT"; exit 1; }
+$BIN --bee "$READ_BEE" addr-verify --owner "$LT_OWNER" --chain-id "$CHAIN_ID" --units 44 >/dev/null \
+  || { echo "FAIL: addr-verify of the index stamped by lifetime"; exit 1; }
+# The same through an export: the log carries each record's lifetime, addr-upload chooses.
+LT_EXP_STATE=$(mktemp -d)
+LT_EXP=$(mktemp -d)/export
+$BIN --bee http://127.0.0.1:9 addr-import --key 0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n') \
+  --state "$LT_EXP_STATE" --out "$LT_EXP" --init --units 40 "${TRACE_FLAG[@]}" >/dev/null \
+  || { echo "FAIL: addr-import --out for the lifetime upload"; exit 1; }
+OUT=$($BIN --bee "$UPLOAD_BEE" addr-upload "$LT_EXP" --batch "$PERM" --lower-batch "$SHORT" \
+  --lower-batch "$LONG" --grace-days 0) || { echo "FAIL: addr-upload with lower batches"; echo "$OUT"; exit 1; }
+GOT=$(echo "$OUT" | stamped)
+case "$GOT" in
+  "long="[1-9]*" permanent=2 short="[1-9]*" ") ;;
+  *) echo "FAIL: the export's upload stamped '$GOT', expected long, two heads permanent, short"; echo "$OUT"; exit 1 ;;
+esac
+rm -rf "$LT_STATE" "$LT_EXP_STATE" "$(dirname "$LT_EXP")"
+echo "ok: lower slices stamped by lifetime (short batch TTL ${SHORT_TTL} s, long ${LONG_TTL} s), directly and through an export; heads and the origin on the permanent batch"
+
 echo "== inspector (ethswarm serve) verifies a block via $READ_BEE"
 # INSPECTOR_ADDR is an IP:port (a socket address, not a host name). Refuse a port that
 # is already taken: the checks would otherwise talk to whatever holds it.
