@@ -451,11 +451,12 @@ importer sets it. With it, the reference can be computed before uploading
 names its spill and pages files.
 
 `testdata/addr1-reader-vectors.txt` holds conformance vectors for independent readers: slices
-built by the slice builder at the edges of these encodings (a spill file of two pages, inline
-entries of exactly `SPILL_INLINE_MAX` bytes and one byte more, a bucket of exactly
-`PAGE_SIZE` bytes inline and one byte more, paged, a pages file of three pages, and a slice
-of an index that starts inside it, with roles of several bits), with every address's entries,
-read back from those bytes, and an address each slice has no record of. A test
+built by the slice builder at the edges of these encodings (spill and pages files of several
+pages, pages filled to the last byte, inline entries of exactly 256 bytes and of 257, a bucket
+of exactly 4096 bytes inline and of 4097, paged, a spilled record in a paged bucket, a slice
+of an index that starts inside it, and a slice at mainnet height with block deltas of three
+and four bytes), with every bucket, every address's entries, read back from those bytes, and
+an address each slice has no record of. A test
 (`src/addr/vectors.rs`) fails when the builder's output changes, so a format change shows up
 as a diff of that file.
 
