@@ -126,7 +126,8 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
     </form>
     <div class="muted" style="margin:-8px 0 14px;font-size:12px">The addr1 address index of the SOC owner above on the chain ID above
       (eth2swarm <code>docs/address-index.md</code>). Every SOC signature, chunk and file reference is checked with the code
-      <code>ethswarm addr-lookup</code> uses.</div>
+      <code>ethswarm addr-lookup</code> uses. Don't know an address with entries?
+      <button type="button" class="ref" id="addrExamples">Show example addresses</button> (well-known addresses of the chain, counted against the index).</div>
     <div id="out-addr"></div>
   </section>
   <section id="tab-bytes" class="hidden">
@@ -279,6 +280,23 @@ function source(node) { return `<div class="muted" style="margin-bottom:8px">fro
 
 // ---- address index ----
 let addrView = '';
+async function showExamples() {
+  const node = $('node').value;
+  $('out-addr').innerHTML = '<div class="spinner">counting the example addresses…</div>';
+  const d = await api('addr/examples', params({ owner: $('owner').value.trim(), chain: $('chain').value, units: $('addrUnits').value }, node));
+  let html = source(node);
+  if (d.error) html += errCard(d.error);
+  html += indexCard(d.index);
+  if (d.examples) {
+    html += card('Example addresses', d.examples.length
+      ? '<table><tr><th>address</th><th></th><th>entries</th></tr>' + d.examples.map(e =>
+          `<tr><td>${e.entries ? addrLink(`lookup:${e.address}::`, e.address) : `<span class="mono muted">${esc(e.address)}</span>`}</td>` +
+          `<td>${esc(e.label)}</td><td>${e.entries ? e.entries : '<span class="muted">none in this period</span>'}</td></tr>`).join('') + '</table>' +
+        '<div class="muted" style="margin-top:8px">Counted from the buckets alone (no spill files): a click looks the address up.</div>'
+      : '<div class="muted">No example addresses for this chain ID.</div>');
+  }
+  $('out-addr').innerHTML = html;
+}
 // A slice or bucket view carries the address it highlights, so a shared link shows it too.
 function withAddr(view, a) { return a ? `${view}:${a}` : view; }
 function slicePath(l, i, a) { return withAddr(`slice:${l}:${i}`, a); }
@@ -548,6 +566,7 @@ document.querySelectorAll('form[data-run]').forEach(f => f.addEventListener('sub
   e.preventDefault(); if (f.dataset.run === 'addr') addrView = ''; run(f.dataset.run);
 }));
 document.querySelectorAll('input[name=socmode]').forEach(r => r.addEventListener('change', socMode));
+$('addrExamples').onclick = () => { show('addr'); showExamples().catch(e => { $('out-addr').innerHTML = errCard(String(e)); }); };
 $('prev').onclick = () => { $('blockN').value = Math.max(0, +$('blockN').value - 1); run('block'); };
 $('next').onclick = () => { $('blockN').value = +$('blockN').value + 1; run('block'); };
 // hashchange covers link clicks, edits of the URL fragment and Back/Forward between

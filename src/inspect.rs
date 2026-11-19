@@ -110,6 +110,7 @@ pub async fn serve(listen: SocketAddr, nodes: Vec<Node>, defaults: Defaults) -> 
         .route("/api/addr/slice", get(addr_slice_handler))
         .route("/api/addr/bucket", get(addr_bucket_handler))
         .route("/api/addr/spill", get(addr_spill_handler))
+        .route("/api/addr/examples", get(addr_examples_handler))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             Arc::new(allowed_hosts(listen)),
@@ -732,6 +733,117 @@ async fn addr_bucket_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
         if matches!(bucket.body, BucketBody::Paged { .. }) {
             out["pagedRecords"] = json!(records_json(&records, highlight));
         }
+        Ok(())
+    })
+    .await
+}
+
+/// Well-known addresses to try per chain. The index holds fingerprints, not addresses, so it
+/// cannot list its own; these are checked against it instead ([`addr_examples_inspect`]).
+fn example_addresses(chain_id: u64) -> &'static [(&'static str, &'static str)] {
+    match chain_id {
+        1 => &[
+            ("0xdAC17F958D2ee523a2206206994597C13D831ec7", "USDT"),
+            ("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "USDC"),
+            ("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "WETH"),
+            ("0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84", "Lido stETH"),
+            (
+                "0x00000000219ab540356cBB839Cbe05303d7705Fa",
+                "beacon deposit contract",
+            ),
+            (
+                "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",
+                "Uniswap V2 router",
+            ),
+            ("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", "vitalik.eth"),
+            (
+                "0x95222290DD7278Aa3Ddd389Cc1E1d165CC4BAfe5",
+                "beaverbuild (block builder)",
+            ),
+            (
+                "0x4838B106FCe9647Bdf1E7877BF73cE8B0BAD5f97",
+                "Titan (block builder)",
+            ),
+        ],
+        // Anvil / Hardhat dev accounts #0–#2 (bee-factory's chain is 1337).
+        1337 | 31337 => &[
+            (
+                "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+                "dev account #0",
+            ),
+            (
+                "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+                "dev account #1",
+            ),
+            (
+                "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC",
+                "dev account #2",
+            ),
+        ],
+        _ => &[],
+    }
+}
+
+async fn addr_examples_handler(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<AddrQuery>,
+) -> ApiResult {
+    ApiResult(addr_examples_inspect(&st, q).await)
+}
+
+/// How many entries each example address has in the index as of the head, from the address
+/// records alone: a descriptor and one bucket per slice (a paged bucket with its pages file),
+/// never a spill file, so even a token contract with millions of entries is counted quickly.
+/// A count can include another address with the same 64-bit fingerprint (rare); a lookup
+/// shows the entries.
+async fn addr_examples_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
+    // The whole index: no `since`, and no address of the query's.
+    let p = AddrParams {
+        since: None,
+        address: None,
+        ..AddrParams::parse(st, &q)?
+    };
+    partial(json!({}), async |out| {
+        let (r, origin) = index_origin(st, &q, &p).await?;
+        let (head, index) = index_head(st, &q, &r, &origin, &p).await?;
+        out["index"] = index;
+        let (slices, _) = read_plan(&head, None)?;
+        let mut descriptors = Vec::with_capacity(slices.len());
+        for s in &slices {
+            descriptors.push(r.slice(*s, head.first_unit).await?);
+        }
+        let descriptors = Arc::new(descriptors);
+        let mut set = tokio::task::JoinSet::new();
+        for (i, (a, label)) in example_addresses(r.chain_id).iter().enumerate() {
+            let address: Address = a.parse().expect("example addresses are valid");
+            let (r, descriptors) = (r.clone(), descriptors.clone());
+            set.spawn(async move {
+                let h = keccak256(address.as_slice());
+                let fp = fingerprint(&h);
+                let mut count = 0u64;
+                for rec in descriptors.iter() {
+                    let (_, records, _) = r
+                        .bucket_records(rec, bucket_of(&h, rec.bucket_count))
+                        .await?;
+                    for x in records.iter().filter(|x| x.fp == fp) {
+                        count += match &x.entries {
+                            Entries::Inline(e) => e.len() as u64,
+                            Entries::Spilled { count, .. } => *count,
+                        };
+                    }
+                }
+                Ok::<_, anyhow::Error>((
+                    i,
+                    json!({ "address": address, "label": label, "entries": count }),
+                ))
+            });
+        }
+        let mut found = Vec::new();
+        while let Some(done) = set.join_next().await {
+            found.push(done.context("example check panicked")??);
+        }
+        found.sort_by_key(|(i, _)| *i);
+        out["examples"] = json!(found.into_iter().map(|(_, v)| v).collect::<Vec<_>>());
         Ok(())
     })
     .await

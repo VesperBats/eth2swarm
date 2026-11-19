@@ -54,6 +54,10 @@ bookmarkable.
     newest 500 entries (the API's `limit`), newest first, and always the full count.
   - A failed read keeps what was read before it: a lookup that fails in one slice still shows
     the head and the slice links, a bucket or spill view still shows the slice.
+  - *Show example addresses*: well-known addresses of the chain (mainnet: tokens, the
+    deposit contract, a router, block builders; dev chains: the Anvil accounts), each with
+    the number of entries it has in the index, counted from the buckets alone (no spill
+    files). The index stores fingerprints, not addresses, so it cannot list its own.
   - The SOC tab decodes addr1 heads, slice descriptors and buckets too, with templates for
     `eth:<chain>:addr1:origin` and `eth:<chain>:addr1:slice:<L>:<i>`.
 
