@@ -458,6 +458,16 @@ importer sets it. With it, the reference can be computed before uploading
 (`src/swarm/file.rs`, checked against Bee at every level boundary), which is how a bucket
 names its spill and pages files.
 
+`testdata/addr1-reader-vectors.txt` holds conformance vectors for independent readers: slices
+built by the slice builder at the edges of these encodings (spill and pages files of several
+pages, pages filled to the last byte, inline entries of exactly 256 bytes and of 257, a bucket
+of exactly 4096 bytes inline and of 4097, paged, a spilled record in a paged bucket, a slice
+of an index that starts inside it, and a slice at mainnet height with block deltas of three
+and four bytes), with every bucket, every address's entries, read back from those bytes, and
+an address each slice has no record of. A test
+(`src/addr/vectors.rs`) fails when the builder's output changes, so a format change shows up
+as a diff of that file.
+
 ### `SliceRecord` (kind 4), 111 bytes
 
 | Field | Type | Meaning |
