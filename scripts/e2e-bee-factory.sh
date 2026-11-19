@@ -218,6 +218,70 @@ $BIN --bee "$READ_BEE" addr-lookup "$OWNER" --owner "$LM_OWNER" --chain-id "$CHA
 rm -rf "$LM_STATE"
 echo "ok: the index from block 64 resumed its stopped backfill with its start, deferred and built (2, 0) from unit 1, and matches the chain"
 
+echo "== address index exported to a directory (--out) without a Bee node, uploaded later (addr-upload)"
+EXP_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+EXP_STATE=$(mktemp -d)
+EXP_DIR=$(mktemp -d)/export
+# No Bee node: the export must not need one (port 9 refuses connections).
+exp_import() {
+  $BIN --bee http://127.0.0.1:9 addr-import --key "$EXP_KEY" --state "$EXP_STATE" \
+    --out "$EXP_DIR" --defer-level 1 "${TRACE_FLAG[@]}" "$@"
+}
+exp_upload() { $BIN --bee "$UPLOAD_BEE" addr-upload "$EXP_DIR" "$@"; }
+OUT=$(exp_import --units 2 --init) || { echo "FAIL: addr-import --out (backfill)"; echo "$OUT"; exit 1; }
+EXP_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
+# Crashes around head 3 (in an export: before and after it is written to the log): the next
+# run truncates the log to its state and writes the same records again.
+for fp in before-head-upload after-head-upload; do
+  if ETH2SWARM_ADDR_FAILPOINT=$fp exp_import --units 3 >/dev/null 2>&1; then
+    echo "FAIL: failpoint $fp did not stop the export"; exit 1
+  fi
+done
+exp_import --units 4 >/dev/null || { echo "FAIL: addr-import --out (resume to 4 units)"; exit 1; }
+# An exported index cannot continue as an uploaded one.
+if OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$EXP_KEY" --state "$EXP_STATE" --units 4 \
+  "${TRACE_FLAG[@]}" 2>&1); then
+  echo "FAIL: an exported index continued without --out"; exit 1
+fi
+echo "$OUT" | grep -q "exported to a directory" || { echo "FAIL: unexpected refusal: $OUT"; exit 1; }
+OUT=$(exp_upload) || { echo "FAIL: addr-upload"; echo "$OUT"; exit 1; }
+echo "$OUT"
+for u in 2 3 4; do
+  OUT=$($BIN --bee "$READ_BEE" addr-verify --owner "$EXP_OWNER" --chain-id "$CHAIN_ID" --units "$u") \
+    || { echo "FAIL: addr-verify of the uploaded export, --units $u"; echo "$OUT"; exit 1; }
+done
+# Nothing new: a second upload resumes at the end and sends nothing.
+exp_upload | grep -q ": 0 files, 0 SOCs, 0 heads" || { echo "FAIL: a repeated upload sent records again"; exit 1; }
+# Another batch does not resume what the first one stamped.
+if OUT=$(exp_upload --batch 0x$(printf '01%.0s' {1..32}) 2>&1); then
+  echo "FAIL: an upload with another batch resumed the progress of the first"; exit 1
+fi
+echo "$OUT" | grep -q -- "--from-start" || { echo "FAIL: unexpected refusal: $OUT"; exit 1; }
+# --from-start sends everything again (identical records, the origin check passes on our own
+# origin).
+OUT=$(exp_upload --from-start) || { echo "FAIL: addr-upload --from-start"; echo "$OUT"; exit 1; }
+echo "$OUT" | grep -q ", 4 heads" || { echo "FAIL: --from-start did not send every head again: $OUT"; exit 1; }
+# Another key's export cannot be uploaded over this index: a second export under the same key
+# from genesis with another start is refused at its origin.
+DUP_STATE=$(mktemp -d); DUP_DIR=$(mktemp -d)/export
+$BIN --bee http://127.0.0.1:9 addr-import --key "$EXP_KEY" --state "$DUP_STATE" --out "$DUP_DIR" \
+  --init --from-block 64 --units 3 "${TRACE_FLAG[@]}" >/dev/null || { echo "FAIL: second export"; exit 1; }
+if OUT=$($BIN --bee "$UPLOAD_BEE" addr-upload "$DUP_DIR" 2>&1); then
+  echo "FAIL: an export under a key with another published index was uploaded"; exit 1
+fi
+echo "$OUT" | grep -q "already published an index" || { echo "FAIL: unexpected refusal: $OUT"; exit 1; }
+rm -rf "$DUP_STATE" "$(dirname "$DUP_DIR")"
+# More units, uploaded incrementally; the merged slice (2, 0) is the one built directly.
+exp_import --units 5 >/dev/null || { echo "FAIL: addr-import --out (5 units)"; exit 1; }
+OUT=$(exp_upload) || { echo "FAIL: addr-upload (incremental)"; echo "$OUT"; exit 1; }
+echo "$OUT" | grep -q ", 1 heads" || { echo "FAIL: the incremental upload did not send exactly head 5: $OUT"; exit 1; }
+OUT=$($BIN --bee "$READ_BEE" addr-verify --owner "$EXP_OWNER" --chain-id "$CHAIN_ID" --units 5) \
+  || { echo "FAIL: addr-verify of the uploaded export, --units 5"; echo "$OUT"; exit 1; }
+EXPORTED=$(echo "$OUT" | awk '/slice \(2, 0\)/ {print $NF}')
+[ "$EXPORTED" = "$LOCAL" ] || { echo "FAIL: exported (2, 0) root '$EXPORTED', local build '$LOCAL'"; exit 1; }
+rm -rf "$EXP_STATE" "$(dirname "$EXP_DIR")"
+echo "ok: an index exported without a Bee node, through two crashes, uploads, resumes its upload and verifies (slice (2, 0) root $EXPORTED)"
+
 if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   echo "== address index with traffic: devnet-activity, import, lookups checked against the chain"
   # Public Foundry dev keys #0 (sender) and #2 (EIP-7702 authority), dev chains only.
@@ -326,10 +390,15 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   LATE_FROM=$((S * 64 + 10))
   LATE_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
   LATE_STATE=$(mktemp -d)
-  OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$LATE_KEY" --state "$LATE_STATE" --init \
-    --from-block "$LATE_FROM" --units "$ACT_UNITS" --max-level 16 "${TRACE_FLAG[@]}") \
-    || { echo "FAIL: addr-import --from-block $LATE_FROM"; exit 1; }
+  LATE_DIR=$(mktemp -d)/export
+  # Exported and uploaded later: this index has spill files, so files take that path too.
+  OUT=$($BIN --bee http://127.0.0.1:9 addr-import --key "$LATE_KEY" --state "$LATE_STATE" --init \
+    --from-block "$LATE_FROM" --units "$ACT_UNITS" --max-level 16 --out "$LATE_DIR" "${TRACE_FLAG[@]}") \
+    || { echo "FAIL: addr-import --from-block $LATE_FROM --out"; exit 1; }
   LATE_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
+  OUT=$($BIN --bee "$UPLOAD_BEE" addr-upload "$LATE_DIR") || { echo "FAIL: addr-upload of the late index"; echo "$OUT"; exit 1; }
+  echo "$OUT"
+  echo "$OUT" | grep -qv ": 0 files" || { echo "FAIL: the late index exported no files: $OUT"; exit 1; }
   OUT=$($BIN --bee "$READ_BEE" addr-verify --owner "$LATE_OWNER" --chain-id "$CHAIN_ID" \
     --units "$ACT_UNITS") || { echo "FAIL: addr-verify of the late index"; echo "$OUT"; exit 1; }
   echo "$OUT" | tail -1
@@ -355,12 +424,12 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
     || { echo "FAIL: the late index has $LATE_SENDER sender entries, the full one $SINCE_SENDER since unit $S"; exit 1; }
   # The start is fixed: a later run cannot move it.
   if OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$LATE_KEY" --state "$LATE_STATE" \
-    --from-block 0 --units "$ACT_UNITS" 2>&1); then
+    --out "$LATE_DIR" --from-block 0 --units "$ACT_UNITS" "${TRACE_FLAG[@]}" 2>&1); then
     echo "FAIL: addr-import moved the start of an existing index"; exit 1
   fi
   echo "$OUT" | grep -q "cannot move it" \
     || { echo "FAIL: moving the start failed for another reason: $OUT"; exit 1; }
-  rm -rf "$LATE_STATE"
+  rm -rf "$LATE_STATE" "$(dirname "$LATE_DIR")"
   echo "ok: the index from block $((S * 64)) verifies, holds the busy address's $N entries and the sender's $LATE_SENDER since its start, matches the chain from there, and keeps its start"
 fi
 

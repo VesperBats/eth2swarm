@@ -84,7 +84,8 @@ enum Command {
         /// the target is published and the merges it started are built.
         #[arg(long)]
         follow: bool,
-        /// Start a new index (first run, no state yet). Refused if the key already has one.
+        /// Start a new index (first run, no state yet). Refused if the key already has one (for
+        /// an export, --out, that is checked by addr-upload before it sends anything).
         #[arg(long)]
         init: bool,
         /// With --init: the index covers the 64-block unit of this block and everything after
@@ -98,6 +99,11 @@ enum Command {
         /// Postage batch ID. Defaults to the Bee node's first usable batch.
         #[arg(long)]
         batch: Option<B256>,
+        /// Write everything to this directory instead of uploading it (no Bee node needed);
+        /// `addr-upload` pushes it through a Bee node later. Every run of the index then
+        /// passes the same directory. Keep it apart from --state.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
         /// Merges of this level and above are built in the background.
         #[arg(long, default_value_t = 6)]
         defer_level: u8,
@@ -127,6 +133,23 @@ enum Command {
         /// any other chain).
         #[arg(long)]
         allow_chain_id: Option<u64>,
+    },
+    /// Upload an address-index export (`addr-import --out`) through the Bee node, in the
+    /// order the importer wrote it, checking every file and SOC first. Resumes where the last
+    /// upload of the directory stopped.
+    AddrUpload {
+        /// The export directory.
+        dir: std::path::PathBuf,
+        /// Postage batch ID. Defaults to the batch of the earlier uploads of this directory,
+        /// else the Bee node's first usable batch.
+        #[arg(long)]
+        batch: Option<B256>,
+        /// Records uploaded in parallel (between two heads).
+        #[arg(long, default_value_t = 16)]
+        concurrency: usize,
+        /// Upload everything again, ignoring the progress of earlier uploads.
+        #[arg(long)]
+        from_start: bool,
     },
     /// Look an address up in the published address index (newest first).
     AddrLookup {
@@ -314,6 +337,7 @@ async fn main() -> Result<()> {
             from_block,
             traces,
             batch,
+            out,
             defer_level,
             max_level,
             concurrency,
@@ -326,6 +350,7 @@ async fn main() -> Result<()> {
                 from_block,
                 traces,
                 batch,
+                out,
                 defer_level,
                 max_level,
                 concurrency,
@@ -360,6 +385,19 @@ async fn main() -> Result<()> {
                 a.emitter,
                 a.busy,
                 a.authority.map_or("none".to_string(), |x| x.to_string())
+            );
+        }
+        Command::AddrUpload {
+            dir,
+            batch,
+            concurrency,
+            from_start,
+        } => {
+            let s = addr::export::upload(&bee, batch, &dir, concurrency, from_start).await?;
+            println!(
+                "Uploaded the export of owner {} on chain {}: {} files, {} SOCs, {} heads \
+                 ({} of {} bytes)",
+                s.owner, s.chain_id, s.files, s.socs, s.heads, s.offset, s.committed
             );
         }
         Command::AddrLookup {

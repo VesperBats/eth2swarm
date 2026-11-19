@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use super::detect::role;
+use super::export::{self, ExportLog, ExportMeta};
 use super::fetch::{FetchedSlice, fetch_slice};
+use super::io::{join_one, write_atomic};
 use super::layout::{
     HeadRecord, L_MAX, MAX_UNITS, UNIT_BLOCKS, bucket_id, first_block, head_id, origin_id, slice_id,
 };
@@ -130,6 +132,10 @@ pub struct State {
     /// The next head, saved before it is uploaded (write-ahead): a run that finds it uploads
     /// exactly this record.
     pub prepared: Option<HeadRecord>,
+    /// For an index exported to a directory (`--out`) instead of uploaded: the length of its
+    /// log when this state was saved. A resumed run truncates the log to it.
+    #[serde(default)]
+    pub export_len: Option<u64>,
     /// A backfill of `n0` units from `first_unit` has started and not finished. Saved before
     /// its first upload, so that a run after a failure repeats exactly that backfill: a slice
     /// the start falls into depends on the start, and its identifiers do not.
@@ -158,19 +164,8 @@ impl State {
     /// directory synced, so that after a crash or a power loss the file is either the old or
     /// the new state, and a head saved before its upload stays saved.
     pub fn save(&self, dir: &Path) -> Result<()> {
-        use std::io::Write as _;
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let tmp = dir.join(format!("{STATE_FILE}.tmp"));
-        let mut f =
-            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        f.write_all(&serde_json::to_vec_pretty(self)?)
-            .and_then(|_| f.sync_all())
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, dir.join(STATE_FILE)).context("replacing the state file")?;
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .with_context(|| format!("syncing {}", dir.display()))?;
-        Ok(())
+        write_atomic(&dir.join(STATE_FILE), &serde_json::to_vec_pretty(self)?)
     }
 
     /// The head update index of the last published head.
@@ -259,6 +254,8 @@ pub struct ImportOptions {
     pub from_block: Option<u64>,
     pub traces: bool,
     pub batch: Option<B256>,
+    /// Write to this directory instead of uploading (`addr-upload` uploads it later).
+    pub out: Option<PathBuf>,
     /// Merges of this level and above are built in the background.
     pub defer_level: u8,
     /// Highest level built in memory (part 4b of #8 lifts this limit).
@@ -266,13 +263,25 @@ pub struct ImportOptions {
     pub concurrency: usize,
 }
 
+/// Where the importer's records go: a Bee node, or an export directory's log, written in
+/// the order they would be uploaded.
+#[derive(Clone)]
+enum Sink {
+    Bee { bee: Bee, batch: B256 },
+    Dir(std::sync::Arc<std::sync::Mutex<ExportLog>>),
+}
+
+fn lock(log: &std::sync::Mutex<ExportLog>) -> Result<std::sync::MutexGuard<'_, ExportLog>> {
+    log.lock()
+        .map_err(|_| anyhow::anyhow!("an export write panicked"))
+}
+
 /// What the importer needs to build and upload slices, cloned into background tasks.
 #[derive(Clone)]
 struct Ctx<P> {
     provider: P,
-    bee: Bee,
+    sink: Sink,
     signer: PrivateKeySigner,
-    batch: B256,
     chain_id: u64,
     /// The first unit the index covers.
     first_unit: u64,
@@ -295,17 +304,45 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
         .await
     }
 
-    /// Uploads a built slice: files first, then the buckets, the descriptor last.
+    /// Uploads a built slice: files first, then the buckets, the descriptor last. Every SOC is
+    /// signed here, once, whichever the sink.
     async fn upload_slice(&self, built: &BuiltSlice) -> Result<()> {
         let (level, index) = (built.record.level, built.record.index);
+        let buckets = built
+            .buckets
+            .iter()
+            .enumerate()
+            .map(|(k, payload)| {
+                let id = bucket_id(self.chain_id, level, index, k as u32);
+                soc::sign(&self.signer, id, payload.clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let descriptor = soc::sign(
+            &self.signer,
+            slice_id(self.chain_id, level, index),
+            built.record.encode(),
+        )?;
+        let owner = self.signer.address();
+        let (bee, batch) = match &self.sink {
+            Sink::Bee { bee, batch } => (bee, *batch),
+            Sink::Dir(log) => {
+                let mut log = lock(log)?;
+                for (reference, file) in &built.files {
+                    log.append(export::FILE, reference, file)?;
+                }
+                for soc in buckets.iter().chain([&descriptor]) {
+                    log.append_soc(export::SOC, &owner, soc)?;
+                }
+                return Ok(());
+            }
+        };
         let mut set = tokio::task::JoinSet::new();
         let limit = self.concurrency.max(1);
         for (reference, file) in &built.files {
             if set.len() >= limit {
                 join_one(&mut set).await?;
             }
-            let (bee, batch, file, reference) =
-                (self.bee.clone(), self.batch, file.clone(), *reference);
+            let (bee, file, reference) = (bee.clone(), file.clone(), *reference);
             set.spawn(async move {
                 let got = bee.upload_file(&batch, file).await?;
                 ensure!(
@@ -318,13 +355,11 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
         while !set.is_empty() {
             join_one(&mut set).await?;
         }
-        for (k, payload) in built.buckets.iter().enumerate() {
+        for soc in buckets {
             if set.len() >= limit {
                 join_one(&mut set).await?;
             }
-            let id = bucket_id(self.chain_id, level, index, k as u32);
-            let soc = soc::sign(&self.signer, id, payload.clone())?;
-            let (bee, batch, owner) = (self.bee.clone(), self.batch, self.signer.address());
+            let bee = bee.clone();
             set.spawn(async move {
                 bee.upload_soc(&batch, &owner, &soc).await?;
                 Ok(())
@@ -333,26 +368,47 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
         while !set.is_empty() {
             join_one(&mut set).await?;
         }
-        self.upload_soc(slice_id(self.chain_id, level, index), built.record.encode())
-            .await
+        bee.upload_soc(&batch, &owner, &descriptor).await?;
+        Ok(())
     }
 
-    async fn upload_soc(&self, id: B256, payload: Vec<u8>) -> Result<()> {
+    /// Uploads one SOC; `kind` says, for an export, whether it is a head ([`export::HEAD`]).
+    async fn upload_soc(&self, kind: u8, id: B256, payload: Vec<u8>) -> Result<()> {
         let soc = soc::sign(&self.signer, id, payload)?;
-        self.bee
-            .upload_soc(&self.batch, &self.signer.address(), &soc)
-            .await?;
+        let owner = self.signer.address();
+        match &self.sink {
+            Sink::Bee { bee, batch } => {
+                bee.upload_soc(batch, &owner, &soc).await?;
+            }
+            Sink::Dir(log) => lock(log)?.append_soc(kind, &owner, &soc)?,
+        }
         Ok(())
     }
 
     async fn publish_head(&self, n: u64, head: &HeadRecord) -> Result<()> {
         let payload = head.encode();
-        self.upload_soc(head_id(self.chain_id, n), payload.clone())
+        self.upload_soc(export::HEAD, head_id(self.chain_id, n), payload.clone())
             .await?;
         if n == 0 {
-            self.upload_soc(origin_id(self.chain_id), payload).await?;
+            self.upload_soc(export::HEAD, origin_id(self.chain_id), payload)
+                .await?;
         }
         Ok(())
+    }
+
+    /// Saves the state. For an export, the log is synced first and its length recorded in
+    /// the state; only after the state is saved may the uploader read that far.
+    fn save(&self, state: &mut State, dir: &Path) -> Result<()> {
+        match &self.sink {
+            Sink::Bee { .. } => state.save(dir),
+            Sink::Dir(log) => {
+                let mut log = lock(log)?;
+                let len = log.checkpoint()?;
+                state.export_len = Some(len);
+                state.save(dir)?;
+                log.commit(len)
+            }
+        }
     }
 
     /// Uploads the prepared head of `state`, if any, and records it as published.
@@ -365,7 +421,7 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
         failpoint("after-head-upload")?;
         state.units = head.units;
         state.prepared = None;
-        state.save(dir)?;
+        self.save(state, dir)?;
         info!(
             units = head.units,
             pending = head.pending.len(),
@@ -405,14 +461,6 @@ fn check_level(slice: SliceId, first_unit: u64, max_level: u8) -> Result<()> {
         held(slice, first_unit).count()
     );
     Ok(())
-}
-
-/// Waits for one upload task, if any is running.
-async fn join_one(set: &mut tokio::task::JoinSet<Result<()>>) -> Result<()> {
-    match set.join_next().await {
-        Some(r) => r.context("upload task panicked")?,
-        None => Ok(()),
-    }
 }
 
 /// Builds deferred merges one at a time, in the order they were deferred.
@@ -533,38 +581,18 @@ where
     };
     let (complete, finalized) = finalized_units(provider).await?;
     let mut target = target_now(complete, finalized)?;
-    let batch = match opts.batch {
-        Some(b) => b,
-        None => bee.usable_batch().await?,
-    };
     let roles = role::mask(opts.traces);
     let existing = State::load(dir)?;
+    ensure!(
+        existing.is_some() || opts.init,
+        "no importer state in {}: pass --init to start a new index (only for a key that has \
+         never published one), or point --state at the existing state",
+        dir.display()
+    );
+    // Everything that can refuse the run is checked before the sink is opened: opening an
+    // export creates it, or truncates it to the state.
     let requested = opts.from_block.map(|b| b / UNIT_BLOCKS);
     let first_unit = match &existing {
-        Some(s) => {
-            ensure!(
-                requested.is_none_or(|u| u == s.first_unit),
-                "the index in {} starts at block {}; --from-block cannot move it",
-                dir.display(),
-                s.first_unit * UNIT_BLOCKS
-            );
-            s.first_unit
-        }
-        None => requested.unwrap_or(0),
-    };
-    let ctx = Ctx {
-        provider: provider.clone(),
-        bee: bee.clone(),
-        signer: signer.clone(),
-        batch,
-        chain_id,
-        first_unit,
-        traces: opts.traces,
-        max_level: opts.max_level,
-        concurrency: opts.concurrency,
-    };
-
-    let mut state = match existing {
         Some(s) => {
             ensure!(
                 s.chain_id == chain_id && s.owner == signer.address() && s.roles == roles,
@@ -576,6 +604,62 @@ where
                 s.roles,
                 signer.address()
             );
+            ensure!(
+                requested.is_none_or(|u| u == s.first_unit),
+                "the index in {} starts at block {}; --from-block cannot move it",
+                dir.display(),
+                s.first_unit * UNIT_BLOCKS
+            );
+            s.first_unit
+        }
+        None => {
+            let first_unit = requested.unwrap_or(0);
+            backfill_slices(target, first_unit, opts.max_level)?;
+            first_unit
+        }
+    };
+    let sink = match (&opts.out, existing.as_ref().map(|s| s.export_len)) {
+        (Some(out), None | Some(Some(_))) => {
+            ensure!(
+                opts.batch.is_none(),
+                "--batch is for uploading; an export takes it at addr-upload"
+            );
+            let meta = ExportMeta::new(chain_id, signer.address());
+            let resume = existing.as_ref().and_then(|s| s.export_len);
+            Sink::Dir(std::sync::Arc::new(std::sync::Mutex::new(ExportLog::open(
+                out, &meta, resume,
+            )?)))
+        }
+        (None, None | Some(None)) => Sink::Bee {
+            bee: bee.clone(),
+            batch: match opts.batch {
+                Some(b) => b,
+                None => bee.usable_batch().await?,
+            },
+        },
+        (Some(_), Some(None)) => bail!(
+            "the index in {} uploads to a Bee node; it cannot switch to --out",
+            dir.display()
+        ),
+        (None, Some(Some(_))) => bail!(
+            "the index in {} is exported to a directory: pass its --out (and upload it with \
+             addr-upload)",
+            dir.display()
+        ),
+    };
+    let ctx = Ctx {
+        provider: provider.clone(),
+        sink,
+        signer: signer.clone(),
+        chain_id,
+        first_unit,
+        traces: opts.traces,
+        max_level: opts.max_level,
+        concurrency: opts.concurrency,
+    };
+
+    let mut state = match existing {
+        Some(s) => {
             if s.backfilling {
                 info!(
                     units = s.n0,
@@ -587,13 +671,17 @@ where
                 s
             }
         }
-        None => {
-            ensure!(
-                opts.init,
-                "no importer state in {}: pass --init to start a new index (only for a key \
-                 that has never published one), or point --state at the existing state",
-                dir.display()
+        None if matches!(ctx.sink, Sink::Dir(_)) => {
+            // Nothing to check against here: addr-upload reads the origin before it sends
+            // anything of a new export, and refuses if the key published another index.
+            tracing::warn!(
+                "exporting a new index for owner {} on chain {chain_id}; addr-upload checks that \
+                 this key has not published another one",
+                signer.address()
             );
+            backfill(&ctx, target, roles, dir).await?
+        }
+        None => {
             // An origin under this key means an index exists: a second backfill would write
             // another origin and other heads under the same write-once identifiers. The read
             // is best effort: Bee 2.8.3 answers a missing chunk and a failed retrieval alike
@@ -646,7 +734,7 @@ where
             break;
         }
         merges.collect(&ctx, &mut state, false).await?;
-        state.save(dir)?;
+        ctx.save(&mut state, dir)?;
         tokio::time::sleep(FOLLOW_POLL).await;
         let (complete, finalized) = finalized_units(provider).await?;
         target = target_now(complete, finalized)?;
@@ -655,7 +743,7 @@ where
     // Let the merges finish. They stay listed until the next run's first head.
     while merges.len() > 0 {
         merges.collect(&ctx, &mut state, true).await?;
-        state.save(dir)?;
+        ctx.save(&mut state, dir)?;
     }
     Ok(Summary {
         owner: signer.address(),
@@ -705,8 +793,26 @@ async fn import_unit<P: Provider + Clone + 'static>(
         pending: state.schedule.next_head_pending(),
     });
     state.prune(n);
-    state.save(&opts.state_dir)?;
+    ctx.save(state, &opts.state_dir)?;
     ctx.publish_prepared(state, &opts.state_dir).await
+}
+
+/// The slices a backfill of `target` units from `first_unit` writes: what a client reads for
+/// head update 0, the cover's slices after the start. Refused if there is nothing to import
+/// or a slice is too large to build in memory.
+fn backfill_slices(target: u64, first_unit: u64, max_level: u8) -> Result<Vec<SliceId>> {
+    ensure!(
+        target > first_unit,
+        "nothing to import: {target} complete units, the index starts at unit {first_unit} \
+         (block {})",
+        first_unit * UNIT_BLOCKS
+    );
+    let slices = resolve_after(first_unit, target, &[]);
+    for s in &slices {
+        check_level(*s, first_unit, max_level)
+            .with_context(|| format!("backfilling {target} units"))?;
+    }
+    Ok(slices)
 }
 
 /// First run: publishes the slices of the cover of `[0, target)` that hold units from the
@@ -719,18 +825,7 @@ async fn backfill<P: Provider + Clone + 'static>(
     roles: u8,
     dir: &Path,
 ) -> Result<State> {
-    ensure!(
-        target > ctx.first_unit,
-        "nothing to import: {target} complete units, the index starts at unit {} (block {})",
-        ctx.first_unit,
-        ctx.first_unit * UNIT_BLOCKS
-    );
-    // What a client reads for head update 0: the cover's slices after the start.
-    let slices = resolve_after(ctx.first_unit, target, &[]);
-    for s in &slices {
-        check_level(*s, ctx.first_unit, ctx.max_level)
-            .with_context(|| format!("backfilling {target} units"))?;
-    }
+    let slices = backfill_slices(target, ctx.first_unit, ctx.max_level)?;
     let mut state = State {
         chain_id: ctx.chain_id,
         owner: ctx.signer.address(),
@@ -741,9 +836,10 @@ async fn backfill<P: Provider + Clone + 'static>(
         schedule: Schedule::default(),
         unit_hashes: BTreeMap::new(),
         prepared: None,
+        export_len: None,
         backfilling: true,
     };
-    state.save(dir)?;
+    ctx.save(&mut state, dir)?;
     let (mut parent, mut last) = (None, None);
     for s in slices {
         info!(level = s.0, index = s.1, "backfill");
@@ -764,7 +860,7 @@ async fn backfill<P: Provider + Clone + 'static>(
     });
     state.backfilling = false;
     // From here on the origin's N0 is fixed: a later run publishes this head, never another.
-    state.save(dir)?;
+    ctx.save(&mut state, dir)?;
     info!(
         units = target,
         first_block = ctx.first_unit * UNIT_BLOCKS,
@@ -882,6 +978,7 @@ mod tests {
                 last_block_timestamp: 1_800_000_000,
                 pending: vec![(1, 4)],
             }),
+            export_len: None,
             backfilling: false,
         };
         s.save(&dir).unwrap();
