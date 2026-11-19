@@ -10,4 +10,6 @@ pub mod layout;
 pub mod lookup;
 pub mod slice;
 pub mod stats;
+#[cfg(test)]
+mod vectors;
 pub mod verify;

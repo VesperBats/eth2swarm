@@ -1,0 +1,3 @@
+# The reader conformance vectors are compared byte for byte (src/addr/vectors.rs): keep
+# their line ends LF on every platform.
+testdata/*.txt text eol=lf
