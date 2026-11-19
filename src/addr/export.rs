@@ -3,13 +3,17 @@
 //! upload").
 //!
 //! An export is one append-only log of records in upload order, `kind (u8) ‖ key (32) ‖
-//! len (u32 BE) ‖ data`:
+//! life (u64 BE) ‖ len (u32 BE) ‖ data` (layout 2; layout 1 has no `life`):
 //!
 //! * [`FILE`]: a spill or pages file; the key is its Swarm reference.
 //! * [`SOC`]: a slice descriptor or a bucket, as a SOC in wire form
 //!   (`identifier ‖ signature ‖ span ‖ payload`); the key is its address.
 //! * [`HEAD`]: a head update or the origin, the same way. A head is a barrier: everything
 //!   before it is uploaded before it, as the importer does with a Bee node.
+//!
+//! `life` is how many more units the record must stay retrievable after it was written
+//! (`u64::MAX`: permanently), which `addr-upload` matches with a batch's TTL
+//! ([`super::stamps`]). A layout-1 log, written before lifetimes, is read as all permanent.
 //!
 //! The importer writes records as it would upload them and checkpoints the log at every save
 //! of its state: the log is synced, its length goes into the state, and only then into the
@@ -36,6 +40,7 @@ use tracing::info;
 
 use super::io::{join_one, write_atomic};
 use super::layout::origin_id;
+use super::stamps::Stamps;
 use crate::swarm::bee::Bee;
 use crate::swarm::file::file_reference;
 use crate::swarm::soc::{self, SignedSoc, soc_address};
@@ -44,8 +49,17 @@ pub const FILE: u8 = 1;
 pub const SOC: u8 = 2;
 pub const HEAD: u8 = 3;
 
-/// Bytes before a record's data.
-const RECORD_HEADER: u64 = 1 + 32 + 4;
+/// Bytes before a record's data, in layout `format`.
+fn record_header(format: u32) -> u64 {
+    if format >= 2 {
+        1 + 32 + 8 + 4
+    } else {
+        1 + 32 + 4
+    }
+}
+
+/// `life` of a permanent record.
+const PERMANENT: u64 = u64::MAX;
 
 const META_FILE: &str = "addr1-export.json";
 const LOG_FILE: &str = "addr1.log";
@@ -62,7 +76,9 @@ const STATE_LOCK: &str = "addr-import.lock";
 pub const SORT_DIR: &str = "ethswarm-sort";
 /// The version of the export's layout, in its metadata: the log is a contract between two
 /// commands that may be different builds on different machines.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
+/// Layouts this build reads (and goes on writing, for an export that started in one).
+const FORMATS: [u32; 2] = [1, 2];
 /// `addr-upload` saves its progress at least this often within a stretch without a head (a
 /// backfill, a large merge), so that a failed record does not send it back to the last head.
 const SAVE_EVERY: u64 = 2048;
@@ -104,8 +120,8 @@ impl ExportMeta {
         )
         .with_context(|| format!("reading {}", path.display()))?;
         ensure!(
-            meta.format == FORMAT,
-            "{} is an export in layout {}, this build reads layout {FORMAT}",
+            FORMATS.contains(&meta.format),
+            "{} is an export in layout {}, this build reads layouts {FORMATS:?}",
             dir.display(),
             meta.format
         );
@@ -130,6 +146,8 @@ fn read_committed(dir: &Path) -> Result<Option<u64>> {
 /// The log the importer appends to.
 pub struct ExportLog {
     dir: PathBuf,
+    /// The layout written: the export's own (an export started in layout 1 stays in it).
+    format: u32,
     out: BufWriter<File>,
     len: u64,
     /// An append failed part way: the file may hold bytes `len` does not count, so nothing
@@ -141,13 +159,14 @@ pub struct ExportLog {
 impl ExportLog {
     /// Opens the export in `dir` for `meta`. `resume_at` is the log length the importer's
     /// state recorded: the log is truncated to it (records after it belong to a unit that
-    /// is written again). `None` starts a new export, in a directory without one.
+    /// is written again). `None` starts a new export, in a directory without one. A resumed
+    /// export keeps its layout.
     pub fn open(dir: &Path, meta: &ExportMeta, resume_at: Option<u64>) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let lock = DirLock::acquire(dir, WRITER_LOCK, "addr-import")?;
         let meta_path = dir.join(META_FILE);
         let log_path = dir.join(LOG_FILE);
-        match resume_at {
+        let format = match resume_at {
             None => {
                 ensure!(
                     is_fresh(dir, meta)?,
@@ -155,11 +174,12 @@ impl ExportLog {
                     dir.display()
                 );
                 write_atomic(&meta_path, &serde_json::to_vec_pretty(meta)?)?;
+                meta.format
             }
             Some(_) => {
                 let found = ExportMeta::read(dir)?;
                 ensure!(
-                    found == *meta,
+                    (found.chain_id, found.owner) == (meta.chain_id, meta.owner),
                     "{} is an export for chain {}, owner {}; this run is for chain {}, owner {}",
                     dir.display(),
                     found.chain_id,
@@ -167,8 +187,9 @@ impl ExportLog {
                     meta.chain_id,
                     meta.owner
                 );
+                found.format
             }
-        }
+        };
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -204,6 +225,7 @@ impl ExportLog {
         }
         let log = Self {
             dir: dir.to_path_buf(),
+            format,
             out: BufWriter::with_capacity(1 << 20, file),
             len,
             broken: false,
@@ -214,21 +236,37 @@ impl ExportLog {
         Ok(log)
     }
 
-    pub fn append(&mut self, kind: u8, key: &B256, data: &[u8]) -> Result<()> {
+    /// Appends a record that must live `life` more units (`None`: permanently).
+    pub fn append(&mut self, kind: u8, key: &B256, life: Option<u64>, data: &[u8]) -> Result<()> {
         ensure!(!self.broken, "an earlier write to the export failed");
         let n = u32::try_from(data.len()).context("record over 4 GiB")?;
         self.broken = true;
         self.out.write_all(&[kind])?;
         self.out.write_all(key.as_slice())?;
+        if self.format >= 2 {
+            let life = life.map_or(PERMANENT, |l| l.min(PERMANENT - 1));
+            self.out.write_all(&life.to_be_bytes())?;
+        }
         self.out.write_all(&n.to_be_bytes())?;
         self.out.write_all(data)?;
         self.broken = false;
-        self.len += RECORD_HEADER + data.len() as u64;
+        self.len += record_header(self.format) + data.len() as u64;
         Ok(())
     }
 
-    pub fn append_soc(&mut self, kind: u8, owner: &Address, soc: &SignedSoc) -> Result<()> {
-        self.append(kind, &soc_address(&soc.identifier, owner), &soc.wire())
+    pub fn append_soc(
+        &mut self,
+        kind: u8,
+        owner: &Address,
+        life: Option<u64>,
+        soc: &SignedSoc,
+    ) -> Result<()> {
+        self.append(
+            kind,
+            &soc_address(&soc.identifier, owner),
+            life,
+            &soc.wire(),
+        )
     }
 
     /// Writes everything out and syncs it: the length to record in the importer's state.
@@ -276,18 +314,23 @@ pub struct Record {
     pub offset: u64,
     pub kind: u8,
     pub key: B256,
+    /// Units it must still live when written (`None`: permanently, or a layout-1 log).
+    pub life: Option<u64>,
     pub data: Vec<u8>,
+    /// Offset of the next record.
+    end: u64,
 }
 
 impl Record {
     fn end(&self) -> u64 {
-        self.offset + RECORD_HEADER + self.data.len() as u64
+        self.end
     }
 }
 
 /// Reads the records of the log in `dir` from `offset` up to `end`.
 pub struct Records {
     reader: BufReader<File>,
+    format: u32,
     offset: u64,
     end: u64,
 }
@@ -295,7 +338,7 @@ pub struct Records {
 impl Records {
     /// `end` is the committed length: the log must hold at least that much (a copy of a live
     /// export can have its `committed` ahead of its log).
-    pub fn open(dir: &Path, offset: u64, end: u64) -> Result<Self> {
+    pub fn open(dir: &Path, format: u32, offset: u64, end: u64) -> Result<Self> {
         let path = dir.join(LOG_FILE);
         let mut f = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
         let len = f.metadata()?.len();
@@ -313,6 +356,7 @@ impl Records {
         f.seek(SeekFrom::Start(offset))?;
         Ok(Self {
             reader: BufReader::with_capacity(1 << 20, f),
+            format,
             offset,
             end,
         })
@@ -322,7 +366,8 @@ impl Records {
         if self.offset >= self.end {
             return Ok(None);
         }
-        let mut head = [0u8; RECORD_HEADER as usize];
+        let header = record_header(self.format);
+        let mut head = vec![0u8; header as usize];
         self.reader
             .read_exact(&mut head)
             .with_context(|| format!("reading the record at {}", self.offset))?;
@@ -333,10 +378,13 @@ impl Records {
             self.offset
         );
         let key = B256::from_slice(&head[1..33]);
-        let n = u32::from_be_bytes(head[33..37].try_into().unwrap()) as usize;
+        let life = (self.format >= 2)
+            .then(|| u64::from_be_bytes(head[33..41].try_into().unwrap()))
+            .filter(|l| *l != PERMANENT);
+        let n = u32::from_be_bytes(head[head.len() - 4..].try_into().unwrap()) as usize;
         // Checked before allocating: a damaged length must not ask for gigabytes.
         ensure!(
-            self.offset + RECORD_HEADER + n as u64 <= self.end,
+            self.offset + header + n as u64 <= self.end,
             "the record at {} runs past the committed length {}",
             self.offset,
             self.end
@@ -347,6 +395,8 @@ impl Records {
             offset: self.offset,
             kind,
             key,
+            life,
+            end: self.offset + header + n as u64,
             data,
         };
         self.offset = rec.end();
@@ -376,6 +426,11 @@ impl Progress {
 /// What an upload did.
 #[derive(Debug, Default)]
 pub struct UploadSummary {
+    /// Records (heads included) per batch.
+    pub batches: std::collections::BTreeMap<B256, u64>,
+    /// Records of lower slices that went to the permanent batch: no lower batch lived long
+    /// enough.
+    pub fell_back: u64,
     pub owner: Address,
     pub chain_id: u64,
     pub files: u64,
@@ -439,7 +494,7 @@ async fn check_origin(bee: &Bee, dir: &Path, meta: &ExportMeta, committed: u64) 
             return Ok(());
         }
     };
-    let ours = find_record(dir, committed, HEAD, &address)?;
+    let ours = find_record(dir, meta.format, committed, HEAD, &address)?;
     ensure!(
         ours.as_deref() == Some(&published[..]),
         "owner {} already published an index on chain {} with another origin: this export \
@@ -452,16 +507,17 @@ async fn check_origin(bee: &Bee, dir: &Path, meta: &ExportMeta, committed: u64) 
 
 /// The data of the first record of `kind` with `key` in the log up to `end`, reading only the
 /// record headers of the others.
-fn find_record(dir: &Path, end: u64, kind: u8, key: &B256) -> Result<Option<Vec<u8>>> {
+fn find_record(dir: &Path, format: u32, end: u64, kind: u8, key: &B256) -> Result<Option<Vec<u8>>> {
     let path = dir.join(LOG_FILE);
     let mut f = BufReader::new(File::open(&path)?);
     let mut offset = 0u64;
+    let header = record_header(format);
     while offset < end {
-        let mut head = [0u8; RECORD_HEADER as usize];
+        let mut head = vec![0u8; header as usize];
         f.read_exact(&mut head)?;
-        let n = u32::from_be_bytes(head[33..37].try_into().unwrap()) as u64;
+        let n = u32::from_be_bytes(head[head.len() - 4..].try_into().unwrap()) as u64;
         ensure!(
-            offset + RECORD_HEADER + n <= end,
+            offset + header + n <= end,
             "the record at {offset} runs past the committed length {end}"
         );
         if head[0] == kind && &head[1..33] == key.as_slice() {
@@ -470,7 +526,7 @@ fn find_record(dir: &Path, end: u64, kind: u8, key: &B256) -> Result<Option<Vec<
             return Ok(Some(data));
         }
         f.seek_relative(n as i64)?;
-        offset += RECORD_HEADER + n;
+        offset += header + n;
     }
     Ok(None)
 }
@@ -495,13 +551,26 @@ async fn upload_one(
     Ok(())
 }
 
-/// Uploads the export in `dir` through `bee` with `batch`, from where the last upload of
-/// this directory stopped (or from the start), up to its committed length. Records between
-/// heads go up in parallel; each head waits for everything before it, then the progress is
-/// saved.
+/// How `addr-upload` stamps: the permanent batch (default: the one the earlier uploads of the
+/// directory used, else the node's first usable batch), the batches for lower slices, and the
+/// grace period they must outlive a slice by.
+#[derive(Debug, Clone, Default)]
+pub struct Batches {
+    pub permanent: Option<B256>,
+    pub lower: Vec<B256>,
+    pub grace_days: u64,
+    /// Seconds per block of the chain.
+    pub slot_secs: u64,
+}
+
+/// Uploads the export in `dir` through `bee`, from where the last upload of this directory
+/// stopped (or from the start), up to its committed length. Records between heads go up in
+/// parallel; each head waits for everything before it, then the progress is saved. Heads and
+/// permanent records go to the permanent batch, a lower slice's records to the lower batch
+/// that expires soonest after the slice ([`Stamps`]).
 pub async fn upload(
     bee: &Bee,
-    batch: Option<B256>,
+    batches: Batches,
     dir: &Path,
     concurrency: usize,
     from_start: bool,
@@ -517,9 +586,17 @@ pub async fn upload(
         }
         _ => Progress::default(),
     };
-    let batch = match (batch, progress.batch) {
+    let batch = match (batches.permanent, progress.batch) {
         (Some(b), _) | (None, Some(b)) => b,
-        (None, None) => bee.usable_batch().await?,
+        (None, None) => {
+            // With lower batches, the node's "first usable batch" may well be a short one:
+            // the permanent records must not land there by accident.
+            ensure!(
+                batches.lower.is_empty(),
+                "--lower-batch needs the permanent batch named with --batch"
+            );
+            bee.usable_batch().await?
+        }
     };
     if let Some(recorded) = progress.batch {
         ensure!(
@@ -530,9 +607,27 @@ pub async fn upload(
         );
     }
     progress.batch = Some(batch);
+    if meta.format < 2 && !batches.lower.is_empty() {
+        tracing::warn!(
+            "{} is a layout-{} export, written before lifetimes: every record is permanent and \
+             goes to {batch}; --lower-batch applies only to an export started by this build",
+            dir.display(),
+            meta.format
+        );
+    }
+    let stamps = std::sync::Arc::new(
+        Stamps::open(
+            bee.clone(),
+            batch,
+            batches.lower,
+            batches.grace_days,
+            batches.slot_secs,
+        )
+        .await?,
+    );
     // The log must still hold the head the last upload ended with.
     if let Some(head) = progress.last_head {
-        let mut r = Records::open(dir, progress.last_head_at, committed)?;
+        let mut r = Records::open(dir, meta.format, progress.last_head_at, committed)?;
         let rec = r.next_record()?;
         match rec {
             Some(rec) if rec.kind == HEAD && rec.key == head && rec.end() <= progress.offset => {}
@@ -554,7 +649,7 @@ pub async fn upload(
         committed,
         ..Default::default()
     };
-    let mut records = Records::open(dir, progress.offset, committed)?;
+    let mut records = Records::open(dir, meta.format, progress.offset, committed)?;
     let mut set = tokio::task::JoinSet::new();
     let limit = concurrency.max(1);
     let mut since_save = 0u64;
@@ -565,7 +660,8 @@ pub async fn upload(
             while !set.is_empty() {
                 join_one(&mut set).await?;
             }
-            upload_one(bee.clone(), batch, meta.owner, rec, soc).await?;
+            let b = stamps.batch_for(None).await?;
+            upload_one(bee.clone(), b, meta.owner, rec, soc).await?;
             summary.heads += 1;
             progress = Progress {
                 offset: end,
@@ -583,7 +679,8 @@ pub async fn upload(
                 FILE => summary.files += 1,
                 _ => summary.socs += 1,
             }
-            set.spawn(upload_one(bee.clone(), batch, meta.owner, rec, soc));
+            let b = stamps.batch_for(rec.life).await?;
+            set.spawn(upload_one(bee.clone(), b, meta.owner, rec, soc));
         }
         summary.offset = end;
         since_save += 1;
@@ -606,6 +703,8 @@ pub async fn upload(
         progress.offset = summary.offset;
         progress.save(&progress_path)?;
     }
+    summary.batches = stamps.used();
+    summary.fell_back = stamps.fell_back();
     Ok(summary)
 }
 
@@ -621,12 +720,54 @@ mod tests {
     }
 
     fn read_all(dir: &Path, end: u64) -> Vec<Record> {
-        let mut r = Records::open(dir, 0, end).unwrap();
+        let format = ExportMeta::read(dir).unwrap().format;
+        let mut r = Records::open(dir, format, 0, end).unwrap();
         let mut out = Vec::new();
         while let Some(rec) = r.next_record().unwrap() {
             out.push(rec);
         }
         out
+    }
+
+    #[test]
+    fn lifetimes_roundtrip_and_layout_1_reads_as_permanent() {
+        let signer = PrivateKeySigner::random();
+        let file = vec![5u8; 100];
+        let reference = file_reference(&file);
+        let head = soc::sign(&signer, B256::repeat_byte(2), b"head".to_vec()).unwrap();
+        for format in [1, 2] {
+            let dir = tmp(&format!("layout{format}"));
+            let meta = ExportMeta {
+                format,
+                ..ExportMeta::new(1, signer.address())
+            };
+            let mut log = ExportLog::open(&dir, &meta, None).unwrap();
+            log.append(FILE, &reference, Some(12), &file).unwrap();
+            log.append_soc(HEAD, &meta.owner, None, &head).unwrap();
+            let end = log.checkpoint().unwrap();
+            log.commit(end).unwrap();
+            drop(log);
+            assert_eq!(
+                end,
+                2 * record_header(format) + 100 + head.wire().len() as u64
+            );
+            let recs = read_all(&dir, end);
+            let lives: Vec<_> = recs.iter().map(|r| r.life).collect();
+            // Layout 1 has no lifetimes: everything is permanent.
+            let want = if format == 1 {
+                [None, None]
+            } else {
+                [Some(12), None]
+            };
+            assert_eq!(lives, want, "layout {format}");
+            assert_eq!(recs[0].data, file);
+            // A resumed export keeps its layout, whatever this build writes.
+            let log =
+                ExportLog::open(&dir, &ExportMeta::new(1, signer.address()), Some(end)).unwrap();
+            assert_eq!(log.format, format);
+            drop(log);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -640,10 +781,10 @@ mod tests {
         let head = soc::sign(&signer, B256::repeat_byte(2), b"head".to_vec()).unwrap();
 
         let mut log = ExportLog::open(&dir, &meta, None).unwrap();
-        log.append(FILE, &reference, &file).unwrap();
-        log.append_soc(SOC, &meta.owner, &soc).unwrap();
+        log.append(FILE, &reference, Some(3), &file).unwrap();
+        log.append_soc(SOC, &meta.owner, Some(3), &soc).unwrap();
         let at_unit = log.checkpoint().unwrap();
-        log.append_soc(HEAD, &meta.owner, &head).unwrap();
+        log.append_soc(HEAD, &meta.owner, None, &head).unwrap();
         let end = log.checkpoint().unwrap();
         log.commit(end).unwrap();
         drop(log);
@@ -719,10 +860,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut rec = vec![FILE];
         rec.extend_from_slice(&[0u8; 32]);
+        rec.extend_from_slice(&PERMANENT.to_be_bytes());
         rec.extend_from_slice(&u32::MAX.to_be_bytes());
         rec.extend_from_slice(&[0u8; 10]);
         std::fs::write(dir.join(LOG_FILE), &rec).unwrap();
-        let err = Records::open(&dir, 0, rec.len() as u64)
+        let err = Records::open(&dir, FORMAT, 0, rec.len() as u64)
             .unwrap()
             .next_record()
             .unwrap_err();
