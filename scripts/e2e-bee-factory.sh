@@ -257,6 +257,20 @@ if OUT=$(exp_upload --batch 0x$(printf '01%.0s' {1..32}) 2>&1); then
   echo "FAIL: an upload with another batch resumed the progress of the first"; exit 1
 fi
 echo "$OUT" | grep -q -- "--from-start" || { echo "FAIL: unexpected refusal: $OUT"; exit 1; }
+# --from-start sends everything again (identical records, the origin check passes on our own
+# origin).
+OUT=$(exp_upload --from-start) || { echo "FAIL: addr-upload --from-start"; echo "$OUT"; exit 1; }
+echo "$OUT" | grep -q ", 4 heads" || { echo "FAIL: --from-start did not send every head again: $OUT"; exit 1; }
+# Another key's export cannot be uploaded over this index: a second export under the same key
+# from genesis with another start is refused at its origin.
+DUP_STATE=$(mktemp -d); DUP_DIR=$(mktemp -d)/export
+$BIN --bee http://127.0.0.1:9 addr-import --key "$EXP_KEY" --state "$DUP_STATE" --out "$DUP_DIR" \
+  --init --from-block 64 --units 3 "${TRACE_FLAG[@]}" >/dev/null || { echo "FAIL: second export"; exit 1; }
+if OUT=$($BIN --bee "$UPLOAD_BEE" addr-upload "$DUP_DIR" 2>&1); then
+  echo "FAIL: an export under a key with another published index was uploaded"; exit 1
+fi
+echo "$OUT" | grep -q "already published an index" || { echo "FAIL: unexpected refusal: $OUT"; exit 1; }
+rm -rf "$DUP_STATE" "$(dirname "$DUP_DIR")"
 # More units, uploaded incrementally; the merged slice (2, 0) is the one built directly.
 exp_import --units 5 >/dev/null || { echo "FAIL: addr-import --out (5 units)"; exit 1; }
 OUT=$(exp_upload) || { echo "FAIL: addr-upload (incremental)"; echo "$OUT"; exit 1; }

@@ -310,9 +310,23 @@ postage stamps come from the upload.
   truncates the log to the length in its state and writes the records of the unfinished
   unit again, identically; the uploader never reads past what a resumed run keeps.
 - `addr-upload` checks every record before sending it (a file against its reference, a SOC
-  against its address and the export's owner) and every reference Bee returns. It keeps
-  its progress in the directory and resumes there, also while the importer goes on
-  appending; `--from-start` sends everything again.
+  against its address and the export's owner) and every reference Bee returns. Before a
+  fresh upload sends anything it reads the origin from Bee: if the key already published
+  an index with another origin, the export is refused (the importer has no Bee node to ask).
+  It keeps its progress in the directory (also within long stretches without a head, such
+  as a backfill) and resumes there, also while the importer goes on appending. The progress
+  is tied to its batch: a resumed upload takes that batch, another one needs `--from-start`,
+  which sends everything again.
+- Moving an export between machines while the importer runs: copy `committed` first and the
+  log after it (every byte below `committed` is final), or stop the importer. Do not mirror
+  with deletion (`rsync --delete`): `uploaded.json`, the upload's progress, lives in the
+  directory too. The metadata names the export's layout version.
+- A deferred merge that finishes just before the importer stops can be written to the log
+  twice (the state that a resumed run starts from still lists it as unbuilt). The copies
+  are identical; the second only costs its upload again.
+- The log is never pruned: the offsets in the state and in the progress are absolute. That
+  is fine for an index of weeks or months; a long-running export would need rotation at a
+  head, or a switch to direct upload once `addr-upload` has caught up (not implemented).
 - An index that starts as an export stays one (every run passes the same `--out`), and an
   uploaded one cannot switch to an export: a head on Swarm must not reference slices that
   exist only in a directory.

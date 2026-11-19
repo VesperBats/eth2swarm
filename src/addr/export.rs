@@ -27,6 +27,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use super::io::{join_one, write_atomic};
+use super::layout::origin_id;
 use crate::swarm::bee::Bee;
 use crate::swarm::file::file_reference;
 use crate::swarm::soc::{self, SignedSoc, soc_address};
@@ -46,6 +48,14 @@ const PROGRESS_FILE: &str = "uploaded.json";
 const WRITER_LOCK: &str = "addr1.log.lock";
 /// Held by the one `addr-upload` of the directory.
 const UPLOAD_LOCK: &str = "upload.lock";
+/// The importer's state lock (`import::StateLock`), there if `--out` is the state directory.
+const STATE_LOCK: &str = "addr-import.lock";
+/// The version of the export's layout, in its metadata: the log is a contract between two
+/// commands that may be different builds on different machines.
+pub const FORMAT: u32 = 1;
+/// `addr-upload` saves its progress at least this often within a stretch without a head (a
+/// backfill, a large merge), so that a failed record does not send it back to the last head.
+const SAVE_EVERY: u64 = 2048;
 
 /// An exclusive lock on `dir/name`, held while the value lives.
 struct DirLock(#[allow(dead_code)] File);
@@ -60,11 +70,51 @@ impl DirLock {
     }
 }
 
-/// What an export is of: one owner's index of one chain.
+/// What an export is of: one owner's index of one chain, in layout [`FORMAT`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportMeta {
+    pub format: u32,
     pub chain_id: u64,
     pub owner: Address,
+}
+
+impl ExportMeta {
+    pub fn new(chain_id: u64, owner: Address) -> Self {
+        Self {
+            format: FORMAT,
+            chain_id,
+            owner,
+        }
+    }
+
+    fn read(dir: &Path) -> Result<Self> {
+        let path = dir.join(META_FILE);
+        let meta: Self = serde_json::from_slice(
+            &std::fs::read(&path).with_context(|| format!("{} holds no export", dir.display()))?,
+        )
+        .with_context(|| format!("reading {}", path.display()))?;
+        ensure!(
+            meta.format == FORMAT,
+            "{} is an export in layout {}, this build reads layout {FORMAT}",
+            dir.display(),
+            meta.format
+        );
+        Ok(meta)
+    }
+}
+
+/// The committed length of the export in `dir`, if it has one.
+fn read_committed(dir: &Path) -> Result<Option<u64>> {
+    let path = dir.join(COMMITTED_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(s) => Ok(Some(
+            s.trim()
+                .parse()
+                .with_context(|| format!("parsing {}", path.display()))?,
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// The log the importer appends to.
@@ -97,10 +147,7 @@ impl ExportLog {
                 write_atomic(&meta_path, &serde_json::to_vec_pretty(meta)?)?;
             }
             Some(_) => {
-                let found: ExportMeta = serde_json::from_slice(
-                    &std::fs::read(&meta_path)
-                        .with_context(|| format!("reading {}", meta_path.display()))?,
-                )?;
+                let found = ExportMeta::read(dir)?;
                 ensure!(
                     found == *meta,
                     "{} is an export for chain {}, owner {}; this run is for chain {}, owner {}",
@@ -125,6 +172,16 @@ impl ExportLog {
             "{} has {len} bytes, the importer's state recorded {at}: the export lost records",
             log_path.display()
         );
+        // The uploader may have sent everything up to `committed`: a state that recorded less
+        // is older than the export (a restored backup) and must not truncate below it.
+        if let Some(committed) = read_committed(dir)? {
+            ensure!(
+                committed <= at,
+                "{} is committed up to {committed}, the importer's state recorded {at}: the \
+                 state is older than the export",
+                log_path.display()
+            );
+        }
         if len > at {
             info!(
                 from = len,
@@ -185,8 +242,8 @@ fn is_fresh(dir: &Path, meta: &ExportMeta) -> Result<bool> {
         let entry = entry?;
         let name = entry.file_name();
         let ok = match name.to_str() {
-            Some(WRITER_LOCK) => true,
-            Some(COMMITTED_FILE) => std::fs::read_to_string(entry.path())?.trim() == "0",
+            Some(WRITER_LOCK | UPLOAD_LOCK | STATE_LOCK) => true,
+            Some(COMMITTED_FILE) => read_committed(dir)? == Some(0),
             Some(LOG_FILE) => entry.metadata()?.len() == 0,
             Some(META_FILE) => {
                 serde_json::from_slice::<ExportMeta>(&std::fs::read(entry.path())?).ok()
@@ -199,23 +256,6 @@ fn is_fresh(dir: &Path, meta: &ExportMeta) -> Result<bool> {
         }
     }
     Ok(true)
-}
-
-/// Writes a small file durably: a temporary file, synced, renamed, and the directory synced,
-/// so that after a crash or a power loss it is either the old or the new content.
-pub(super) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    let mut f = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    f.write_all(data)
-        .and_then(|_| f.sync_all())
-        .with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
-    if let Some(dir) = path.parent() {
-        File::open(dir)
-            .and_then(|d| d.sync_all())
-            .with_context(|| format!("syncing {}", dir.display()))?;
-    }
-    Ok(())
 }
 
 /// One record of the log.
@@ -242,9 +282,23 @@ pub struct Records {
 }
 
 impl Records {
+    /// `end` is the committed length: the log must hold at least that much (a copy of a live
+    /// export can have its `committed` ahead of its log).
     pub fn open(dir: &Path, offset: u64, end: u64) -> Result<Self> {
         let path = dir.join(LOG_FILE);
         let mut f = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let len = f.metadata()?.len();
+        ensure!(
+            end <= len,
+            "{} has {len} bytes, `committed` says {end}: an incomplete copy? Copy `committed` \
+             first and the log after it, or stop the importer while copying",
+            path.display()
+        );
+        ensure!(
+            offset <= end,
+            "reading {} from {offset}, past its committed length {end}",
+            path.display()
+        );
         f.seek(SeekFrom::Start(offset))?;
         Ok(Self {
             reader: BufReader::with_capacity(1 << 20, f),
@@ -358,6 +412,58 @@ fn check(rec: &Record, owner: &Address) -> Result<Option<SignedSoc>> {
     }
 }
 
+/// Refuses an export whose key already published another index: if Bee has a chunk at the
+/// origin's address, it must be this export's origin (a repeated upload). Bee 2.8.3 answers a
+/// missing and an unretrievable chunk alike, so only a chunk that comes back is conclusive.
+async fn check_origin(bee: &Bee, dir: &Path, meta: &ExportMeta, committed: u64) -> Result<()> {
+    let address = soc_address(&origin_id(meta.chain_id), &meta.owner);
+    let published = match bee.clone().with_retries(2).get_chunk(&address).await {
+        Ok(raw) => raw,
+        Err(e) => {
+            tracing::warn!(
+                "no origin found for owner {} on chain {}: uploading a new index ({e:#})",
+                meta.owner,
+                meta.chain_id
+            );
+            return Ok(());
+        }
+    };
+    let ours = find_record(dir, committed, HEAD, &address)?;
+    ensure!(
+        ours.as_deref() == Some(&published[..]),
+        "owner {} already published an index on chain {} with another origin: this export \
+         would write other records under the same identifiers. Export under another key.",
+        meta.owner,
+        meta.chain_id
+    );
+    Ok(())
+}
+
+/// The data of the first record of `kind` with `key` in the log up to `end`, reading only the
+/// record headers of the others.
+fn find_record(dir: &Path, end: u64, kind: u8, key: &B256) -> Result<Option<Vec<u8>>> {
+    let path = dir.join(LOG_FILE);
+    let mut f = BufReader::new(File::open(&path)?);
+    let mut offset = 0u64;
+    while offset < end {
+        let mut head = [0u8; RECORD_HEADER as usize];
+        f.read_exact(&mut head)?;
+        let n = u32::from_be_bytes(head[33..37].try_into().unwrap()) as u64;
+        ensure!(
+            offset + RECORD_HEADER + n <= end,
+            "the record at {offset} runs past the committed length {end}"
+        );
+        if head[0] == kind && &head[1..33] == key.as_slice() {
+            let mut data = vec![0u8; n as usize];
+            f.read_exact(&mut data)?;
+            return Ok(Some(data));
+        }
+        f.seek_relative(n as i64)?;
+        offset += RECORD_HEADER + n;
+    }
+    Ok(None)
+}
+
 async fn upload_one(
     bee: Bee,
     batch: B256,
@@ -378,29 +484,20 @@ async fn upload_one(
     Ok(())
 }
 
-use super::import::join_one;
-
 /// Uploads the export in `dir` through `bee` with `batch`, from where the last upload of
 /// this directory stopped (or from the start), up to its committed length. Records between
 /// heads go up in parallel; each head waits for everything before it, then the progress is
 /// saved.
 pub async fn upload(
     bee: &Bee,
-    batch: B256,
+    batch: Option<B256>,
     dir: &Path,
     concurrency: usize,
     from_start: bool,
 ) -> Result<UploadSummary> {
+    let meta = ExportMeta::read(dir)?;
     let _lock = DirLock::acquire(dir, UPLOAD_LOCK, "addr-upload")?;
-    let meta: ExportMeta = serde_json::from_slice(
-        &std::fs::read(dir.join(META_FILE))
-            .with_context(|| format!("{} holds no export", dir.display()))?,
-    )?;
-    let committed: u64 = std::fs::read_to_string(dir.join(COMMITTED_FILE))
-        .context("reading the committed length")?
-        .trim()
-        .parse()
-        .context("parsing the committed length")?;
+    let committed = read_committed(dir)?.context("the export has no committed length")?;
     let progress_path = dir.join(PROGRESS_FILE);
     let mut progress: Progress = match (from_start, std::fs::read(&progress_path)) {
         (false, Ok(bytes)) => serde_json::from_slice(&bytes)?,
@@ -409,13 +506,18 @@ pub async fn upload(
         }
         _ => Progress::default(),
     };
-    ensure!(
-        progress.batch.is_none_or(|b| b == batch),
-        "{} was uploaded with batch {} so far; pass --from-start to upload everything with \
-         batch {batch}",
-        dir.display(),
-        progress.batch.unwrap_or_default()
-    );
+    let batch = match (batch, progress.batch) {
+        (Some(b), _) | (None, Some(b)) => b,
+        (None, None) => bee.usable_batch().await?,
+    };
+    if let Some(recorded) = progress.batch {
+        ensure!(
+            recorded == batch,
+            "{} was uploaded with batch {recorded} so far: pass --batch {recorded} to continue, \
+             or --from-start to upload everything again with batch {batch}",
+            dir.display()
+        );
+    }
     progress.batch = Some(batch);
     // The log must still hold the head the last upload ended with.
     if let Some(head) = progress.last_head {
@@ -430,6 +532,10 @@ pub async fn upload(
             ),
         }
     }
+    // Before a fresh upload sends anything: the key must not have published another index.
+    if progress.last_head.is_none() {
+        check_origin(bee, dir, &meta, committed).await?;
+    }
     let mut summary = UploadSummary {
         owner: meta.owner,
         chain_id: meta.chain_id,
@@ -440,6 +546,7 @@ pub async fn upload(
     let mut records = Records::open(dir, progress.offset, committed)?;
     let mut set = tokio::task::JoinSet::new();
     let limit = concurrency.max(1);
+    let mut since_save = 0u64;
     while let Some(rec) = records.next_record()? {
         let soc = check(&rec, &meta.owner)?;
         let (kind, key, offset, end) = (rec.kind, rec.key, rec.offset, rec.end());
@@ -456,6 +563,7 @@ pub async fn upload(
                 batch: Some(batch),
             };
             progress.save(&progress_path)?;
+            since_save = 0;
         } else {
             if set.len() >= limit {
                 join_one(&mut set).await?;
@@ -467,6 +575,17 @@ pub async fn upload(
             set.spawn(upload_one(bee.clone(), batch, meta.owner, rec, soc));
         }
         summary.offset = end;
+        since_save += 1;
+        // Within a long stretch without a head: wait for what is in flight, then save the
+        // offset (the last head stays what a resumed upload checks).
+        if since_save >= SAVE_EVERY {
+            while !set.is_empty() {
+                join_one(&mut set).await?;
+            }
+            progress.offset = summary.offset;
+            progress.save(&progress_path)?;
+            since_save = 0;
+        }
     }
     while !set.is_empty() {
         join_one(&mut set).await?;
@@ -503,10 +622,7 @@ mod tests {
     fn log_roundtrip_truncation_and_checks() {
         let dir = tmp("log");
         let signer = PrivateKeySigner::random();
-        let meta = ExportMeta {
-            chain_id: 1,
-            owner: signer.address(),
-        };
+        let meta = ExportMeta::new(1, signer.address());
         let file = vec![7u8; 5000];
         let reference = file_reference(&file);
         let soc = soc::sign(&signer, B256::repeat_byte(1), b"bucket".to_vec()).unwrap();
@@ -547,7 +663,11 @@ mod tests {
         assert!(ExportLog::open(&dir, &other, Some(end)).is_err());
         // A state further than the log: records were lost.
         assert!(ExportLog::open(&dir, &meta, Some(end + 1)).is_err());
-        // Resuming from an earlier state drops the records after it.
+        // A state older than what was committed (the uploader may have sent it) is refused.
+        assert!(ExportLog::open(&dir, &meta, Some(at_unit)).is_err());
+        // The importer's own case: the state recorded `at_unit`, the run stopped before
+        // committing more, and the log holds records after it. They are dropped.
+        std::fs::write(dir.join(COMMITTED_FILE), at_unit.to_string()).unwrap();
         let log = ExportLog::open(&dir, &meta, Some(at_unit)).unwrap();
         assert_eq!(log.len, at_unit);
         drop(log);
@@ -562,10 +682,7 @@ mod tests {
     #[test]
     fn a_new_export_needs_a_fresh_directory() {
         let dir = tmp("fresh");
-        let meta = ExportMeta {
-            chain_id: 1,
-            owner: Address::repeat_byte(1),
-        };
+        let meta = ExportMeta::new(1, Address::repeat_byte(1));
         // An attempt that stopped before writing a record can be repeated.
         drop(ExportLog::open(&dir, &meta, None).unwrap());
         drop(ExportLog::open(&dir, &meta, None).unwrap());

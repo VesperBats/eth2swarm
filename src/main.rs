@@ -84,7 +84,8 @@ enum Command {
         /// the target is published and the merges it started are built.
         #[arg(long)]
         follow: bool,
-        /// Start a new index (first run, no state yet). Refused if the key already has one.
+        /// Start a new index (first run, no state yet). Refused if the key already has one (for
+        /// an export, --out, that is checked by addr-upload before it sends anything).
         #[arg(long)]
         init: bool,
         /// With --init: the index covers the 64-block unit of this block and everything after
@@ -100,7 +101,7 @@ enum Command {
         batch: Option<B256>,
         /// Write everything to this directory instead of uploading it (no Bee node needed);
         /// `addr-upload` pushes it through a Bee node later. Every run of the index then
-        /// passes the same directory.
+        /// passes the same directory. Keep it apart from --state.
         #[arg(long)]
         out: Option<std::path::PathBuf>,
         /// Merges of this level and above are built in the background.
@@ -139,7 +140,8 @@ enum Command {
     AddrUpload {
         /// The export directory.
         dir: std::path::PathBuf,
-        /// Postage batch ID. Defaults to the Bee node's first usable batch.
+        /// Postage batch ID. Defaults to the batch of the earlier uploads of this directory,
+        /// else the Bee node's first usable batch.
         #[arg(long)]
         batch: Option<B256>,
         /// Records uploaded in parallel (between two heads).
@@ -391,10 +393,6 @@ async fn main() -> Result<()> {
             concurrency,
             from_start,
         } => {
-            let batch = match batch {
-                Some(b) => b,
-                None => bee.usable_batch().await?,
-            };
             let s = addr::export::upload(&bee, batch, &dir, concurrency, from_start).await?;
             println!(
                 "Uploaded the export of owner {} on chain {}: {} files, {} SOCs, {} heads \

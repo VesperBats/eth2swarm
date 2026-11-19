@@ -25,6 +25,7 @@ use tracing::info;
 use super::detect::role;
 use super::export::{self, ExportLog, ExportMeta};
 use super::fetch::{FetchedSlice, fetch_slice};
+use super::io::{join_one, write_atomic};
 use super::layout::{
     HeadRecord, L_MAX, MAX_UNITS, UNIT_BLOCKS, bucket_id, first_block, head_id, origin_id, slice_id,
 };
@@ -164,7 +165,7 @@ impl State {
     /// the new state, and a head saved before its upload stays saved.
     pub fn save(&self, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        export::write_atomic(&dir.join(STATE_FILE), &serde_json::to_vec_pretty(self)?)
+        write_atomic(&dir.join(STATE_FILE), &serde_json::to_vec_pretty(self)?)
     }
 
     /// The head update index of the last published head.
@@ -462,14 +463,6 @@ fn check_level(slice: SliceId, first_unit: u64, max_level: u8) -> Result<()> {
     Ok(())
 }
 
-/// Waits for one upload task, if any is running.
-pub(super) async fn join_one(set: &mut tokio::task::JoinSet<Result<()>>) -> Result<()> {
-    match set.join_next().await {
-        Some(r) => r.context("upload task panicked")?,
-        None => Ok(()),
-    }
-}
-
 /// Builds deferred merges one at a time, in the order they were deferred.
 struct MergeWorker {
     queue: std::collections::VecDeque<SliceId>,
@@ -631,10 +624,7 @@ where
                 opts.batch.is_none(),
                 "--batch is for uploading; an export takes it at addr-upload"
             );
-            let meta = ExportMeta {
-                chain_id,
-                owner: signer.address(),
-            };
+            let meta = ExportMeta::new(chain_id, signer.address());
             let resume = existing.as_ref().and_then(|s| s.export_len);
             Sink::Dir(std::sync::Arc::new(std::sync::Mutex::new(ExportLog::open(
                 out, &meta, resume,
@@ -682,11 +672,11 @@ where
             }
         }
         None if matches!(ctx.sink, Sink::Dir(_)) => {
-            // Nothing to check against: the export goes to Swarm later. --init and the empty
-            // directory are the guard; addr-upload checks nothing about earlier indexes.
+            // Nothing to check against here: addr-upload reads the origin before it sends
+            // anything of a new export, and refuses if the key published another index.
             tracing::warn!(
-                "exporting a new index for owner {} on chain {chain_id}; make sure this key has \
-                 not published one",
+                "exporting a new index for owner {} on chain {chain_id}; addr-upload checks that \
+                 this key has not published another one",
                 signer.address()
             );
             backfill(&ctx, target, roles, dir).await?
