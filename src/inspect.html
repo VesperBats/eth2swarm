@@ -382,7 +382,8 @@ const runners = {
       if (stale()) return;
       if (d.error) html += errCard(d.error);
       if (d.slice) html += sliceCard(d.slice);
-      if (d.entries) html += card(`Spill file — ${d.count} entries` + (d.shown < d.count ? ` (the newest ${d.shown}, newest first)` : ', newest first'), kv([['reference', hash(d.spillRef)]]) + entriesTable(d.entries));
+      if (d.entries) html += card(`Spill file — ${d.count} entries` + (d.shown < d.count ? ` (the newest ${d.shown}, newest first)` : ', newest first'), kv([['reference', hash(d.spillRef)],
+        ['read', d.readWhole ? 'whole, every entry checked against the count' : '<span class="badge warn">newest pages only</span> <span class="muted">a file too large to read whole: read from its last page backwards, as a client would</span>']]) + entriesTable(d.entries));
     } else {
       d = await api('addr/lookup', params({ ...base, since: $('addrSince').value }, node));
       if (stale()) return;

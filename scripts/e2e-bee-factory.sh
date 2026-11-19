@@ -253,7 +253,7 @@ for u in 2 3 4; do
     || { echo "FAIL: addr-verify of the uploaded export, --units $u"; echo "$OUT"; exit 1; }
 done
 # Nothing new: a second upload resumes at the end and sends nothing.
-exp_upload | grep -q ": 0 files, 0 SOCs, 0 heads" || { echo "FAIL: a repeated upload sent records again"; exit 1; }
+exp_upload | grep -q ": 0 files, 0 chunks of large files, 0 SOCs, 0 heads" || { echo "FAIL: a repeated upload sent records again"; exit 1; }
 # Another batch does not resume what the first one stamped.
 if OUT=$(exp_upload --batch 0x$(printf '01%.0s' {1..32}) 2>&1); then
   echo "FAIL: an upload with another batch resumed the progress of the first"; exit 1
@@ -305,8 +305,10 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
     [[ "$T" =~ ^[0-9]+$ ]] && [ $((T % 64)) -le 40 ] && break
     sleep 1
   done
+  # 1,400 transfers: the busy address's spill file has two pages (a page holds 1,363 entries
+  # of 3 bytes), so it can be streamed and read page by page below.
   ACT=$($BIN devnet-activity --key "$KEY" --authority-key "$AUTH_KEY" --busy "$BUSY" \
-    --transfers 120) || { echo "FAIL: devnet-activity"; exit 1; }
+    --transfers 1400) || { echo "FAIL: devnet-activity"; exit 1; }
   echo "$ACT"
   EMITTER=$(echo "$ACT" | awk '{for (i = 1; i < NF; i++) if ($i == "emitter") print $(i + 1)}' | tr -d ,)
   echo "$ACT" | grep -q 'authority 0x' || { echo "FAIL: the chain did not take the EIP-7702 transaction"; exit 1; }
@@ -331,8 +333,9 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   ACT_STATE=$(mktemp -d)
   # The backfill covers the whole dev chain from genesis; its blocks are nearly empty, so
   # even large slices are quick to build here (--max-level 16, above the default of 12), only
-  # slower on an old stack.
-  OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$ACT_KEY" --state "$ACT_STATE" --init \
+  # slower on an old stack. Every spill file is streamed: uploaded chunk by chunk as it is
+  # written, as a busy address of a top-level slice is.
+  OUT=$(ETH2SWARM_ADDR_STREAM_FILE_BYTES=1 $BIN --bee "$UPLOAD_BEE" addr-import --key "$ACT_KEY" --state "$ACT_STATE" --init \
     --units "$ACT_UNITS" --max-level 16 "${TRACE_FLAG[@]}") \
     || { echo "FAIL: addr-import $ACT_UNITS units"; exit 1; }
   ACT_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
@@ -359,12 +362,22 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
           || { echo "FAIL: the authority's newest entry has no AUTH role: $NEWEST"; exit 1; } ;;
     esac
   done
-  [ "${N:-0}" -ge 120 ] || { echo "FAIL: busy address has ${N:-0} appearances, expected >= 120"; exit 1; }
+  [ "${N:-0}" -ge 1400 ] || { echo "FAIL: busy address has ${N:-0} appearances, expected >= 1400"; exit 1; }
   BUSY_FILES=$(echo "$BUSY_OUT" | head -1 | awk '{for (i = 1; i < NF; i++) if ($(i + 1) == "files") print $i}')
   [ "${BUSY_FILES:-0}" -ge 1 ] || { echo "FAIL: the busy address did not spill: $BUSY_OUT"; exit 1; }
   # The full lookup of the (fresh) busy address finds exactly what the incremental one did.
   FULL=$(lookup "$BUSY" | count)
   [ "$FULL" = "$N" ] || { echo "FAIL: the full lookup found $FULL entries, --since $U1 found $N"; exit 1; }
+  # Read page by page through the chunk tree, as a spill file above the whole-file limit is
+  # (a test limit of one page): the same entries, matching the chain; and the whole index
+  # verifies that way too.
+  OUT=$(ETH2SWARM_ADDR_WHOLE_FILE_BYTES=4096 lookup "$BUSY" --since "$U1" --against-chain) \
+    || { echo "FAIL: addr-lookup of the busy address page by page"; echo "$OUT"; exit 1; }
+  PAGED=$(echo "$OUT" | count)
+  [ "$PAGED" = "$N" ] || { echo "FAIL: page by page the busy address has $PAGED entries, not $N"; exit 1; }
+  ETH2SWARM_ADDR_WHOLE_FILE_BYTES=4096 $BIN --bee "$READ_BEE" addr-verify --owner "$ACT_OWNER" \
+    --chain-id "$CHAIN_ID" --units "$ACT_UNITS" >/dev/null \
+    || { echo "FAIL: addr-verify reading spill files page by page"; exit 1; }
   # The sender has appearances before and after unit U1: the incremental lookup must read
   # fewer slices than the full one and match the chain from U1 on.
   slices_read() { awk '/appearances in the index/ {for (i = 1; i < NF; i++) if ($(i + 1) == "slices,") print $i}'; }
@@ -400,14 +413,15 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   LATE_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
   LATE_STATE=$(mktemp -d)
   LATE_DIR=$(mktemp -d)/export
-  # Exported and uploaded later: this index has spill files, so files take that path too.
-  OUT=$(ETH2SWARM_ADDR_SORT_BUFFER_BYTES=180 $BIN --bee http://127.0.0.1:9 addr-import --key "$LATE_KEY" --state "$LATE_STATE" --init \
+  # Exported and uploaded later: this index has spill files, streamed into the log as their
+  # chunks (records of kind CHUNK), so they take that path too.
+  OUT=$(ETH2SWARM_ADDR_SORT_BUFFER_BYTES=180 ETH2SWARM_ADDR_STREAM_FILE_BYTES=1 $BIN --bee http://127.0.0.1:9 addr-import --key "$LATE_KEY" --state "$LATE_STATE" --init \
     --from-block "$LATE_FROM" --units "$ACT_UNITS" --max-level 16 --out "$LATE_DIR" "${TRACE_FLAG[@]}") \
     || { echo "FAIL: addr-import --from-block $LATE_FROM --out"; exit 1; }
   LATE_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
   OUT=$($BIN --bee "$UPLOAD_BEE" addr-upload "$LATE_DIR") || { echo "FAIL: addr-upload of the late index"; echo "$OUT"; exit 1; }
   echo "$OUT"
-  echo "$OUT" | grep -qv ": 0 files" || { echo "FAIL: the late index exported no files: $OUT"; exit 1; }
+  echo "$OUT" | grep -q " 0 chunks of large files" && { echo "FAIL: the late index exported no streamed spill file: $OUT"; exit 1; }
   OUT=$($BIN --bee "$READ_BEE" addr-verify --owner "$LATE_OWNER" --chain-id "$CHAIN_ID" \
     --units "$ACT_UNITS") || { echo "FAIL: addr-verify of the late index"; echo "$OUT"; exit 1; }
   echo "$OUT" | tail -1

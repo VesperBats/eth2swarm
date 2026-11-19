@@ -179,7 +179,9 @@ fn build(
         roles,
         &std::env::temp_dir(),
         (appearances.len() + 1) * 64,
-    )?;
+    )?
+    // Built in memory: every spill file is handed out whole, at any size.
+    .with_stream_file(usize::MAX);
     for a in appearances {
         b.push(a)?;
     }
@@ -187,6 +189,7 @@ fn build(
     let built = b.finish(last_block_hash, force_buckets, &mut |out| {
         match out {
             Output::File(r, f) => files.push((r, f)),
+            Output::Chunk(..) => anyhow::bail!("an in-memory build streamed a spill file"),
             Output::Bucket(k, p) => {
                 anyhow::ensure!(k as usize == buckets.len(), "bucket {k} out of order");
                 buckets.push(p)
@@ -541,8 +544,9 @@ mod tests {
         buffer: usize,
         force: Option<u32>,
     ) -> BuiltSlice {
-        let mut b =
-            SliceBuilder::new(slice, first_unit, roles, &std::env::temp_dir(), buffer).unwrap();
+        let mut b = SliceBuilder::new(slice, first_unit, roles, &std::env::temp_dir(), buffer)
+            .unwrap()
+            .with_stream_file(usize::MAX);
         for a in apps {
             b.push(a).unwrap();
         }
@@ -551,6 +555,7 @@ mod tests {
             .finish(B256::repeat_byte(3), force, &mut |out| {
                 match out {
                     Output::File(r, f) => files.push((r, f)),
+                    Output::Chunk(..) => panic!("streamed with an unlimited threshold"),
                     Output::Bucket(_, p) => buckets.push(p),
                 }
                 Ok(())

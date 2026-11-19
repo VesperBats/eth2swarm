@@ -8,9 +8,10 @@ and a client (`ethswarm addr-lookup`, head discovery from a finalized block, inc
 sync, and a check against the chain). An index can start at a later block instead of
 genesis (`addr-import --from-block`, *Starting at a later block*), and an import can be
 written to a directory and uploaded later (`--out`, `addr-upload`). `ethswarm devnet-activity` generates test traffic on
-a dev chain. The client reads every slice and whole spill and pages files; steps 3–5 of
-*Client lookup* (page search, last page first, stopping when the screen is full) and the
-time-based head estimate are not implemented. Slices of any level are built with bounded
+a dev chain. The client reads every slice, whole pages files, and spill files whole up to
+256 MB and page by page above (every page for a lookup; the newest pages, stopping at its
+limit, in the inspector's spill view); the page search of a paged bucket, stopping a lookup
+when the screen is full, and the time-based head estimate are not implemented. Slices of any level are built with bounded
 memory (*Building large slices*), and stamped with postage batches by lifetime
 (`--lower-batch`, *Lifetime*). Still open: re-measuring with traces. Design issue: #5.
 
@@ -252,13 +253,15 @@ replaces: it is built from the blocks again. The importer does that with bounded
    along it, so a bucket's records are consecutive; they are ordered by (fingerprint,
    address), encoded, paged if needed, and published at once. The descriptor goes last.
 
-Memory is the sort buffer, one bucket, the entries (16 bytes each) and spill file of the
-busiest address, and 32 bytes per bucket and per file of the slice; temporary disk is about
-45 bytes per appearance of the slice being built, plus its records. The busiest address is
-the one part that grows with the slice: a token contract in a top-level slice has tens of
-millions of entries, which is several GB and a spill file beyond the client's 256 MB read
-limit. Writing spill files as a stream, and paging them for the client, is still open; up to
-level 12 (about a month) it stays in the hundreds of MB. Measured on
+Memory is the sort buffer, one bucket, and 32 bytes per bucket and per file of the slice;
+temporary disk is about 45 bytes per appearance of the slice being built, plus its records.
+A busy address does not add to it: its entries go into its spill file page by page as the
+merge yields them, and a spill file above 1 MiB is chunked as it is written (the chunks of
+Bee's tree for the whole file, its root last) and handed out chunk by chunk, so memory holds
+one page and one path of the tree. A token contract in a top-level slice, tens of millions of
+entries and several GB of spill file, takes no more memory than a quiet address. Such a file
+is above the 256 MB a client reads whole: a client reads it page by page (*Client lookup*,
+step 4). Measured on
 synthetic data: 100 M appearances (about a week of mainnet) in one slice with a 64 MB buffer
 peaked at 91 MiB and took 95 s, against about 10 GB in memory before.
 
@@ -327,9 +330,12 @@ locally, so the uploaded index is the one a direct import would have published; 
 postage stamps come from the upload.
 
 - The export is one append-only log of records in upload order (`kind ‖ key ‖ life ‖ length ‖
-  data`): files under their reference, slice descriptors and buckets as SOCs in wire form
+  data`): files under their reference (a spill file above 1 MiB as its chunks, each in wire
+  form under its address, the root last), slice descriptors and buckets as SOCs in wire form
   under their address, and heads (and the origin) the same way; `life` is how many more
-  units the record must stay (layout 2, *Lifetime*; permanent: all ones). A head is a barrier:
+  units the record must stay (layouts 2 and 3, *Lifetime*; permanent: all ones; layout 3 adds
+  the chunk records, so a build that cannot upload them refuses the export up front). A head
+  is a barrier:
   `addr-upload` sends the records between two heads in parallel, and a head only after
   everything before it, as the importer does with a Bee node.
 - At every save of its state the importer syncs the log, records its length in the state,
@@ -346,6 +352,9 @@ postage stamps come from the upload.
   `--from-start`, which sends everything again. Lower batches can change between uploads; a
   resumed upload does not send again what went to a lower batch that has expired since
   (`--from-start` does).
+- An export keeps the layout it started in when it is continued. One started before layout 3
+  writes spill files whole, so an address whose spill file would exceed 256 MB stops it (start
+  a new export); one started before layout 2 has no lifetimes either.
 - Moving an export between machines while the importer runs: copy `committed` first and the
   log after it (every byte below `committed` is final), or stop the importer. Do not mirror
   with deletion (`rsync --delete`): `uploaded.json`, the upload's progress, lives in the
@@ -421,7 +430,7 @@ How the importer stamps (`addr-import` and `addr-upload`, `--batch` and `--lower
   one interval after it was written). Past the grace period the slice's batch
   can expire while a head still uses it; topping up that batch (or importing again) is the
   remedy.
-- An export records each record's remaining lifetime in the log (layout 2), so `addr-upload`
+- An export records each record's remaining lifetime in the log (layouts 2 and 3), so `addr-upload`
   chooses the batches; a layout-1 export (written before lifetimes) uploads as permanent, and
   `addr-upload` warns when it is given lower batches for one. A layout-1 export stays in
   layout 1 when it is continued: lifetimes need an export started by this build.
@@ -643,7 +652,9 @@ Newest first, for address `A`:
    `k` and `fp`, read bucket `k`, and scan it for `fp` (records have variable length, so the
    2.8 KB are read front to back). For a paged bucket, binary-search its pages.
 4. For a spilled address, walk the spill file's tree from its root chunk to the last page,
-   then earlier pages as the user scrolls. Each tree level is one chunk and one round
+   then earlier pages as the user scrolls. (`ethswarm` reads a spill file of up to 256 MB
+   whole; a larger one page by page, every page for a lookup, the newest pages in the
+   inspector's spill view.) Each tree level is one chunk and one round
    trip: root and page for up to 128 pages, one intermediate level more up to 16,384 pages
    (≈ 16 million entries). A binary search over pages costs such a path per probe.
 5. Stop when the screen is full; continue with older slices on demand.

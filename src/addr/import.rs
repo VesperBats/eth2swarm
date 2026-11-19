@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use super::build::{Output, SliceBuilder};
+use super::build::{Output, STREAM_FILE, SliceBuilder};
 use super::detect::role;
 use super::export::{self, ExportLog, ExportMeta};
 use super::fetch::fetch_appearances;
@@ -312,6 +312,8 @@ struct Ctx<P> {
     _sort_lock: std::sync::Arc<std::fs::File>,
     /// Bytes of one sort buffer (a background merge and a unit can each hold one).
     sort_buffer: usize,
+    /// Spill files above this many bytes are uploaded chunk by chunk as they are written.
+    stream_file: usize,
 }
 
 /// Sets a build's cancel flag when dropped.
@@ -364,7 +366,8 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
             role::mask(self.traces),
             &self.sort_dir,
             self.sort_buffer,
-        )?;
+        )?
+        .with_stream_file(self.stream_file);
         let (first, last) = (
             held_first_block(level, index, self.first_unit),
             last_block(level, index),
@@ -423,6 +426,9 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
                 (Sink::Dir(log), Output::File(reference, file)) => {
                     lock(log)?.append(export::FILE, &reference, life, &file)?
                 }
+                (Sink::Dir(log), Output::Chunk(address, wire)) => {
+                    lock(log)?.append(export::CHUNK, &address, life, &wire)?
+                }
                 (Sink::Dir(log), Output::Bucket(k, payload)) => {
                     let soc = soc::sign(
                         &self.signer,
@@ -446,6 +452,14 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
                             ensure!(
                                 got == reference,
                                 "Bee stored a file under {got}, the bucket names {reference}"
+                            );
+                            Ok(())
+                        }),
+                        Output::Chunk(address, wire) => set.spawn(async move {
+                            let got = bee.upload_chunk(&batch, wire).await?;
+                            ensure!(
+                                got == address,
+                                "Bee stored a chunk under {got}, it hashes to {address}"
                             );
                             Ok(())
                         }),
@@ -841,6 +855,17 @@ where
             dir.display()
         ),
     };
+    let stream_file = match (&sink, std::env::var("ETH2SWARM_ADDR_STREAM_FILE_BYTES")) {
+        // An export started before layout 3 has no chunk records: its spill files stay whole
+        // (and stay within MAX_FILE).
+        (Sink::Dir(log), _) if lock(log)?.format() < 3 => usize::MAX,
+        // Test hook: a small value makes a dev chain's busy address go through the chunked
+        // path (`scripts/e2e-bee-factory.sh`).
+        (_, Ok(v)) => v
+            .parse()
+            .with_context(|| format!("ETH2SWARM_ADDR_STREAM_FILE_BYTES={v}"))?,
+        (_, Err(_)) => STREAM_FILE,
+    };
     let ctx = Ctx {
         provider: provider.clone(),
         sink,
@@ -860,6 +885,7 @@ where
                 .with_context(|| format!("ETH2SWARM_ADDR_SORT_BUFFER_BYTES={v}"))?,
             Err(_) => opts.sort_buffer,
         },
+        stream_file,
     };
 
     let mut state = match existing {

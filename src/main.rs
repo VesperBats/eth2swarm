@@ -133,10 +133,10 @@ enum Command {
         /// Merges of this level and above are built in the background.
         #[arg(long, default_value_t = 6)]
         defer_level: u8,
-        /// Highest slice level built. Memory is bounded by --sort-memory-mb except for the
-        /// busiest address of a slice, whose entries and spill file are held whole: up to
-        /// level 12 (about a month) that stays in the hundreds of MB; above it a token
-        /// contract can need GBs and a spill file beyond what clients read (still open).
+        /// Highest slice level built. Memory is bounded by --sort-memory-mb at any level (a
+        /// busy address's spill file is written page by page, and above 1 MiB uploaded chunk
+        /// by chunk; an export started before layout 3 writes it whole and refuses one above
+        /// 256 MB); the cap bounds the time and the temporary disk one slice takes.
         #[arg(long, default_value_t = 12)]
         max_level: u8,
         /// Directory for the sort runs of the slice being built (default: --state); they go in
@@ -460,9 +460,9 @@ async fn main() -> Result<()> {
             };
             let s = addr::export::upload(&bee, batches, &dir, concurrency, from_start).await?;
             println!(
-                "Uploaded the export of owner {} on chain {}: {} files, {} SOCs, {} heads \
-                 ({} of {} bytes)",
-                s.owner, s.chain_id, s.files, s.socs, s.heads, s.offset, s.committed
+                "Uploaded the export of owner {} on chain {}: {} files, {} chunks of large \
+                 files, {} SOCs, {} heads ({} of {} bytes)",
+                s.owner, s.chain_id, s.files, s.chunks, s.socs, s.heads, s.offset, s.committed
             );
             print_batches(
                 &s.batches,
