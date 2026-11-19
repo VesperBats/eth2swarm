@@ -107,16 +107,29 @@ impl Bee {
             .context("Bee node has no usable postage batch (pass --batch)")
     }
 
-    /// A postage batch of this node: whether it is usable and how long it lives.
-    pub async fn batch(&self, id: &B256) -> Result<BatchInfo> {
-        self.http
-            .get(self.url(&format!("stamps/{}", hex::encode(id)))?)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("parsing /stamps/{batch}")
+    /// A postage batch of this node: whether it is usable and how long it lives; `None` if
+    /// the node does not know it (never bought here, or expired and gone). Transport errors
+    /// and server errors are retried.
+    pub async fn batch(&self, id: &B256) -> Result<Option<BatchInfo>> {
+        let url = self.url(&format!("stamps/{}", hex::encode(id)))?;
+        let mut last = None;
+        for attempt in 0..self.retries {
+            backoff(attempt).await;
+            match self.http.get(url.clone()).send().await {
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => return Ok(None),
+                Ok(resp) if resp.status().is_success() => {
+                    return resp
+                        .json()
+                        .await
+                        .map(Some)
+                        .context("parsing /stamps/{batch}");
+                }
+                Ok(resp) if !resp.status().is_server_error() => return Err(error_from(resp).await),
+                Ok(resp) => last = Some(error_from(resp).await),
+                Err(e) => last = Some(e.into()),
+            }
+        }
+        Err(last.unwrap()).with_context(|| format!("GET {url} failed"))
     }
 
     /// Upload arbitrary bytes as a Swarm file (chunk tree); returns its root reference.

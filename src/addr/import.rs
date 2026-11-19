@@ -354,10 +354,9 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
     ) -> Result<Published> {
         check_level(slice, self.first_unit, self.max_level)?;
         let life = stamps::life_units(slice, head_units);
-        let batch = match &self.sink {
-            Sink::Bee { stamps, .. } => Some(stamps.batch_for(life).await?),
-            Sink::Dir(_) => None,
-        };
+        // The batch is chosen when the first record is ready to upload, after the blocks are
+        // fetched (hours, for a large slice): its TTL is then as current as it can be.
+        let mut batch: Option<B256> = None;
         let (level, index) = slice;
         let mut builder = SliceBuilder::new(
             slice,
@@ -432,11 +431,15 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
                     )?;
                     lock(log)?.append_soc(export::SOC, &owner, life, &soc)?
                 }
-                (Sink::Bee { bee, .. }, out) => {
+                (Sink::Bee { bee, stamps }, out) => {
                     if set.len() >= limit {
                         join_one(&mut set).await?;
                     }
-                    let (bee, batch) = (bee.clone(), batch.expect("a batch for Bee"));
+                    let batch = match batch {
+                        Some(b) => b,
+                        None => *batch.insert(stamps.batch_for(life).await?),
+                    };
+                    let bee = bee.clone();
                     match out {
                         Output::File(reference, file) => set.spawn(async move {
                             let got = bee.upload_file(&batch, file).await?;
@@ -804,17 +807,28 @@ where
         (None, None | Some(None)) => {
             let permanent = match opts.batch {
                 Some(b) => b,
-                None => bee.usable_batch().await?,
+                None => {
+                    // With lower batches, the node's "first usable batch" may well be a short
+                    // one: the permanent records must not land there by accident.
+                    ensure!(
+                        opts.lower_batches.is_empty(),
+                        "--lower-batch needs the permanent batch named with --batch"
+                    );
+                    bee.usable_batch().await?
+                }
             };
             Sink::Bee {
                 bee: bee.clone(),
-                stamps: std::sync::Arc::new(Stamps::new(
-                    bee.clone(),
-                    permanent,
-                    opts.lower_batches.clone(),
-                    opts.grace_days.unwrap_or(stamps::GRACE_DAYS),
-                    opts.slot_secs.unwrap_or(stamps::SLOT_SECS),
-                )),
+                stamps: std::sync::Arc::new(
+                    Stamps::open(
+                        bee.clone(),
+                        permanent,
+                        opts.lower_batches.clone(),
+                        opts.grace_days.unwrap_or(stamps::GRACE_DAYS),
+                        opts.slot_secs.unwrap_or(stamps::SLOT_SECS),
+                    )
+                    .await?,
+                ),
             }
         }
         (Some(_), Some(None)) => bail!(

@@ -588,7 +588,15 @@ pub async fn upload(
     };
     let batch = match (batches.permanent, progress.batch) {
         (Some(b), _) | (None, Some(b)) => b,
-        (None, None) => bee.usable_batch().await?,
+        (None, None) => {
+            // With lower batches, the node's "first usable batch" may well be a short one:
+            // the permanent records must not land there by accident.
+            ensure!(
+                batches.lower.is_empty(),
+                "--lower-batch needs the permanent batch named with --batch"
+            );
+            bee.usable_batch().await?
+        }
     };
     if let Some(recorded) = progress.batch {
         ensure!(
@@ -599,13 +607,24 @@ pub async fn upload(
         );
     }
     progress.batch = Some(batch);
-    let stamps = std::sync::Arc::new(Stamps::new(
-        bee.clone(),
-        batch,
-        batches.lower,
-        batches.grace_days,
-        batches.slot_secs,
-    ));
+    if meta.format < 2 && !batches.lower.is_empty() {
+        tracing::warn!(
+            "{} is a layout-{} export, written before lifetimes: every record is permanent and \
+             goes to {batch}; --lower-batch applies only to an export started by this build",
+            dir.display(),
+            meta.format
+        );
+    }
+    let stamps = std::sync::Arc::new(
+        Stamps::open(
+            bee.clone(),
+            batch,
+            batches.lower,
+            batches.grace_days,
+            batches.slot_secs,
+        )
+        .await?,
+    );
     // The log must still hold the head the last upload ended with.
     if let Some(head) = progress.last_head {
         let mut r = Records::open(dir, meta.format, progress.last_head_at, committed)?;

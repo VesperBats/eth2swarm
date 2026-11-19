@@ -342,8 +342,10 @@ postage stamps come from the upload.
   an index with another origin, the export is refused (the importer has no Bee node to ask).
   It keeps its progress in the directory (also within long stretches without a head, such
   as a backfill) and resumes there, also while the importer goes on appending. The progress
-  is tied to its batch: a resumed upload takes that batch, another one needs `--from-start`,
-  which sends everything again.
+  is tied to its permanent batch: a resumed upload takes that batch, another one needs
+  `--from-start`, which sends everything again. Lower batches can change between uploads; a
+  resumed upload does not send again what went to a lower batch that has expired since
+  (`--from-start` does).
 - Moving an export between machines while the importer runs: copy `committed` first and the
   log after it (every byte below `committed` is final), or stop the importer. Do not mirror
   with deletion (`rsync --delete`): `uploaded.json`, the upload's progress, lives in the
@@ -388,13 +390,18 @@ long-lived ones. See *Full history and cost* for the size.
 
 How the importer stamps (`addr-import` and `addr-upload`, `--batch` and `--lower-batch`):
 
-- A slice `(L, i)` below `L_max` is dead once the head reaches unit `(⌊i/2⌋ + 1)·2^(L+1)`:
-  an even `i` stays in the cover until it merges with `(L, i + 1)` at `(i + 2)·2^L`, an odd
-  `i` exists only in a pending merge's expansion, which ends with that merge at `(i + 1)·2^L`.
-  Written while the head has `N` units, its records must live that unit minus `N` more units
-  (a deferred merge is counted from its own end, the earliest head it can be written at),
-  at 64 blocks of `--slot-secs` per unit (default 12 s, mainnet's slot: 768 s), plus a grace period (`--grace-days`, default 7, given to `addr-upload`
-  for an export) for clients holding an older head and the cases below.
+- A slice `(L, i)` below `L_max` with an even `i` stays in the cover until it merges with
+  `(L, i + 1)`: it is dead once the head reaches unit `(i + 2)·2^L`. Written while the head
+  has `N` units, its records must live that unit minus `N` more units (a deferred merge is
+  counted from its own end, the earliest head it can be written at), at 64 blocks of
+  `--slot-secs` per unit (default 12 s, mainnet's slot: 768 s), plus a grace period
+  (`--grace-days`, default 7, given to `addr-upload` for an export) for clients holding an
+  older head and the cases below.
+- An odd `i` is only ever written as the level-0 slice `(0, N − 1)` of a unit whose merge is
+  deferred: it is read from head `N`, which lists the merge as pending, until the merge is
+  uploaded. Its lifetime by the formula above (`(⌊i/2⌋ + 1)·2^(L+1)`, the unit it is written
+  at) is zero: the grace period alone covers it, as it covers the rest of a pending merge's
+  expansion from that unit on.
 - Each lower slice goes to the `--lower-batch` with the smallest remaining TTL (`batchTTL`
   of `GET /stamps/{id}`, asked at most once a minute) that is at least that long, so the
   batch expires soon after the slice is dead. If none lives long enough, it goes to the
@@ -405,14 +412,19 @@ How the importer stamps (`addr-import` and `addr-upload`, `--batch` and `--lower
   longest-lived lower level written meanwhile); a slice that no lower batch outlives goes to
   the permanent batch and costs permanent storage. A lower batch Bee cannot tell about (it
   expired, or the request failed) is left out until the next refresh.
-- The lifetime assumes the head keeps moving at `--slot-secs` per block. Two things keep a
+- The lifetime assumes the head keeps moving at `--slot-secs` per block. Four things keep a
   lower slice in use longer, and the grace period must cover them: the importer being stopped
-  or behind (its last head still lists the slice), and a deferred merge taking long to build
-  (its expansion stays in use until it is uploaded). Past the grace period the slice's batch
+  or behind (its last head still lists the slice); a deferred merge taking long to build (its
+  expansion stays in use until it is uploaded); a backfill, whose slices are stamped as they
+  are written but whose head 0 appears only once all of them are; and, for an export uploaded
+  periodically, the time between two uploads (the head that drops a slice is uploaded up to
+  one interval after it was written). Past the grace period the slice's batch
   can expire while a head still uses it; topping up that batch (or importing again) is the
   remedy.
 - An export records each record's remaining lifetime in the log (layout 2), so `addr-upload`
-  chooses the batches; a layout-1 export (written before lifetimes) uploads as permanent.
+  chooses the batches; a layout-1 export (written before lifetimes) uploads as permanent, and
+  `addr-upload` warns when it is given lower batches for one. A layout-1 export stays in
+  layout 1 when it is continued: lifetimes need an export started by this build.
   The lifetime is counted from when the record was written, so an upload long after the
   export over-provisions rather than under-provisions.
 - A batch fills up as well as expiring: a lower batch must be deep enough for what it is

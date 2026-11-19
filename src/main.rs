@@ -45,6 +45,33 @@ struct Cli {
 }
 
 /// Where a client finds data on Swarm.
+/// How uploads are stamped (`addr-import`, `addr-upload`; see `docs/address-index.md`,
+/// "Lifetime").
+#[derive(clap::Args, Debug, Clone)]
+struct Stamping {
+    /// Postage batch ID for the permanent records: heads, the origin, top-level slices, and
+    /// everything without --lower-batch. Defaults to the batch of the earlier uploads of the
+    /// directory (addr-upload), else the Bee node's first usable batch; required with
+    /// --lower-batch.
+    #[arg(long)]
+    batch: Option<B256>,
+    /// A batch for the lower slices, which die once the head has passed them (repeatable).
+    /// Each lower slice goes to the one that expires soonest after the slice is dead plus
+    /// --grace-days, or to --batch if none lives that long. Batches are never bought or
+    /// topped up.
+    #[arg(long = "lower-batch")]
+    lower_batches: Vec<B256>,
+    /// Days a lower batch must outlive a slice (default 7): for clients holding an older
+    /// head, a deferred merge still being built (whose expansion stays in use meanwhile), the
+    /// importer being stopped, and for an export the time between two uploads.
+    #[arg(long)]
+    grace_days: Option<u64>,
+    /// Seconds per block of the chain (default 12, mainnet's slot time): how long a unit, and
+    /// so a lower slice's lifetime, lasts.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    slot_secs: Option<u64>,
+}
+
 #[derive(clap::Args)]
 struct Source {
     /// Address of the SOC owner (the importer's key).
@@ -96,25 +123,8 @@ enum Command {
         /// Also read `trace_block` (see `appearances`).
         #[arg(long)]
         traces: bool,
-        /// Postage batch ID for the permanent records (everything, without --lower-batch).
-        /// Defaults to the Bee node's first usable batch.
-        #[arg(long)]
-        batch: Option<B256>,
-        /// A batch for the lower slices, which die once the head has passed them (repeatable).
-        /// Each lower slice goes to the one that expires soonest after the slice is dead plus
-        /// --grace-days, or to --batch if none lives that long. Heads, the origin and the
-        /// top-level slices always go to --batch. The importer never buys or tops up batches.
-        #[arg(long = "lower-batch")]
-        lower_batches: Vec<B256>,
-        /// Days a lower batch must outlive a slice (default 7): for clients holding an older
-        /// head, a deferred merge still being built (whose expansion stays in use meanwhile),
-        /// and the importer being stopped (its head's slices stay in use).
-        #[arg(long)]
-        grace_days: Option<u64>,
-        /// Seconds per block of the chain (default 12, mainnet's slot time): how long a unit,
-        /// and so a lower slice's lifetime, lasts. A chain with slower blocks needs it.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-        slot_secs: Option<u64>,
+        #[command(flatten)]
+        stamping: Stamping,
         /// Write everything to this directory instead of uploading it (no Bee node needed);
         /// `addr-upload` pushes it through a Bee node later. Every run of the index then
         /// passes the same directory. Keep it apart from --state.
@@ -168,26 +178,8 @@ enum Command {
     AddrUpload {
         /// The export directory.
         dir: std::path::PathBuf,
-        /// Postage batch ID for the permanent records (everything, without --lower-batch).
-        /// Defaults to the batch of the earlier uploads of this directory, else the Bee node's
-        /// first usable batch.
-        #[arg(long)]
-        batch: Option<B256>,
-        /// A batch for the lower slices, which die once the head has passed them (repeatable).
-        /// Each lower slice goes to the one that expires soonest after the slice is dead plus
-        /// --grace-days, or to --batch if none lives that long. Heads, the origin and the
-        /// top-level slices always go to --batch. The importer never buys or tops up batches.
-        #[arg(long = "lower-batch")]
-        lower_batches: Vec<B256>,
-        /// Days a lower batch must outlive a slice (default 7): for clients holding an older
-        /// head, a deferred merge still being built (whose expansion stays in use meanwhile),
-        /// and the importer being stopped (its head's slices stay in use).
-        #[arg(long)]
-        grace_days: Option<u64>,
-        /// Seconds per block of the chain (default 12, mainnet's slot time): how long a unit,
-        /// and so a lower slice's lifetime, lasts. A chain with slower blocks needs it.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-        slot_secs: Option<u64>,
+        #[command(flatten)]
+        stamping: Stamping,
         /// Records uploaded in parallel (between two heads).
         #[arg(long, default_value_t = 16)]
         concurrency: usize,
@@ -395,10 +387,7 @@ async fn main() -> Result<()> {
             init,
             from_block,
             traces,
-            batch,
-            lower_batches,
-            grace_days,
-            slot_secs,
+            stamping,
             out,
             defer_level,
             max_level,
@@ -413,10 +402,10 @@ async fn main() -> Result<()> {
                 init,
                 from_block,
                 traces,
-                batch,
-                lower_batches,
-                grace_days,
-                slot_secs,
+                batch: stamping.batch,
+                lower_batches: stamping.lower_batches,
+                grace_days: stamping.grace_days,
+                slot_secs: stamping.slot_secs,
                 out,
                 defer_level,
                 max_level,
@@ -459,18 +448,15 @@ async fn main() -> Result<()> {
         }
         Command::AddrUpload {
             dir,
-            batch,
-            lower_batches,
-            grace_days,
-            slot_secs,
+            stamping,
             concurrency,
             from_start,
         } => {
             let batches = addr::export::Batches {
-                permanent: batch,
-                lower: lower_batches,
-                grace_days: grace_days.unwrap_or(addr::stamps::GRACE_DAYS),
-                slot_secs: slot_secs.unwrap_or(addr::stamps::SLOT_SECS),
+                permanent: stamping.batch,
+                lower: stamping.lower_batches,
+                grace_days: stamping.grace_days.unwrap_or(addr::stamps::GRACE_DAYS),
+                slot_secs: stamping.slot_secs.unwrap_or(addr::stamps::SLOT_SECS),
             };
             let s = addr::export::upload(&bee, batches, &dir, concurrency, from_start).await?;
             println!(
