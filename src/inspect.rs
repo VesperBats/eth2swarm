@@ -93,7 +93,12 @@ impl AppState {
     }
 }
 
-pub async fn serve(listen: SocketAddr, nodes: Vec<Node>, defaults: Defaults) -> Result<()> {
+pub async fn serve(
+    listen: SocketAddr,
+    hosts: HostPolicy,
+    nodes: Vec<Node>,
+    defaults: Defaults,
+) -> Result<()> {
     let state = Arc::new(AppState {
         nodes,
         defaults,
@@ -112,10 +117,7 @@ pub async fn serve(listen: SocketAddr, nodes: Vec<Node>, defaults: Defaults) -> 
         .route("/api/addr/spill", get(addr_spill_handler))
         .route("/api/addr/examples", get(addr_examples_handler))
         .with_state(state.clone())
-        .layer(middleware::from_fn_with_state(
-            Arc::new(allowed_hosts(listen)),
-            check_host,
-        ));
+        .layer(middleware::from_fn_with_state(Arc::new(hosts), check_host));
     if !listen.ip().is_loopback() {
         eprintln!(
             "WARNING: listening on {listen}, which is not loopback. The inspector has no \
@@ -133,24 +135,75 @@ pub async fn serve(listen: SocketAddr, nodes: Vec<Node>, defaults: Defaults) -> 
     Ok(())
 }
 
-/// Host header values accepted by the server: the listen address plus the loopback names for
-/// its port. Rejecting anything else blocks DNS-rebinding attacks from web pages.
-fn allowed_hosts(listen: SocketAddr) -> Vec<String> {
-    let port = listen.port();
-    let mut hosts = vec![
-        listen.to_string(),
-        format!("localhost:{port}"),
-        format!("127.0.0.1:{port}"),
-        format!("[::1]:{port}"),
-    ];
-    if port == 80 {
-        hosts.extend(["localhost".into(), "127.0.0.1".into(), "[::1]".into()]);
+/// Which `Host` headers the server answers. Requests naming anything else are refused: a web
+/// page the browser is on could otherwise reach the inspector through a DNS name it controls
+/// that resolves to this machine (DNS rebinding). An IP literal cannot be rebound, so the
+/// listen address is accepted, and when the server listens on every address (`0.0.0.0` /
+/// `::`) any IP literal; names only when they are loopback names or allowed explicitly.
+#[derive(Clone, Debug)]
+pub struct HostPolicy {
+    port: u16,
+    listen_ip: std::net::IpAddr,
+    names: Vec<String>,
+}
+
+impl HostPolicy {
+    pub fn new(listen: SocketAddr, extra_names: &[String]) -> Self {
+        let mut names: Vec<String> = ["localhost".to_string()].into();
+        names.extend(
+            extra_names
+                .iter()
+                .map(|n| n.trim_end_matches('.').to_ascii_lowercase()),
+        );
+        Self {
+            port: listen.port(),
+            listen_ip: listen.ip(),
+            names,
+        }
     }
-    hosts
+
+    /// Whether a request whose `Host` header is `host` is answered.
+    pub fn allows(&self, host: &str) -> bool {
+        let (name, port) = split_host(host);
+        // A missing port is the scheme's default, which is ours only on port 80.
+        if port.unwrap_or(80) != self.port {
+            return false;
+        }
+        match name.parse::<std::net::IpAddr>() {
+            Ok(ip) => ip.is_loopback() || ip == self.listen_ip || self.listen_ip.is_unspecified(),
+            Err(_) => {
+                let name = name.trim_end_matches('.').to_ascii_lowercase();
+                self.names.contains(&name)
+            }
+        }
+    }
+}
+
+/// `name:port`, `[v6]:port`, `name` or `[v6]` into the name (an IPv6 literal without brackets)
+/// and the port.
+fn split_host(host: &str) -> (&str, Option<u16>) {
+    if let Some(rest) = host.strip_prefix('[') {
+        if let Some((ip, tail)) = rest.split_once(']') {
+            let port = tail.strip_prefix(':').and_then(|p| p.parse().ok());
+            return (
+                ip,
+                if tail.is_empty() {
+                    None
+                } else {
+                    port.or(Some(0))
+                },
+            );
+        }
+        return (host, Some(0));
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) => (name, Some(port.parse().unwrap_or(0))),
+        None => (host, None),
+    }
 }
 
 async fn check_host(
-    State(allowed): State<Arc<Vec<String>>>,
+    State(policy): State<Arc<HostPolicy>>,
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
@@ -159,11 +212,43 @@ async fn check_host(
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
-    if allowed.iter().any(|a| a.eq_ignore_ascii_case(host)) {
+    if policy.allows(host) {
         next.run(req).await
     } else {
         (StatusCode::FORBIDDEN, format!("host {host:?} not allowed")).into_response()
     }
+}
+
+/// This machine's Tailscale IPv4 address and MagicDNS name, from the `tailscale` CLI.
+pub fn tailscale_identity() -> Result<(std::net::IpAddr, Option<String>)> {
+    let out = std::process::Command::new("tailscale")
+        .args(["ip", "-4"])
+        .output()
+        .context("running `tailscale ip -4` (is Tailscale installed and up?)")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "`tailscale ip -4` failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let ip: std::net::IpAddr = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .context("`tailscale ip -4` printed no IPv4 address")?;
+    let name = std::process::Command::new("tailscale")
+        .args(["status", "--self", "--json"])
+        .output()
+        .ok()
+        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
+        .and_then(|v| {
+            v["Self"]["DNSName"]
+                .as_str()
+                .map(|s| s.trim_end_matches('.').to_string())
+        })
+        .filter(|s| !s.is_empty());
+    Ok((ip, name))
 }
 
 /// Every handler answers 200 with a JSON document; failures carry `"error"` so the page
@@ -1320,6 +1405,33 @@ mod tests {
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn host_policy() {
+        let lo = HostPolicy::new("127.0.0.1:8090".parse().unwrap(), &[]);
+        assert!(
+            lo.allows("127.0.0.1:8090") && lo.allows("localhost:8090") && lo.allows("[::1]:8090")
+        );
+        assert!(!lo.allows("evil.example:8090") && !lo.allows("127.0.0.1:9999"));
+        assert!(
+            !lo.allows("100.64.0.1:8090"),
+            "another IP when bound to loopback"
+        );
+        // On a Tailscale address with its MagicDNS name.
+        let ts = HostPolicy::new(
+            "100.64.0.1:8090".parse().unwrap(),
+            &["nuc.example.ts.net.".to_string()],
+        );
+        assert!(ts.allows("100.64.0.1:8090") && ts.allows("NUC.example.ts.net:8090"));
+        assert!(!ts.allows("192.168.1.5:8090") && !ts.allows("rebind.attacker.example:8090"));
+        // On every address: any IP literal, still no unknown name.
+        let any = HostPolicy::new("0.0.0.0:8090".parse().unwrap(), &[]);
+        assert!(any.allows("192.168.1.5:8090") && any.allows("[fe80::1]:8090"));
+        assert!(!any.allows("rebind.attacker.example:8090") && !any.allows("192.168.1.5"));
+        // Port 80 may be left out.
+        let p80 = HostPolicy::new("0.0.0.0:80".parse().unwrap(), &[]);
+        assert!(p80.allows("192.168.1.5") && p80.allows("localhost"));
     }
 
     #[test]

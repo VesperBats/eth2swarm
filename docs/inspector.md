@@ -82,6 +82,16 @@ antd --network-id 1337 --api-addr 127.0.0.1:1733 --allow-private-dials --no-disk
 
 Peer IDs: `curl -s localhost:1633/addresses` (use the `/ip4/127.0.0.1/…` underlay).
 
-The UI has no authentication. It listens on `127.0.0.1:8090` by default and warns when
-`--listen` is not a loopback address; requests whose `Host` header isn't the listen address
-or a loopback name are rejected (protection against DNS rebinding).
+The UI has no authentication. It listens on `127.0.0.1:8090` by default and warns when it
+listens anywhere else. To open it from another machine:
+
+```sh
+cargo run -- serve --tailscale        # this machine's Tailscale IPv4, port 8090: tailnet only
+cargo run -- serve --listen 0.0.0.0:8090   # every address (LAN included)
+```
+
+`--tailscale` also accepts the machine's MagicDNS name (`http://<host>.<tailnet>.ts.net:8090/`).
+Requests are answered only for a `Host` header that is an IP address (the listen address,
+or any when listening on `0.0.0.0`), a loopback name, or a name given with `--allow-host`;
+other names are rejected, which keeps a web page from reaching the inspector through a DNS
+name it controls (DNS rebinding).

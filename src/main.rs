@@ -278,9 +278,19 @@ enum Command {
     },
     /// Local web UI to inspect SOCs, blocks, epochs and raw references on Swarm nodes.
     Serve {
-        /// Address to listen on (keep it on loopback: the UI has no authentication).
+        /// Address to listen on. The UI has no authentication: anything else than loopback
+        /// lets whoever reaches the address read the configured nodes through it.
+        /// `0.0.0.0:8090` listens on every address.
         #[arg(long, default_value = "127.0.0.1:8090")]
         listen: std::net::SocketAddr,
+        /// Listen on this machine's Tailscale IPv4 address instead (the port from --listen),
+        /// reachable only from the tailnet, and accept its MagicDNS name as Host.
+        #[arg(long)]
+        tailscale: bool,
+        /// Further host names the UI is opened by (repeatable), e.g. a DNS name of this
+        /// machine. IP addresses need no entry; unknown names are refused (DNS rebinding).
+        #[arg(long = "allow-host")]
+        allow_hosts: Vec<String>,
         /// Nodes to read from, as `name=url` (repeatable). Defaults to antd on :1733 and the
         /// bee-factory nodes.
         #[arg(long = "node", value_parser = inspect::parse_node)]
@@ -540,6 +550,8 @@ async fn main() -> Result<()> {
         }
         Command::Serve {
             listen,
+            tailscale,
+            allow_hosts,
             nodes,
             owner,
             chain_id,
@@ -565,7 +577,18 @@ async fn main() -> Result<()> {
                 chain_id,
                 anchor,
             };
-            inspect::serve(listen, nodes, defaults).await?;
+            let mut listen = listen;
+            let mut allow_hosts = allow_hosts;
+            if tailscale {
+                let (ip, name) = inspect::tailscale_identity()?;
+                listen.set_ip(ip);
+                allow_hosts.extend(name);
+            }
+            let hosts = inspect::HostPolicy::new(listen, &allow_hosts);
+            for h in &allow_hosts {
+                println!("  accepting Host {h}:{}", listen.port());
+            }
+            inspect::serve(listen, hosts, nodes, defaults).await?;
         }
     }
     Ok(())
