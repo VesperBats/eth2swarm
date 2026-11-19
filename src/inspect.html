@@ -63,6 +63,7 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
 .radio { display: flex; gap: 14px; margin-bottom: 10px; font-size: 13px; }
 .radio label { flex-direction: row; text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--ink); align-items: center; }
 .hidden { display: none !important; }
+#owner:placeholder-shown { border-color: var(--warn); }
 .spinner { color: var(--muted); font-style: italic; }
 @media (max-width: 760px) { .settings { grid-template-columns: 1fr 1fr; } .steps li { grid-template-columns: 22px 1fr; } .steps li span:last-child { grid-column: 2; } }
 </style>
@@ -73,7 +74,7 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
     <button type="button" class="ghost" id="reset" style="float:right;font-size:12px;padding:3px 8px" title="Reset node, owner, chain ID and anchor to the values ethswarm serve was started with">reset settings</button></h1>
   <div class="settings">
     <label>Node<select id="node"></select></label>
-    <label>SOC owner<input id="owner" placeholder="0x… importer address" spellcheck="false"></label>
+    <label>SOC owner<input id="owner" placeholder="0x… importer address (required)" spellcheck="false" title="Address of the importer's key. Block, Epoch and SOC lookups need it; ethswarm serve fills it in from --owner / ETH2SWARM_OWNER"></label>
     <label>Chain ID<input id="chain" type="number" min="0"></label>
     <label>Trust anchor (blank = owner's published anchor)<input id="anchor" placeholder="0x… pinned anchor" spellcheck="false"></label>
   </div>

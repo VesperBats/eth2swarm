@@ -110,6 +110,11 @@ pub async fn serve(listen: SocketAddr, nodes: Vec<Node>, defaults: Defaults) -> 
     for n in &state.nodes {
         println!("  node {:<10} {}", n.name, n.url);
     }
+    if state.defaults.owner.is_none() {
+        println!(
+            "  no default SOC owner (--owner / ETH2SWARM_OWNER): enter it in the page's settings bar"
+        );
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -203,9 +208,14 @@ fn parse_chain(s: Option<&str>, default: u64) -> Result<u64> {
     }
 }
 
+/// The error for a lookup without an owner says where the owner comes from: the page's
+/// owner field starts empty unless `ethswarm serve` was given one.
+const OWNER_REQUIRED: &str = "owner address is required: enter the importer's address in the \
+     SOC owner field above, or start `ethswarm serve` with --owner / ETH2SWARM_OWNER";
+
 fn parse_owner(s: Option<&str>) -> Result<Address> {
     s.filter(|s| !s.trim().is_empty())
-        .context("owner address is required")?
+        .context(OWNER_REQUIRED)?
         .trim()
         .parse()
         .context("owner must be a 20-byte hex address")
@@ -796,5 +806,18 @@ mod tests {
         h.transactions_root = keccak256(b"txs");
         h.ommers_hash = keccak256(b"uncles");
         assert_eq!(body_contents(&h), ["txs", "uncles", "withdrawals"]);
+    }
+
+    #[test]
+    fn missing_owner_says_where_to_set_it() {
+        for s in [None, Some(""), Some("  ")] {
+            let e = format!("{:#}", parse_owner(s).unwrap_err());
+            assert!(e.contains("SOC owner field"), "{s:?}: {e}");
+            assert!(e.contains("ETH2SWARM_OWNER"), "{s:?}: {e}");
+        }
+        let e = format!("{:#}", parse_owner(Some("0x12")).unwrap_err());
+        assert!(e.contains("20-byte hex address"), "{e}");
+        let a = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+        assert_eq!(parse_owner(Some(a)).unwrap(), a.parse::<Address>().unwrap());
     }
 }
