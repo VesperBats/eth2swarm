@@ -29,7 +29,7 @@ pub fn held(slice: SliceId, first_unit: u64) -> Range<u64> {
 
 /// The size of what `slice` holds in an index from unit `first_unit`, as a level: the
 /// smallest `L` with `2^L` units at least [`held`]'s. The slice's own level from genesis, less
-/// for the slice a later start falls into. What building it in memory costs grows with this.
+/// for the slice a later start falls into. What building it costs grows with this.
 pub fn held_level(slice: SliceId, first_unit: u64) -> u8 {
     held(slice, first_unit)
         .count()
@@ -135,7 +135,13 @@ pub struct BuiltSlice {
 
 /// Bucket of a hash among `buckets` (multiply-shift).
 pub fn bucket_of(h: &B256, buckets: u32) -> u32 {
-    super::build::bucket_of_prefix(u32::from_be_bytes(h[..4].try_into().unwrap()), buckets)
+    bucket_of_prefix(u32::from_be_bytes(h[..4].try_into().unwrap()), buckets)
+}
+
+/// Bucket of an address whose hash starts with `prefix` (`h[0..4]` big-endian), among
+/// `buckets`: what the streaming builder computes from its sort items.
+pub fn bucket_of_prefix(prefix: u32, buckets: u32) -> u32 {
+    ((prefix as u64 * buckets as u64) >> 32) as u32
 }
 
 pub fn fingerprint(h: &B256) -> [u8; 8] {
@@ -629,6 +635,52 @@ mod tests {
 
     /// Bytes of one sort item of the streaming builder.
     const ITEM_BYTES: usize = 45;
+
+    /// More runs than one merge round takes (128 × 128): two rounds, then the last merge.
+    #[test]
+    fn streaming_build_over_two_merge_rounds() {
+        let slice = (6, 1); // blocks 4096..8191
+        let apps: Vec<Appearance> = (0..17_000u64)
+            .map(|i| Appearance {
+                block: 4096 + (i * 7919) % 4096,
+                slot: (i % 13) as u32,
+                address: Address::left_padding_from(&(i % 3001).to_be_bytes()),
+                roles: 1 << (i % 7),
+            })
+            .collect();
+        let reference = reference_build(slice, 0, &apps, B256::repeat_byte(3), 0x7f, None).unwrap();
+        assert_same(
+            &reference,
+            &streamed(slice, 0, &apps, 0x7f, ITEM_BYTES, None),
+        );
+    }
+
+    /// A build whose cancel flag is set stops with an error and leaves no runs behind.
+    #[test]
+    fn a_cancelled_build_stops_and_cleans_up() {
+        let parent = std::env::temp_dir().join(format!("addr-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let mut b = SliceBuilder::new((10, 0), 0, 0x7f, &parent, ITEM_BYTES * 2).unwrap();
+        for i in 0..200_000u64 {
+            b.push(&Appearance {
+                block: i % 65_536,
+                slot: 1,
+                address: Address::left_padding_from(&i.to_be_bytes()),
+                roles: 1,
+            })
+            .unwrap();
+        }
+        b.cancel_flag()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let err = b.finish(B256::ZERO, None, &mut |_| Ok(())).unwrap_err();
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+        assert_eq!(
+            std::fs::read_dir(&parent).unwrap().count(),
+            0,
+            "runs left behind"
+        );
+        std::fs::remove_dir(&parent).unwrap();
+    }
 
     #[test]
     fn slices_of_an_index_from_a_later_unit() {

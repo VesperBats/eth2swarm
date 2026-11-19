@@ -107,12 +107,15 @@ enum Command {
         /// Merges of this level and above are built in the background.
         #[arg(long, default_value_t = 6)]
         defer_level: u8,
-        /// Highest slice level built (a cap on the time and temporary disk one slice takes;
-        /// memory is bounded by --sort-memory-mb at any level).
-        #[arg(long, default_value_t = addr::layout::L_MAX)]
+        /// Highest slice level built. Memory is bounded by --sort-memory-mb except for the
+        /// busiest address of a slice, whose entries and spill file are held whole: up to
+        /// level 12 (about a month) that stays in the hundreds of MB; above it a token
+        /// contract can need GBs and a spill file beyond what clients read (still open).
+        #[arg(long, default_value_t = 12)]
         max_level: u8,
-        /// Directory for the sort runs of the slice being built (default: `sort` in --state).
-        /// About 45 bytes per appearance of the largest slice, removed once it is built.
+        /// Directory for the sort runs of the slice being built (default: --state); they go in
+        /// an `ethswarm-sort` directory of their own there. About 45 bytes per appearance of
+        /// the largest slice, removed once it is built.
         #[arg(long)]
         sort_dir: Option<std::path::PathBuf>,
         /// Memory for one sort buffer, in MiB. A background merge and the newest unit can each

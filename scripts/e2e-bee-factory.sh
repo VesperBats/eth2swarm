@@ -282,6 +282,13 @@ OUT=$($BIN --bee "$READ_BEE" addr-verify --owner "$EXP_OWNER" --chain-id "$CHAIN
 EXPORTED=$(echo "$OUT" | awk '/slice \(2, 0\)/ {print $NF}')
 [ "$EXPORTED" = "$LOCAL" ] || { echo "FAIL: exported (2, 0) root '$EXPORTED', local build '$LOCAL'"; exit 1; }
 rm -rf "$EXP_STATE" "$(dirname "$EXP_DIR")"
+# One directory for state, export and sort runs works too (a new export there is fresh).
+ONE_DIR=$(mktemp -d)
+ETH2SWARM_ADDR_SORT_BUFFER_BYTES=180 $BIN --bee http://127.0.0.1:9 addr-import \
+  --key 0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n') --state "$ONE_DIR" --out "$ONE_DIR" \
+  --init --units 2 "${TRACE_FLAG[@]}" >/dev/null \
+  || { echo "FAIL: an export into its own state directory"; exit 1; }
+rm -rf "$ONE_DIR"
 echo "ok: an index exported without a Bee node, through two crashes, uploads, resumes its upload and verifies (slice (2, 0) root $EXPORTED)"
 
 if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
@@ -323,8 +330,8 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   ACT_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
   ACT_STATE=$(mktemp -d)
   # The backfill covers the whole dev chain from genesis; its blocks are nearly empty, so
-  # building even large slices in memory is fine here (--max-level 16), only slower on an
-  # old stack.
+  # even large slices are quick to build here (--max-level 16, above the default of 12), only
+  # slower on an old stack.
   OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$ACT_KEY" --state "$ACT_STATE" --init \
     --units "$ACT_UNITS" --max-level 16 "${TRACE_FLAG[@]}") \
     || { echo "FAIL: addr-import $ACT_UNITS units"; exit 1; }

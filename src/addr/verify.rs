@@ -6,8 +6,8 @@ use alloy::providers::Provider;
 use anyhow::{Context, Result, ensure};
 
 use super::layout::{
-    AddressRecord, BucketBody, BucketRecord, Entries, Entry, HeadRecord, SliceRecord, bucket_id,
-    bucket_pages_file, decode_bucket_page, decode_spill_page, head_id, held_first_block,
+    AddressRecord, BucketBody, BucketRecord, Entries, Entry, HeadRecord, MAX_FILE, SliceRecord,
+    bucket_id, bucket_pages_file, decode_bucket_page, decode_spill_page, head_id, held_first_block,
     last_block, origin_id, pages, slice_id, spill_file,
 };
 use super::slice::{SliceId, resolve_after};
@@ -15,9 +15,6 @@ use crate::accumulator::{Tree, depth_for};
 use crate::swarm::bee::Bee;
 use crate::swarm::file::file_reference;
 use crate::swarm::soc::{self, soc_address};
-
-/// Largest spill or pages file read (a busy address in a large slice).
-const MAX_FILE: usize = 256 << 20;
 
 /// Reads `addr1` records of one owner on one chain, checking signatures and identities.
 #[derive(Clone)]

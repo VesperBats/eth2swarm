@@ -347,9 +347,14 @@ postage stamps come from the upload.
   log after it (every byte below `committed` is final), or stop the importer. Do not mirror
   with deletion (`rsync --delete`): `uploaded.json`, the upload's progress, lives in the
   directory too. The metadata names the export's layout version.
-- A deferred merge that finishes just before the importer stops can be written to the log
-  twice (the state that a resumed run starts from still lists it as unbuilt). The copies
-  are identical; the second only costs its upload again.
+- A slice is written to the log record by record as it is built, so a deferred merge
+  building in the background interleaves with the units and their heads. Its descriptor
+  still comes before the head that drops it from `pending`, and no head makes a client read
+  it before. But `addr-upload` can send part of a merge before its descriptor, and a run
+  that stops while a merge is written (or just after, before the state records it as
+  built) writes the whole merge again after the part it kept. The copies are identical;
+  they cost disk in a log that is never pruned and a second upload, for a large merge
+  gigabytes.
 - The log is never pruned: the offsets in the state and in the progress are absolute. That
   is fine for an index of weeks or months; a long-running export would need rotation at a
   head, or a switch to direct upload once `addr-upload` has caught up (not implemented).

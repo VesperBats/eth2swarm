@@ -13,8 +13,12 @@
 //!    decreases along it, so each bucket's records are consecutive. They are ordered by
 //!    (fingerprint, address), encoded, paged if too large, and handed out.
 //!
-//! Memory: the sort buffer, one bucket, the entries and spill file of the busiest address,
-//! and 32 bytes per bucket (for `buckets_root`) and per file (to list each once).
+//! Memory: the sort buffer (given back once the runs are written), one bucket, the entries and
+//! spill file of the busiest address, and 32 bytes per bucket (for `buckets_root`) and per
+//! file (to list each once). A slice that fits one buffer keeps its spool in memory beside it
+//! (the records plus 36 bytes per address), so it peaks at up to about twice the buffer.
+//! Disk: 45 bytes per appearance for the runs, up to twice that during a merge round (a
+//! group is written before its inputs are removed), then the spool.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -29,12 +33,12 @@ use anyhow::{Context, Result, ensure};
 
 use super::detect::Appearance;
 use super::layout::{
-    AddressRecord, BUCKET_TARGET, BucketBody, BucketRecord, Entries, Entry, L_MAX, PAGE_SIZE,
-    SPILL_INLINE_MAX, SliceRecord, bucket_pages_file, entries_len, held_first_block, last_block,
-    spill_file,
+    AddressRecord, BUCKET_TARGET, BucketBody, BucketRecord, Entries, Entry, L_MAX, MAX_FILE,
+    PAGE_SIZE, SPILL_INLINE_MAX, SliceRecord, bucket_pages_file, entries_len, held_first_block,
+    last_block, spill_file,
 };
-use super::slice::{SliceId, held};
-use crate::accumulator::{Tree, depth_for};
+use super::slice::{SliceId, bucket_of_prefix, held};
+use crate::accumulator::{depth_for, root_of};
 use crate::swarm::file::file_reference;
 
 /// Bytes of one sort item.
@@ -75,7 +79,8 @@ impl TempDir {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
+        // `create_dir`, not `create_dir_all`: a path that is already there is not ours.
+        std::fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
         Ok(Self(path))
     }
 }
@@ -223,6 +228,8 @@ impl SliceBuilder {
             if !self.buf.is_empty() {
                 self.spill_run()?;
             }
+            // From here on only the runs are read: give the buffer back.
+            self.buf = Vec::new();
             let dir = self.tmp.as_ref().expect("runs were written").0.clone();
             Source::Runs(Merge::open(
                 &dir,
@@ -256,6 +263,13 @@ impl SliceBuilder {
             let fp: [u8; 8] = h[4..12].try_into().unwrap();
             let rec = if entries_len(entries, first) > SPILL_INLINE_MAX {
                 let file = spill_file(entries);
+                ensure!(
+                    file.len() <= MAX_FILE,
+                    "slice ({level}, {index}): an address with {} entries needs a spill file of \
+                     {} bytes, above the {MAX_FILE} a client reads",
+                    entries.len(),
+                    file.len()
+                );
                 let spill_ref = file_reference(&file);
                 if seen.insert(spill_ref) {
                     emit(Output::File(spill_ref, file))?;
@@ -310,7 +324,10 @@ impl SliceBuilder {
         if let Some(k) = current {
             flush(k, &mut entries)?;
         }
-        drop(source);
+        // The runs are read: close them and free their disk while the spool is read.
+        if let Source::Runs(m) = source {
+            m.remove()?;
+        }
 
         let bucket_count = match force_buckets {
             Some(b) => b,
@@ -340,6 +357,12 @@ impl SliceBuilder {
                         .map(|g| AddressRecord::decode(&mut &g.2[..], first, last))
                         .collect::<Result<Vec<_>>>()?;
                     let file = bucket_pages_file(&recs, first);
+                    ensure!(
+                        file.len() <= MAX_FILE,
+                        "slice ({level}, {index}): bucket {k} needs a pages file of {} bytes, \
+                         above the {MAX_FILE} a client reads",
+                        file.len()
+                    );
                     let pages_ref = file_reference(&file);
                     payload = BucketRecord {
                         level,
@@ -390,7 +413,8 @@ impl SliceBuilder {
             group_k += 1;
         }
         drop(emit_bucket);
-        let buckets_root = Tree::new(&leaves, depth_for(leaves.len())).root();
+        let depth = depth_for(leaves.len());
+        let buckets_root = root_of(leaves, depth);
         Ok(Built {
             record: SliceRecord {
                 level,
@@ -436,12 +460,6 @@ impl Spool {
     }
 }
 
-/// Bucket of an address whose hash starts with `prefix`, among `buckets` (multiply-shift, as
-/// `slice::bucket_of`).
-pub fn bucket_of_prefix(prefix: u32, buckets: u32) -> u32 {
-    ((prefix as u64 * buckets as u64) >> 32) as u32
-}
-
 fn write_run(path: &Path, items: &[Item]) -> Result<()> {
     let mut w = BufWriter::with_capacity(1 << 20, File::create(path)?);
     for item in items {
@@ -479,6 +497,7 @@ impl Source {
 struct Merge {
     readers: Vec<BufReader<File>>,
     heap: BinaryHeap<Reverse<(Item, usize)>>,
+    paths: Vec<PathBuf>,
 }
 
 impl Merge {
@@ -500,10 +519,7 @@ impl Merge {
                     }
                 }
                 w.flush()?;
-                drop(m);
-                for p in group {
-                    std::fs::remove_file(p)?;
-                }
+                m.remove()?;
                 next.push(path);
             }
             runs = next;
@@ -522,7 +538,20 @@ impl Merge {
             }
             readers.push(r);
         }
-        Ok(Self { readers, heap })
+        Ok(Self {
+            readers,
+            heap,
+            paths: runs.to_vec(),
+        })
+    }
+
+    /// Closes the runs and removes them.
+    fn remove(self) -> Result<()> {
+        drop(self.readers);
+        for p in &self.paths {
+            std::fs::remove_file(p).with_context(|| format!("removing {}", p.display()))?;
+        }
+        Ok(())
     }
 
     fn next_item(&mut self) -> Result<Option<Item>> {

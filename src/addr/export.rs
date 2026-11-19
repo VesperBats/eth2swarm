@@ -17,6 +17,13 @@
 //! (the records of an unfinished unit are written again, identically), and the uploader reads
 //! no further than `committed`, which is never beyond that length, so a truncation never takes
 //! away a record it may have uploaded.
+//!
+//! A slice is written record by record as it is built, so a deferred merge building in the
+//! background interleaves with the units, their heads and the checkpoints. Its descriptor is
+//! still in the log before the head that drops it from `pending`, and no head makes a client
+//! read a merge before that; but `committed` can fall inside a merge, and a run that stops
+//! while one is written keeps the part before its last save and writes the whole merge again
+//! after it. The copies are identical; they cost disk and a second upload.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -50,6 +57,9 @@ const WRITER_LOCK: &str = "addr1.log.lock";
 const UPLOAD_LOCK: &str = "upload.lock";
 /// The importer's state lock (`import::StateLock`), there if `--out` is the state directory.
 const STATE_LOCK: &str = "addr-import.lock";
+/// The importer's own directory for sort runs, inside `--sort-dir` (default: the state
+/// directory), so there too if `--out` is the state directory.
+pub const SORT_DIR: &str = "ethswarm-sort";
 /// The version of the export's layout, in its metadata: the log is a contract between two
 /// commands that may be different builds on different machines.
 pub const FORMAT: u32 = 1;
@@ -243,6 +253,7 @@ fn is_fresh(dir: &Path, meta: &ExportMeta) -> Result<bool> {
         let name = entry.file_name();
         let ok = match name.to_str() {
             Some(WRITER_LOCK | UPLOAD_LOCK | STATE_LOCK) => true,
+            Some(SORT_DIR) => entry.file_type()?.is_dir(),
             Some(COMMITTED_FILE) => read_committed(dir)? == Some(0),
             Some(LOG_FILE) => entry.metadata()?.len() == 0,
             Some(META_FILE) => {

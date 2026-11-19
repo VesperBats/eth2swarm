@@ -3,8 +3,8 @@
 //!
 //! The importer keeps its progress in a local state file. Swarm holds what clients read: the
 //! slices, one head update per unit, and the origin (a copy of head update 0). Slices are
-//! built in memory from the chain, up to `max_level` (part 4b of #8 adds external-memory
-//! building for the large levels a mainnet import needs).
+//! built from the chain with bounded memory (`build::SliceBuilder`, sort runs on disk), up to
+//! `max_level`, and published as they are built.
 //!
 //! Heads and the origin are write-once, so they are written ahead: the next head is saved in
 //! the state before it is uploaded, and a run that finds a prepared head uploads exactly that
@@ -514,14 +514,23 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
     }
 }
 
-/// The sort directory of this run, locked for it and emptied of what a stopped run left there
-/// (the runs of a slice are removed when it is built, so anything there is from a run that did
-/// not finish).
+/// The sort directory of this run: the importer's own [`export::SORT_DIR`] inside `--sort-dir`
+/// (default: the state directory), locked for the run and emptied of the slice directories a
+/// stopped run left there (a slice's runs are removed when it is built). Nothing else in
+/// `--sort-dir` is touched.
 fn sort_dir(opts: &ImportOptions) -> Result<(PathBuf, std::fs::File)> {
     let dir = opts
         .sort_dir
-        .clone()
-        .unwrap_or_else(|| opts.state_dir.join("sort"));
+        .as_ref()
+        .unwrap_or(&opts.state_dir)
+        .join(export::SORT_DIR);
+    let lock = prepare_sort_dir(&dir)?;
+    Ok((dir, lock))
+}
+
+/// Creates, locks and cleans the sort directory `dir` (see [`sort_dir`]).
+fn prepare_sort_dir(dir: &Path) -> Result<std::fs::File> {
+    let dir = dir.to_path_buf();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join("sort.lock");
     let lock =
@@ -534,16 +543,21 @@ fn sort_dir(opts: &ImportOptions) -> Result<(PathBuf, std::fs::File)> {
     })?;
     for entry in std::fs::read_dir(&dir)? {
         let path = entry?.path();
-        let stale = path
+        // Only what the builder makes: `slice-<level>-<index>-<pid>-<n>`, a directory.
+        let ours = path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("slice-"));
-        if stale {
+            .and_then(|n| n.strip_prefix("slice-"))
+            .is_some_and(|rest| {
+                let parts: Vec<&str> = rest.split('-').collect();
+                parts.len() == 4 && parts.iter().all(|p| p.parse::<u64>().is_ok())
+            });
+        if ours && path.is_dir() && !path.is_symlink() {
             std::fs::remove_dir_all(&path)
                 .with_context(|| format!("removing {}", path.display()))?;
         }
     }
-    Ok((dir, lock))
+    Ok(lock)
 }
 
 /// A slice is built only up to `max_level`, measured by what it holds ([`held_level`]): the
@@ -759,10 +773,12 @@ where
         _sort_lock: std::sync::Arc::new(sort_lock),
         // Test hook: a tiny buffer makes even a dev chain's slices take many runs and merge
         // rounds (`scripts/e2e-bee-factory.sh`).
-        sort_buffer: std::env::var("ETH2SWARM_ADDR_SORT_BUFFER_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(opts.sort_buffer),
+        sort_buffer: match std::env::var("ETH2SWARM_ADDR_SORT_BUFFER_BYTES") {
+            Ok(v) => v
+                .parse()
+                .with_context(|| format!("ETH2SWARM_ADDR_SORT_BUFFER_BYTES={v}"))?,
+            Err(_) => opts.sort_buffer,
+        },
     };
 
     let mut state = match existing {
@@ -905,7 +921,7 @@ async fn import_unit<P: Provider + Clone + 'static>(
 
 /// The slices a backfill of `target` units from `first_unit` writes: what a client reads for
 /// head update 0, the cover's slices after the start. Refused if there is nothing to import
-/// or a slice is too large to build in memory.
+/// or a slice is above `max_level`.
 fn backfill_slices(target: u64, first_unit: u64, max_level: u8) -> Result<Vec<SliceId>> {
     ensure!(
         target > first_unit,
@@ -978,6 +994,25 @@ async fn backfill<P: Provider + Clone + 'static>(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn the_sort_directory_is_locked_and_only_our_leftovers_go() {
+        let dir = std::env::temp_dir().join(format!("addr-sort-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("slice-3-7-123-0")).unwrap();
+        std::fs::create_dir_all(dir.join("slice-mine")).unwrap();
+        std::fs::write(dir.join("slice-1-2-3-4.txt"), "a file").unwrap();
+        let lock = prepare_sort_dir(&dir).unwrap();
+        assert!(
+            !dir.join("slice-3-7-123-0").exists(),
+            "a stopped run's slice"
+        );
+        assert!(dir.join("slice-mine").exists() && dir.join("slice-1-2-3-4.txt").exists());
+        assert!(prepare_sort_dir(&dir).is_err(), "a second importer");
+        drop(lock);
+        assert!(prepare_sort_dir(&dir).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn unit_work_defers_from_the_given_level() {

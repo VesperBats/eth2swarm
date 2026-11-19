@@ -23,6 +23,8 @@ pub const BUCKET_TARGET: usize = 2816;
 pub const SPILL_INLINE_MAX: usize = 256;
 /// Bucket payload limit (one chunk) and size of spill and bucket pages.
 pub const PAGE_SIZE: usize = 4096;
+/// Largest spill or pages file a client reads; the importer refuses to make a larger one.
+pub const MAX_FILE: usize = 256 << 20;
 
 const KIND_SLICE: u8 = 4;
 const KIND_BUCKET: u8 = 5;

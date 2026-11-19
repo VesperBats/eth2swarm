@@ -50,6 +50,32 @@ fn levels(leaves: &[B256], depth: u32) -> Vec<Vec<B256>> {
     out
 }
 
+/// The root of [`Tree::new`]`(leaves, depth)` without keeping its levels: the leaves are folded
+/// in place, and the zero-padding is folded in as the hashes of all-zero subtrees. Memory is
+/// the leaves themselves (for a slice with millions of buckets).
+pub fn root_of(mut leaves: Vec<B256>, depth: u32) -> B256 {
+    assert!(
+        leaves.len() <= 1usize << depth,
+        "too many leaves for depth {depth}"
+    );
+    let mut zero = B256::ZERO; // the root of an all-zero subtree of the current height
+    if leaves.is_empty() {
+        leaves.push(B256::ZERO);
+    }
+    for _ in 0..depth {
+        if leaves.len() % 2 == 1 {
+            leaves.push(zero);
+        }
+        let n = leaves.len() / 2;
+        for i in 0..n {
+            leaves[i] = parent(&leaves[2 * i], &leaves[2 * i + 1]);
+        }
+        leaves.truncate(n);
+        zero = parent(&zero, &zero);
+    }
+    leaves[0]
+}
+
 /// A Merkle tree with precomputed levels, for producing many proofs.
 pub struct Tree {
     levels: Vec<Vec<B256>>,
@@ -124,5 +150,21 @@ mod tests {
         let tree = Tree::new(&[leaf], depth_for(1));
         assert_eq!(tree.root(), leaf);
         assert!(tree.proof(0).is_empty());
+    }
+
+    #[test]
+    fn root_of_matches_the_tree() {
+        for n in 0..70usize {
+            let leaves: Vec<B256> = (0..n)
+                .map(|i| keccak256((i as u64).to_be_bytes()))
+                .collect();
+            for depth in depth_for(n)..depth_for(n) + 3 {
+                assert_eq!(
+                    root_of(leaves.clone(), depth),
+                    Tree::new(&leaves, depth).root(),
+                    "{n} leaves, depth {depth}"
+                );
+            }
+        }
     }
 }
