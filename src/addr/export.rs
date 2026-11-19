@@ -42,6 +42,23 @@ const META_FILE: &str = "addr1-export.json";
 const LOG_FILE: &str = "addr1.log";
 const COMMITTED_FILE: &str = "committed";
 const PROGRESS_FILE: &str = "uploaded.json";
+/// Held by the one importer writing the log.
+const WRITER_LOCK: &str = "addr1.log.lock";
+/// Held by the one `addr-upload` of the directory.
+const UPLOAD_LOCK: &str = "upload.lock";
+
+/// An exclusive lock on `dir/name`, held while the value lives.
+struct DirLock(#[allow(dead_code)] File);
+
+impl DirLock {
+    fn acquire(dir: &Path, name: &str, who: &str) -> Result<Self> {
+        let path = dir.join(name);
+        let f = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        f.try_lock()
+            .map_err(|_| anyhow::anyhow!("another {who} holds {}", path.display()))?;
+        Ok(Self(f))
+    }
+}
 
 /// What an export is of: one owner's index of one chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +72,10 @@ pub struct ExportLog {
     dir: PathBuf,
     out: BufWriter<File>,
     len: u64,
+    /// An append failed part way: the file may hold bytes `len` does not count, so nothing
+    /// more may be checkpointed. The next run truncates them away.
+    broken: bool,
+    _lock: DirLock,
 }
 
 impl ExportLog {
@@ -63,13 +84,14 @@ impl ExportLog {
     /// is written again). `None` starts a new export, in a directory without one.
     pub fn open(dir: &Path, meta: &ExportMeta, resume_at: Option<u64>) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let lock = DirLock::acquire(dir, WRITER_LOCK, "addr-import")?;
         let meta_path = dir.join(META_FILE);
         let log_path = dir.join(LOG_FILE);
         match resume_at {
             None => {
                 ensure!(
-                    !meta_path.exists() && !log_path.exists(),
-                    "{} already holds an export; a new index needs an empty directory",
+                    is_fresh(dir, meta)?,
+                    "{} is not empty; a new export needs an empty directory",
                     dir.display()
                 );
                 write_atomic(&meta_path, &serde_json::to_vec_pretty(meta)?)?;
@@ -117,6 +139,8 @@ impl ExportLog {
             dir: dir.to_path_buf(),
             out: BufWriter::with_capacity(1 << 20, file),
             len,
+            broken: false,
+            _lock: lock,
         };
         // A run that stopped before writing `committed` leaves it behind the log.
         log.commit(len)?;
@@ -124,11 +148,14 @@ impl ExportLog {
     }
 
     pub fn append(&mut self, kind: u8, key: &B256, data: &[u8]) -> Result<()> {
+        ensure!(!self.broken, "an earlier write to the export failed");
         let n = u32::try_from(data.len()).context("record over 4 GiB")?;
+        self.broken = true;
         self.out.write_all(&[kind])?;
         self.out.write_all(key.as_slice())?;
         self.out.write_all(&n.to_be_bytes())?;
         self.out.write_all(data)?;
+        self.broken = false;
         self.len += RECORD_HEADER + data.len() as u64;
         Ok(())
     }
@@ -139,6 +166,7 @@ impl ExportLog {
 
     /// Writes everything out and syncs it: the length to record in the importer's state.
     pub fn checkpoint(&mut self) -> Result<u64> {
+        ensure!(!self.broken, "an earlier write to the export failed");
         self.out.flush()?;
         self.out.get_ref().sync_data()?;
         Ok(self.len)
@@ -150,15 +178,42 @@ impl ExportLog {
     }
 }
 
-/// Writes a small file durably: a temporary file, synced, renamed, and the directory synced.
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+/// A directory a new export may start in: empty, or holding only what an earlier attempt for
+/// the same index left before it wrote any record (its metadata, an empty log, the locks).
+fn is_fresh(dir: &Path, meta: &ExportMeta) -> Result<bool> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let ok = match name.to_str() {
+            Some(WRITER_LOCK) => true,
+            Some(COMMITTED_FILE) => std::fs::read_to_string(entry.path())?.trim() == "0",
+            Some(LOG_FILE) => entry.metadata()?.len() == 0,
+            Some(META_FILE) => {
+                serde_json::from_slice::<ExportMeta>(&std::fs::read(entry.path())?).ok()
+                    == Some(meta.clone())
+            }
+            _ => false,
+        };
+        if !ok {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Writes a small file durably: a temporary file, synced, renamed, and the directory synced,
+/// so that after a crash or a power loss it is either the old or the new content.
+pub(super) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     let mut f = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    f.write_all(data)?;
-    f.sync_all()?;
+    f.write_all(data)
+        .and_then(|_| f.sync_all())
+        .with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
     if let Some(dir) = path.parent() {
-        File::open(dir)?.sync_all()?;
+        File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("syncing {}", dir.display()))?;
     }
     Ok(())
 }
@@ -214,6 +269,13 @@ impl Records {
         );
         let key = B256::from_slice(&head[1..33]);
         let n = u32::from_be_bytes(head[33..37].try_into().unwrap()) as usize;
+        // Checked before allocating: a damaged length must not ask for gigabytes.
+        ensure!(
+            self.offset + RECORD_HEADER + n as u64 <= self.end,
+            "the record at {} runs past the committed length {}",
+            self.offset,
+            self.end
+        );
         let mut data = vec![0u8; n];
         self.reader.read_exact(&mut data)?;
         let rec = Record {
@@ -223,12 +285,6 @@ impl Records {
             data,
         };
         self.offset = rec.end();
-        ensure!(
-            self.offset <= self.end,
-            "the record at {} runs past the committed length {}",
-            rec.offset,
-            self.end
-        );
         Ok(Some(rec))
     }
 }
@@ -241,6 +297,9 @@ pub struct Progress {
     pub last_head: Option<B256>,
     /// Offset of that head's record.
     pub last_head_at: u64,
+    /// The batch the records were stamped with: an upload with another batch (another node,
+    /// or a new batch after the old one expired) starts from the beginning.
+    pub batch: Option<B256>,
 }
 
 impl Progress {
@@ -319,12 +378,7 @@ async fn upload_one(
     Ok(())
 }
 
-async fn join_one(set: &mut tokio::task::JoinSet<Result<()>>) -> Result<()> {
-    match set.join_next().await {
-        Some(r) => r.context("upload task panicked")?,
-        None => Ok(()),
-    }
-}
+use super::import::join_one;
 
 /// Uploads the export in `dir` through `bee` with `batch`, from where the last upload of
 /// this directory stopped (or from the start), up to its committed length. Records between
@@ -337,6 +391,7 @@ pub async fn upload(
     concurrency: usize,
     from_start: bool,
 ) -> Result<UploadSummary> {
+    let _lock = DirLock::acquire(dir, UPLOAD_LOCK, "addr-upload")?;
     let meta: ExportMeta = serde_json::from_slice(
         &std::fs::read(dir.join(META_FILE))
             .with_context(|| format!("{} holds no export", dir.display()))?,
@@ -354,6 +409,14 @@ pub async fn upload(
         }
         _ => Progress::default(),
     };
+    ensure!(
+        progress.batch.is_none_or(|b| b == batch),
+        "{} was uploaded with batch {} so far; pass --from-start to upload everything with \
+         batch {batch}",
+        dir.display(),
+        progress.batch.unwrap_or_default()
+    );
+    progress.batch = Some(batch);
     // The log must still hold the head the last upload ended with.
     if let Some(head) = progress.last_head {
         let mut r = Records::open(dir, progress.last_head_at, committed)?;
@@ -390,6 +453,7 @@ pub async fn upload(
                 offset: end,
                 last_head: Some(key),
                 last_head_at: offset,
+                batch: Some(batch),
             };
             progress.save(&progress_path)?;
         } else {
@@ -492,6 +556,49 @@ mod tests {
             std::fs::read_to_string(dir.join(COMMITTED_FILE)).unwrap(),
             at_unit.to_string()
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_export_needs_a_fresh_directory() {
+        let dir = tmp("fresh");
+        let meta = ExportMeta {
+            chain_id: 1,
+            owner: Address::repeat_byte(1),
+        };
+        // An attempt that stopped before writing a record can be repeated.
+        drop(ExportLog::open(&dir, &meta, None).unwrap());
+        drop(ExportLog::open(&dir, &meta, None).unwrap());
+        // Not for another owner, and not with another upload's progress left behind.
+        let other = ExportMeta {
+            owner: Address::repeat_byte(2),
+            ..meta.clone()
+        };
+        assert!(ExportLog::open(&dir, &other, None).is_err());
+        std::fs::write(dir.join(PROGRESS_FILE), "{}").unwrap();
+        assert!(ExportLog::open(&dir, &meta, None).is_err());
+        std::fs::remove_file(dir.join(PROGRESS_FILE)).unwrap();
+        // One writer at a time.
+        let log = ExportLog::open(&dir, &meta, None).unwrap();
+        assert!(ExportLog::open(&dir, &meta, Some(0)).is_err());
+        drop(log);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_length_is_refused_before_it_is_read() {
+        let dir = tmp("framing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rec = vec![FILE];
+        rec.extend_from_slice(&[0u8; 32]);
+        rec.extend_from_slice(&u32::MAX.to_be_bytes());
+        rec.extend_from_slice(&[0u8; 10]);
+        std::fs::write(dir.join(LOG_FILE), &rec).unwrap();
+        let err = Records::open(&dir, 0, rec.len() as u64)
+            .unwrap()
+            .next_record()
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("runs past"), "{err:#}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

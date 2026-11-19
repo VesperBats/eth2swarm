@@ -239,7 +239,8 @@ for fp in before-head-upload after-head-upload; do
 done
 exp_import --units 4 >/dev/null || { echo "FAIL: addr-import --out (resume to 4 units)"; exit 1; }
 # An exported index cannot continue as an uploaded one.
-if OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$EXP_KEY" --state "$EXP_STATE" --units 4 2>&1); then
+if OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$EXP_KEY" --state "$EXP_STATE" --units 4 \
+  "${TRACE_FLAG[@]}" 2>&1); then
   echo "FAIL: an exported index continued without --out"; exit 1
 fi
 echo "$OUT" | grep -q "exported to a directory" || { echo "FAIL: unexpected refusal: $OUT"; exit 1; }
@@ -251,6 +252,11 @@ for u in 2 3 4; do
 done
 # Nothing new: a second upload resumes at the end and sends nothing.
 exp_upload | grep -q ": 0 files, 0 SOCs, 0 heads" || { echo "FAIL: a repeated upload sent records again"; exit 1; }
+# Another batch does not resume what the first one stamped.
+if OUT=$(exp_upload --batch 0x$(printf '01%.0s' {1..32}) 2>&1); then
+  echo "FAIL: an upload with another batch resumed the progress of the first"; exit 1
+fi
+echo "$OUT" | grep -q -- "--from-start" || { echo "FAIL: unexpected refusal: $OUT"; exit 1; }
 # More units, uploaded incrementally; the merged slice (2, 0) is the one built directly.
 exp_import --units 5 >/dev/null || { echo "FAIL: addr-import --out (5 units)"; exit 1; }
 OUT=$(exp_upload) || { echo "FAIL: addr-upload (incremental)"; echo "$OUT"; exit 1; }
@@ -404,7 +410,7 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
     || { echo "FAIL: the late index has $LATE_SENDER sender entries, the full one $SINCE_SENDER since unit $S"; exit 1; }
   # The start is fixed: a later run cannot move it.
   if OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$LATE_KEY" --state "$LATE_STATE" \
-    --out "$LATE_DIR" --from-block 0 --units "$ACT_UNITS" 2>&1); then
+    --out "$LATE_DIR" --from-block 0 --units "$ACT_UNITS" "${TRACE_FLAG[@]}" 2>&1); then
     echo "FAIL: addr-import moved the start of an existing index"; exit 1
   fi
   echo "$OUT" | grep -q "cannot move it" \
