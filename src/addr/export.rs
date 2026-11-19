@@ -559,6 +559,8 @@ pub struct Batches {
     pub permanent: Option<B256>,
     pub lower: Vec<B256>,
     pub grace_days: u64,
+    /// Seconds per block of the chain.
+    pub slot_secs: u64,
 }
 
 /// Uploads the export in `dir` through `bee`, from where the last upload of this directory
@@ -602,6 +604,7 @@ pub async fn upload(
         batch,
         batches.lower,
         batches.grace_days,
+        batches.slot_secs,
     ));
     // The log must still hold the head the last upload ended with.
     if let Some(head) = progress.last_head {

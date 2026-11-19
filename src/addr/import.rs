@@ -263,6 +263,8 @@ pub struct ImportOptions {
     pub lower_batches: Vec<B256>,
     /// Days a lower batch must outlive the slices it stamps (default 7; for uploading only).
     pub grace_days: Option<u64>,
+    /// Seconds per block of the chain, for lifetimes (default 12; for uploading only).
+    pub slot_secs: Option<u64>,
     /// Write to this directory instead of uploading (`addr-upload` uploads it later).
     pub out: Option<PathBuf>,
     /// Merges of this level and above are built in the background.
@@ -786,9 +788,12 @@ where
     let sink = match (&opts.out, existing.as_ref().map(|s| s.export_len)) {
         (Some(out), None | Some(Some(_))) => {
             ensure!(
-                opts.batch.is_none() && opts.lower_batches.is_empty() && opts.grace_days.is_none(),
-                "--batch, --lower-batch and --grace-days are for uploading; an export takes them \
-                 at addr-upload"
+                opts.batch.is_none()
+                    && opts.lower_batches.is_empty()
+                    && opts.grace_days.is_none()
+                    && opts.slot_secs.is_none(),
+                "--batch, --lower-batch, --grace-days and --slot-secs are for uploading; an \
+                 export takes them at addr-upload"
             );
             let meta = ExportMeta::new(chain_id, signer.address());
             let resume = existing.as_ref().and_then(|s| s.export_len);
@@ -808,6 +813,7 @@ where
                     permanent,
                     opts.lower_batches.clone(),
                     opts.grace_days.unwrap_or(stamps::GRACE_DAYS),
+                    opts.slot_secs.unwrap_or(stamps::SLOT_SECS),
                 )),
             }
         }

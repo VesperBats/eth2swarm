@@ -393,7 +393,7 @@ How the importer stamps (`addr-import` and `addr-upload`, `--batch` and `--lower
   `i` exists only in a pending merge's expansion, which ends with that merge at `(i + 1)·2^L`.
   Written while the head has `N` units, its records must live that unit minus `N` more units
   (a deferred merge is counted from its own end, the earliest head it can be written at),
-  at 768 s per unit, plus a grace period (`--grace-days`, default 7, given to `addr-upload`
+  at 64 blocks of `--slot-secs` per unit (default 12 s, mainnet's slot: 768 s), plus a grace period (`--grace-days`, default 7, given to `addr-upload`
   for an export) for clients holding an older head and the cases below.
 - Each lower slice goes to the `--lower-batch` with the smallest remaining TTL (`batchTTL`
   of `GET /stamps/{id}`, asked at most once a minute) that is at least that long, so the
@@ -405,12 +405,12 @@ How the importer stamps (`addr-import` and `addr-upload`, `--batch` and `--lower
   longest-lived lower level written meanwhile); a slice that no lower batch outlives goes to
   the permanent batch and costs permanent storage. A lower batch Bee cannot tell about (it
   expired, or the request failed) is left out until the next refresh.
-- The lifetime assumes the head keeps moving at 12 s per block. Three things keep a lower
-  slice in use longer, and the grace period must cover them: the importer being stopped or
-  behind (its last head still lists the slice), a deferred merge taking long to build (its
-  expansion stays in use until it is uploaded), and a chain with slower blocks. Past the
-  grace period the slice's batch can expire while a head still uses it; topping up that batch
-  (or importing again) is the remedy.
+- The lifetime assumes the head keeps moving at `--slot-secs` per block. Two things keep a
+  lower slice in use longer, and the grace period must cover them: the importer being stopped
+  or behind (its last head still lists the slice), and a deferred merge taking long to build
+  (its expansion stays in use until it is uploaded). Past the grace period the slice's batch
+  can expire while a head still uses it; topping up that batch (or importing again) is the
+  remedy.
 - An export records each record's remaining lifetime in the log (layout 2), so `addr-upload`
   chooses the batches; a layout-1 export (written before lifetimes) uploads as permanent.
   The lifetime is counted from when the record was written, so an upload long after the

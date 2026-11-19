@@ -111,6 +111,10 @@ enum Command {
         /// and the importer being stopped (its head's slices stay in use).
         #[arg(long)]
         grace_days: Option<u64>,
+        /// Seconds per block of the chain (default 12, mainnet's slot time): how long a unit,
+        /// and so a lower slice's lifetime, lasts. A chain with slower blocks needs it.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        slot_secs: Option<u64>,
         /// Write everything to this directory instead of uploading it (no Bee node needed);
         /// `addr-upload` pushes it through a Bee node later. Every run of the index then
         /// passes the same directory. Keep it apart from --state.
@@ -180,6 +184,10 @@ enum Command {
         /// and the importer being stopped (its head's slices stay in use).
         #[arg(long)]
         grace_days: Option<u64>,
+        /// Seconds per block of the chain (default 12, mainnet's slot time): how long a unit,
+        /// and so a lower slice's lifetime, lasts. A chain with slower blocks needs it.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        slot_secs: Option<u64>,
         /// Records uploaded in parallel (between two heads).
         #[arg(long, default_value_t = 16)]
         concurrency: usize,
@@ -390,6 +398,7 @@ async fn main() -> Result<()> {
             batch,
             lower_batches,
             grace_days,
+            slot_secs,
             out,
             defer_level,
             max_level,
@@ -407,6 +416,7 @@ async fn main() -> Result<()> {
                 batch,
                 lower_batches,
                 grace_days,
+                slot_secs,
                 out,
                 defer_level,
                 max_level,
@@ -452,6 +462,7 @@ async fn main() -> Result<()> {
             batch,
             lower_batches,
             grace_days,
+            slot_secs,
             concurrency,
             from_start,
         } => {
@@ -459,6 +470,7 @@ async fn main() -> Result<()> {
                 permanent: batch,
                 lower: lower_batches,
                 grace_days: grace_days.unwrap_or(addr::stamps::GRACE_DAYS),
+                slot_secs: slot_secs.unwrap_or(addr::stamps::SLOT_SECS),
             };
             let s = addr::export::upload(&bee, batches, &dir, concurrency, from_start).await?;
             println!(

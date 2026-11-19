@@ -19,9 +19,9 @@ use super::layout::{L_MAX, UNIT_BLOCKS};
 use super::slice::SliceId;
 use crate::swarm::bee::Bee;
 
-/// Seconds of one unit at mainnet's slot time: what a batch's TTL is measured against. A
-/// chain with slower blocks needs a longer grace period.
-pub const UNIT_SECS: u64 = UNIT_BLOCKS * 12;
+/// Seconds per block on mainnet: what a unit's duration, and with it a batch's TTL, is
+/// measured against unless `--slot-secs` says otherwise.
+pub const SLOT_SECS: u64 = 12;
 
 /// The unit at which the head has moved past slice `s` for good, so that no cover uses it any
 /// more: `None` for a top-level slice, which is permanent. A lower slice `(L, i)` with `i` even
@@ -67,6 +67,8 @@ pub struct Stamps {
     permanent: B256,
     lower: Vec<B256>,
     grace_secs: u64,
+    /// Seconds per unit of this chain.
+    unit_secs: u64,
     /// Held while Bee is asked, so that concurrent callers wait for one refresh.
     ttls: tokio::sync::Mutex<Option<Ttls>>,
     used: Mutex<BTreeMap<B256, u64>>,
@@ -74,12 +76,20 @@ pub struct Stamps {
 }
 
 impl Stamps {
-    pub fn new(bee: Bee, permanent: B256, lower: Vec<B256>, grace_days: u64) -> Self {
+    /// `slot_secs` is the chain's seconds per block (mainnet: [`SLOT_SECS`]).
+    pub fn new(
+        bee: Bee,
+        permanent: B256,
+        lower: Vec<B256>,
+        grace_days: u64,
+        slot_secs: u64,
+    ) -> Self {
         Self {
             bee,
             permanent,
             lower,
             grace_secs: grace_days.saturating_mul(86_400),
+            unit_secs: UNIT_BLOCKS.saturating_mul(slot_secs.max(1)),
             ttls: tokio::sync::Mutex::new(None),
             used: Mutex::new(BTreeMap::new()),
             fell_back: Mutex::new(0),
@@ -93,7 +103,7 @@ impl Stamps {
             Some(_) if self.lower.is_empty() => self.permanent,
             Some(units) => {
                 let need = units
-                    .saturating_mul(UNIT_SECS)
+                    .saturating_mul(self.unit_secs)
                     .saturating_add(self.grace_secs);
                 match choose(&self.lower_ttls().await, need) {
                     Some(b) => b,
