@@ -117,8 +117,8 @@ enum Command {
         sort_dir: Option<std::path::PathBuf>,
         /// Memory for one sort buffer, in MiB. A background merge and the newest unit can each
         /// hold one.
-        #[arg(long, default_value_t = 512)]
-        sort_memory_mb: usize,
+        #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u64).range(1..=1 << 20))]
+        sort_memory_mb: u64,
         /// Blocks fetched, and chunks uploaded, in parallel.
         #[arg(long, default_value_t = 16)]
         concurrency: usize,
@@ -366,7 +366,7 @@ async fn main() -> Result<()> {
                 max_level,
                 concurrency,
                 sort_dir,
-                sort_buffer: sort_memory_mb << 20,
+                sort_buffer: usize::try_from(sort_memory_mb << 20)?,
             };
             let s = addr::import::run(&provider, &bee, &key, opts).await?;
             println!(

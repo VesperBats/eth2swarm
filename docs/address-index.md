@@ -252,8 +252,13 @@ replaces: it is built from the blocks again. The importer does that with bounded
    along it, so a bucket's records are consecutive; they are ordered by (fingerprint,
    address), encoded, paged if needed, and published at once. The descriptor goes last.
 
-Memory is the sort buffer, one bucket and the entries of the busiest address; temporary disk
-is about 45 bytes per appearance of the slice being built, plus its records. Measured on
+Memory is the sort buffer, one bucket, the entries (16 bytes each) and spill file of the
+busiest address, and 32 bytes per bucket and per file of the slice; temporary disk is about
+45 bytes per appearance of the slice being built, plus its records. The busiest address is
+the one part that grows with the slice: a token contract in a top-level slice has tens of
+millions of entries, which is several GB and a spill file beyond the client's 256 MB read
+limit. Writing spill files as a stream, and paging them for the client, is still open; up to
+level 12 (about a month) it stays in the hundreds of MB. Measured on
 synthetic data: 100 M appearances (about a week of mainnet) in one slice with a 64 MB buffer
 peaked at 91 MiB and took 95 s, against about 10 GB in memory before.
 

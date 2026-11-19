@@ -135,8 +135,7 @@ pub struct BuiltSlice {
 
 /// Bucket of a hash among `buckets` (multiply-shift).
 pub fn bucket_of(h: &B256, buckets: u32) -> u32 {
-    let prefix = u32::from_be_bytes(h[..4].try_into().unwrap()) as u64;
-    ((prefix * buckets as u64) >> 32) as u32
+    super::build::bucket_of_prefix(u32::from_be_bytes(h[..4].try_into().unwrap()), buckets)
 }
 
 pub fn fingerprint(h: &B256) -> [u8; 8] {

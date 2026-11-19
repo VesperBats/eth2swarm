@@ -13,14 +13,16 @@
 //!    decreases along it, so each bucket's records are consecutive. They are ordered by
 //!    (fingerprint, address), encoded, paged if too large, and handed out.
 //!
-//! Memory: the sort buffer, one bucket, and the entries of the busiest address.
+//! Memory: the sort buffer, one bucket, the entries and spill file of the busiest address,
+//! and 32 bytes per bucket (for `buckets_root`) and per file (to list each once).
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloy::primitives::{B256, keccak256};
 use anyhow::{Context, Result, ensure};
@@ -41,6 +43,9 @@ type Item = [u8; ITEM];
 
 /// Runs merged at once; more are merged in rounds.
 const FAN_IN: usize = 128;
+
+/// Items or buckets between two looks at the cancel flag.
+const CANCEL_EVERY: u64 = 1 << 16;
 
 /// What building hands out, in order: files before the buckets that name them.
 #[derive(Debug)]
@@ -92,6 +97,15 @@ pub struct SliceBuilder {
     tmp_parent: PathBuf,
     tmp: Option<TempDir>,
     runs: Vec<PathBuf>,
+    cancel: Arc<AtomicBool>,
+}
+
+fn check(cancel: &AtomicBool) -> Result<()> {
+    ensure!(
+        !cancel.load(Ordering::Relaxed),
+        "the slice build was cancelled"
+    );
+    Ok(())
 }
 
 impl SliceBuilder {
@@ -129,7 +143,20 @@ impl SliceBuilder {
             tmp_parent: tmp_parent.to_path_buf(),
             tmp: None,
             runs: Vec::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// A flag that, once set, makes the build stop at its next look (it looks every
+    /// [`CANCEL_EVERY`] items or buckets).
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    /// Whether the next [`push`](Self::push) writes a run to disk (a caller on an async
+    /// runtime does that one off the runtime's threads).
+    pub fn push_spills(&self) -> bool {
+        self.buf.len() + 1 >= self.cap
     }
 
     pub fn push(&mut self, a: &Appearance) -> Result<()> {
@@ -154,6 +181,11 @@ impl SliceBuilder {
         item[32..40].copy_from_slice(&a.block.to_be_bytes());
         item[40..44].copy_from_slice(&a.slot.to_be_bytes());
         item[44] = a.roles;
+        if self.buf.capacity() == 0 {
+            // Allocated once at its full size: growing by doubling would end near twice the
+            // buffer, with the old allocation held during the copy.
+            self.buf.reserve_exact(self.cap);
+        }
         self.buf.push(item);
         if self.buf.len() >= self.cap {
             self.spill_run()?;
@@ -192,7 +224,11 @@ impl SliceBuilder {
                 self.spill_run()?;
             }
             let dir = self.tmp.as_ref().expect("runs were written").0.clone();
-            Source::Runs(Merge::open(&dir, std::mem::take(&mut self.runs))?)
+            Source::Runs(Merge::open(
+                &dir,
+                std::mem::take(&mut self.runs),
+                &self.cancel,
+            )?)
         };
         let (level, index) = self.slice;
         let (first, last) = (self.first, self.last);
@@ -247,7 +283,12 @@ impl SliceBuilder {
             spool.write_all(&bytes)?;
             Ok(())
         };
+        let mut items = 0u64;
         while let Some(item) = source.next_item()? {
+            items += 1;
+            if items.is_multiple_of(CANCEL_EVERY) {
+                check(&self.cancel)?;
+            }
             let key: [u8; 32] = item[..32].try_into().unwrap();
             if current != Some(key) {
                 if let Some(k) = current {
@@ -280,24 +321,24 @@ impl SliceBuilder {
         let mut reader = spool.into_reader()?;
         let mut leaves = Vec::with_capacity(bucket_count as usize);
         let mut paged = 0u32;
-        let mut group: Vec<([u8; 8], [u8; 20], AddressRecord)> = Vec::new();
+        // A bucket's records as encoded, with their (fingerprint, address) order key; they are
+        // decoded only for a bucket that has to be paged.
+        let mut group: Vec<([u8; 8], [u8; 20], Vec<u8>)> = Vec::new();
         let mut group_k = 0u32;
+        let cancel = self.cancel.clone();
         let mut emit_bucket =
-            |k: u32, group: &mut Vec<([u8; 8], [u8; 20], AddressRecord)>| -> Result<()> {
+            |k: u32, group: &mut Vec<([u8; 8], [u8; 20], Vec<u8>)>| -> Result<()> {
+                if u64::from(k).is_multiple_of(CANCEL_EVERY) {
+                    check(&cancel)?;
+                }
                 group.sort_by_key(|g| (g.0, g.1));
-                let recs: Vec<AddressRecord> = group.drain(..).map(|g| g.2).collect();
-                let inline = BucketRecord {
-                    level,
-                    index,
-                    bucket: k,
-                    base: first,
-                    body: BucketBody::Inline(recs),
-                };
-                let mut payload = inline.encode();
+                let mut payload =
+                    BucketRecord::encode_inline(level, index, k, group.iter().map(|g| &g.2[..]));
                 if payload.len() > PAGE_SIZE {
-                    let BucketBody::Inline(recs) = inline.body else {
-                        unreachable!()
-                    };
+                    let recs = group
+                        .iter()
+                        .map(|g| AddressRecord::decode(&mut &g.2[..], first, last))
+                        .collect::<Result<Vec<_>>>()?;
                     let file = bucket_pages_file(&recs, first);
                     let pages_ref = file_reference(&file);
                     payload = BucketRecord {
@@ -317,6 +358,7 @@ impl SliceBuilder {
                     }
                     paged += 1;
                 }
+                group.clear();
                 leaves.push(keccak256(&payload));
                 emit(Output::Bucket(k, payload))
             };
@@ -331,7 +373,6 @@ impl SliceBuilder {
             reader.read_exact(&mut len)?;
             let mut bytes = vec![0u8; u32::from_be_bytes(len) as usize];
             reader.read_exact(&mut bytes)?;
-            let rec = AddressRecord::decode(&mut &bytes[..], first, last)?;
             let k = bucket_of_prefix(
                 u32::from_be_bytes(key[..4].try_into().unwrap()),
                 bucket_count,
@@ -342,7 +383,7 @@ impl SliceBuilder {
             }
             let fp: [u8; 8] = key[4..12].try_into().unwrap();
             let address: [u8; 20] = key[12..32].try_into().unwrap();
-            group.push((fp, address, rec));
+            group.push((fp, address, bytes));
         }
         while group_k < bucket_count {
             emit_bucket(group_k, &mut group)?;
@@ -397,7 +438,7 @@ impl Spool {
 
 /// Bucket of an address whose hash starts with `prefix`, among `buckets` (multiply-shift, as
 /// `slice::bucket_of`).
-fn bucket_of_prefix(prefix: u32, buckets: u32) -> u32 {
+pub fn bucket_of_prefix(prefix: u32, buckets: u32) -> u32 {
     ((prefix as u64 * buckets as u64) >> 32) as u32
 }
 
@@ -442,7 +483,7 @@ struct Merge {
 
 impl Merge {
     /// Merges `runs`, first in rounds of [`FAN_IN`] into new runs in `dir` if there are more.
-    fn open(dir: &Path, mut runs: Vec<PathBuf>) -> Result<Self> {
+    fn open(dir: &Path, mut runs: Vec<PathBuf>, cancel: &AtomicBool) -> Result<Self> {
         let mut round = 0;
         while runs.len() > FAN_IN {
             let mut next = Vec::new();
@@ -450,8 +491,13 @@ impl Merge {
                 let path = dir.join(format!("merge-{round}-{i}"));
                 let mut m = Self::of(group)?;
                 let mut w = BufWriter::with_capacity(1 << 20, File::create(&path)?);
+                let mut n = 0u64;
                 while let Some(item) = m.next_item()? {
                     w.write_all(&item)?;
+                    n += 1;
+                    if n.is_multiple_of(CANCEL_EVERY) {
+                        check(cancel)?;
+                    }
                 }
                 w.flush()?;
                 drop(m);

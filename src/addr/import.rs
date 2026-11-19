@@ -296,8 +296,19 @@ struct Ctx<P> {
     concurrency: usize,
     /// Where slices keep their sort runs while they are built.
     sort_dir: PathBuf,
+    /// Held for the run: one importer per sort directory.
+    _sort_lock: std::sync::Arc<std::fs::File>,
     /// Bytes of one sort buffer (a background merge and a unit can each hold one).
     sort_buffer: usize,
+}
+
+/// Sets a build's cancel flag when dropped.
+struct CancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The last block of a published slice.
@@ -331,6 +342,8 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
             held_first_block(level, index, self.first_unit),
             last_block(level, index),
         );
+        // However publishing ends, a build still running stops at its next look.
+        let _cancel = CancelOnDrop(builder.cancel_flag());
         let (mut first_parent, mut last_hash, mut last_timestamp) = (None, B256::ZERO, 0);
         fetch_appearances(
             &self.provider,
@@ -341,7 +354,14 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
                 first_parent.get_or_insert(b.parent_hash);
                 last_hash = b.hash;
                 last_timestamp = b.timestamp;
-                b.appearances.iter().try_for_each(|a| builder.push(a))
+                b.appearances.iter().try_for_each(|a| {
+                    if builder.push_spills() {
+                        // Sorting and writing a full buffer takes seconds: off the runtime.
+                        tokio::task::block_in_place(|| builder.push(a))
+                    } else {
+                        builder.push(a)
+                    }
+                })
             },
         )
         .await?;
@@ -494,14 +514,24 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
     }
 }
 
-/// The sort directory of this run, emptied of what a stopped run left there (the runs of a
-/// slice are removed when it is built, so anything there is from a run that did not finish).
-fn sort_dir(opts: &ImportOptions) -> Result<PathBuf> {
+/// The sort directory of this run, locked for it and emptied of what a stopped run left there
+/// (the runs of a slice are removed when it is built, so anything there is from a run that did
+/// not finish).
+fn sort_dir(opts: &ImportOptions) -> Result<(PathBuf, std::fs::File)> {
     let dir = opts
         .sort_dir
         .clone()
         .unwrap_or_else(|| opts.state_dir.join("sort"));
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("sort.lock");
+    let lock =
+        std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+    lock.try_lock().map_err(|_| {
+        anyhow::anyhow!(
+            "another addr-import uses the sort directory {} (one importer per sort directory)",
+            dir.display()
+        )
+    })?;
     for entry in std::fs::read_dir(&dir)? {
         let path = entry?.path();
         let stale = path
@@ -513,7 +543,7 @@ fn sort_dir(opts: &ImportOptions) -> Result<PathBuf> {
                 .with_context(|| format!("removing {}", path.display()))?;
         }
     }
-    Ok(dir)
+    Ok((dir, lock))
 }
 
 /// A slice is built only up to `max_level`, measured by what it holds ([`held_level`]): the
@@ -686,6 +716,7 @@ where
             first_unit
         }
     };
+    let (sort_dir, sort_lock) = sort_dir(&opts)?;
     let sink = match (&opts.out, existing.as_ref().map(|s| s.export_len)) {
         (Some(out), None | Some(Some(_))) => {
             ensure!(
@@ -724,7 +755,8 @@ where
         traces: opts.traces,
         max_level: opts.max_level,
         concurrency: opts.concurrency,
-        sort_dir: sort_dir(&opts)?,
+        sort_dir,
+        _sort_lock: std::sync::Arc::new(sort_lock),
         // Test hook: a tiny buffer makes even a dev chain's slices take many runs and merge
         // rounds (`scripts/e2e-bee-factory.sh`).
         sort_buffer: std::env::var("ETH2SWARM_ADDR_SORT_BUFFER_BYTES")

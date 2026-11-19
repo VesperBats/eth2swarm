@@ -484,20 +484,50 @@ impl BucketRecord {
     #[cfg_attr(not(test), allow(dead_code))]
     pub const INLINE_HEADER: usize = 19;
 
+    /// An inline bucket from its address records, each already encoded
+    /// ([`AddressRecord::encode`] with the slice's base), in bucket order.
+    pub fn encode_inline<'a>(
+        level: u8,
+        index: u32,
+        bucket: u32,
+        records: impl ExactSizeIterator<Item = &'a [u8]>,
+    ) -> Vec<u8> {
+        let mut w = Writer::new(KIND_BUCKET);
+        w.u8(level);
+        w.u32(index);
+        w.u32(bucket);
+        w.u8(0);
+        w.u32(u32::try_from(records.len()).expect("more than 2^32 records"));
+        for rec in records {
+            w.0.extend_from_slice(rec);
+        }
+        w.0
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let base = self.base;
+        if let BucketBody::Inline(records) = &self.body {
+            let encoded: Vec<Vec<u8>> = records
+                .iter()
+                .map(|rec| {
+                    let mut out = Vec::new();
+                    rec.encode(&mut out, base);
+                    out
+                })
+                .collect();
+            return Self::encode_inline(
+                self.level,
+                self.index,
+                self.bucket,
+                encoded.iter().map(|r| &r[..]),
+            );
+        }
         let mut w = Writer::new(KIND_BUCKET);
         w.u8(self.level);
         w.u32(self.index);
         w.u32(self.bucket);
         match &self.body {
-            BucketBody::Inline(records) => {
-                w.u8(0);
-                w.u32(records.len() as u32);
-                for rec in records {
-                    rec.encode(&mut w.0, base);
-                }
-            }
+            BucketBody::Inline(_) => unreachable!("encoded above"),
             BucketBody::Paged {
                 count,
                 pages,
