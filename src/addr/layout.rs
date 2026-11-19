@@ -579,8 +579,9 @@ pub struct HeadRecord {
     pub units: u64,
     pub last_block_hash: B256,
     pub last_block_timestamp: u64,
-    /// Deferred merges `(level, index)`, strictly ascending by (first unit, level): an outer
-    /// merge deferred while an inner one is still pending starts at the same unit.
+    /// Deferred merges `(level, index)`, strictly ascending by `(index·2^level, level)`, the
+    /// grid's first unit (not the one an index from a later unit holds from): an outer merge
+    /// deferred while an inner one is still pending starts at the same unit.
     pub pending: Vec<(u8, u32)>,
 }
 

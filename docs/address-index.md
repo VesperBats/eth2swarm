@@ -279,7 +279,9 @@ covers and merges; only the slices that hold nothing are left out:
 - Every head states `S` (as `first_block = S·U`), the same in every update; the origin
   does too. `N0 > S`.
 - The backfill writes the slices of the cover of `[0, N0)` that end after `S`; every later
-  unit and merge proceeds as above. A merge the start falls into holds its units from `S`
+  unit and merge proceeds as above. The importer records `S` and `N0` before the first
+  upload, and a backfill that fails is repeated with exactly those: the slice the start
+  falls into depends on `S`, its identifiers do not, and they are written once. A merge the start falls into holds its units from `S`
   on, so it still holds exactly the entries of the slices it replaces.
 - A client reads what an incremental sync from unit `S` would read: the slices of the
   resolved cover that end after `S`. It reports the blocks before `S·U` as **not covered**,
@@ -493,7 +495,7 @@ range. `u32` block numbers last until block 2^32, more than 1600 years of 12-sec
 | `last_block_hash` | 32 bytes | hash of `last_block` |
 | `last_block_timestamp` | u64 | timestamp of `last_block` (seconds) |
 | `pending_count` | u8 | `p`, the number of deferred merges |
-| `pending` | `p` × (u8 level ‖ u32 index) | the deferred merged slices, strictly ascending by (first unit, level): an outer merge deferred while an inner one is pending starts at the same unit; each ends after unit `S` |
+| `pending` | `p` × (u8 level ‖ u32 index) | the deferred merged slices, strictly ascending by `(i·2^L, L)`, the grid's first unit and the level (for an index from unit `S`, not the unit the slice holds from): an outer merge deferred while an inner one is pending starts at the same unit; each ends after unit `S` |
 
 ## Client lookup
 

@@ -130,6 +130,11 @@ pub struct State {
     /// The next head, saved before it is uploaded (write-ahead): a run that finds it uploads
     /// exactly this record.
     pub prepared: Option<HeadRecord>,
+    /// A backfill of `n0` units from `first_unit` has started and not finished. Saved before
+    /// its first upload, so that a run after a failure repeats exactly that backfill: a slice
+    /// the start falls into depends on the start, and its identifiers do not.
+    #[serde(default)]
+    pub backfilling: bool,
 }
 
 impl State {
@@ -232,7 +237,8 @@ impl StateLock {
 }
 
 /// Test hook: `ETH2SWARM_ADDR_FAILPOINT=before-head-upload` or `after-head-upload` makes a run
-/// stop around a head upload, as a crash would (used by `scripts/e2e-bee-factory.sh`).
+/// stop around a head upload, `backfill-slice` after the first slice of a backfill, as a crash
+/// would (used by `scripts/e2e-bee-factory.sh`).
 fn failpoint(name: &str) -> Result<()> {
     match std::env::var("ETH2SWARM_ADDR_FAILPOINT") {
         Ok(v) if v == name => bail!("failpoint {name}"),
@@ -570,7 +576,16 @@ where
                 s.roles,
                 signer.address()
             );
-            s
+            if s.backfilling {
+                info!(
+                    units = s.n0,
+                    first_block = s.first_unit * UNIT_BLOCKS,
+                    "resuming the unfinished backfill as it started"
+                );
+                backfill(&ctx, s.n0, roles, dir).await?
+            } else {
+                s
+            }
         }
         None => {
             ensure!(
@@ -582,19 +597,24 @@ where
             // An origin under this key means an index exists: a second backfill would write
             // another origin and other heads under the same write-once identifiers. The read
             // is best effort: Bee 2.8.3 answers a missing chunk and a failed retrieval alike
-            // (500), so only finding the origin is conclusive; --init is the guard.
-            let reader = super::verify::IndexReader {
-                bee: bee.clone(),
-                owner: signer.address(),
-                chain_id,
-            };
-            match reader.origin().await {
-                Ok(origin) => bail!(
-                    "owner {} already published an index on chain {chain_id} (origin at {} \
-                     units); restore its state directory instead of starting over",
-                    signer.address(),
-                    origin.units
-                ),
+            // (500), so only finding the origin is conclusive; --init is the guard. Any SOC of
+            // this owner there counts, also one that no longer decodes (an earlier format).
+            let address = soc::soc_address(&origin_id(chain_id), &signer.address());
+            match bee.get_chunk(&address).await {
+                Ok(raw) => {
+                    let what = match soc::verify(&raw, &address, &signer.address())
+                        .and_then(|p| HeadRecord::decode(&p))
+                    {
+                        Ok(origin) => format!("origin at {} units", origin.units),
+                        Err(e) => format!("an origin this version cannot read: {e:#}"),
+                    };
+                    bail!(
+                        "owner {} already published an index on chain {chain_id} ({what}); \
+                         restore its state directory instead of starting over, or use another \
+                         key",
+                        signer.address()
+                    )
+                }
                 Err(e) => tracing::warn!(
                     "no origin found for owner {} on chain {chain_id}, starting a new index \
                      ({e:#})",
@@ -691,7 +711,8 @@ async fn import_unit<P: Provider + Clone + 'static>(
 
 /// First run: publishes the slices of the cover of `[0, target)` that hold units from the
 /// index's start on (every other past slice would never be read), then head update 0 and the
-/// origin, written ahead like every head.
+/// origin, written ahead like every head. The start and `target` are saved before the first
+/// upload, and a run after a failure resumes with them ([`State::backfilling`]).
 async fn backfill<P: Provider + Clone + 'static>(
     ctx: &Ctx<P>,
     target: u64,
@@ -720,12 +741,15 @@ async fn backfill<P: Provider + Clone + 'static>(
         schedule: Schedule::default(),
         unit_hashes: BTreeMap::new(),
         prepared: None,
+        backfilling: true,
     };
+    state.save(dir)?;
     let (mut parent, mut last) = (None, None);
     for s in slices {
         info!(level = s.0, index = s.1, "backfill");
         let f = ctx.fetch(s, parent).await?;
         ctx.upload_slice(&f.built).await?;
+        failpoint("backfill-slice")?;
         parent = Some(f.last_hash);
         state.unit_hashes.insert(units(s).end - 1, f.last_hash);
         last = Some(f);
@@ -738,6 +762,7 @@ async fn backfill<P: Provider + Clone + 'static>(
         last_block_timestamp: last.last_timestamp,
         pending: Vec::new(),
     });
+    state.backfilling = false;
     // From here on the origin's N0 is fixed: a later run publishes this head, never another.
     state.save(dir)?;
     info!(
@@ -857,6 +882,7 @@ mod tests {
                 last_block_timestamp: 1_800_000_000,
                 pending: vec![(1, 4)],
             }),
+            backfilling: false,
         };
         s.save(&dir).unwrap();
         assert_eq!(State::load(&dir).unwrap(), Some(s.clone()));
@@ -916,7 +942,7 @@ mod tests {
         }
         // A pending merge the start falls into keeps its last unit, and nothing before it.
         s3.schedule.defer((7, 0)); // units 0..128, held from 5
-        s3.unit_hashes = (5..130).map(|u| (u, B256::ZERO)).collect();
+        s3.unit_hashes = (4..130).map(|u| (u, B256::ZERO)).collect();
         s3.prune(130);
         assert!(s3.unit_hash(127).is_ok());
         assert!(s3.unit_hash(4).is_err());
