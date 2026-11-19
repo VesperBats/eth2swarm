@@ -10,7 +10,7 @@ use anyhow::{Result, ensure};
 use super::detect::Appearance;
 use super::layout::{
     AddressRecord, BUCKET_TARGET, BucketBody, BucketRecord, Entries, Entry, L_MAX, PAGE_SIZE,
-    SPILL_INLINE_MAX, SliceRecord, bucket_pages_file, entries_len, first_block, last_block,
+    SPILL_INLINE_MAX, SliceRecord, bucket_pages_file, entries_len, held_first_block, last_block,
     spill_file,
 };
 use crate::accumulator::{Tree, depth_for};
@@ -23,6 +23,24 @@ pub type SliceId = (u8, u32);
 pub fn units(slice: SliceId) -> Range<u64> {
     let (level, index) = slice;
     (index as u64) << level..(index as u64 + 1) << level
+}
+
+/// Units slice `slice` holds in an index that starts at unit `first_unit`: its own units from
+/// the index's start on. Empty for a slice that ends at or before the start: it does not exist
+/// in that index.
+pub fn held(slice: SliceId, first_unit: u64) -> Range<u64> {
+    let r = units(slice);
+    r.start.max(first_unit).min(r.end)..r.end
+}
+
+/// The size of what `slice` holds in an index from unit `first_unit`, as a level: the
+/// smallest `L` with `2^L` units at least [`held`]'s. The slice's own level from genesis, less
+/// for the slice a later start falls into. What building it in memory costs grows with this.
+pub fn held_level(slice: SliceId, first_unit: u64) -> u8 {
+    held(slice, first_unit)
+        .count()
+        .next_power_of_two()
+        .trailing_zeros() as u8
 }
 
 /// The cover of `[0, n)` units, oldest first.
@@ -97,6 +115,9 @@ pub fn resolve(n: u64, pending: &[SliceId]) -> Vec<SliceId> {
 /// What a client that has read everything up to unit `m` still has to read for a head with
 /// `n` units and the deferred merges `pending`: the slices of [`resolve`] that end after unit
 /// `m`. A slice that starts before `m` is read whole; its entries before `m` are not new.
+///
+/// For an index that starts at unit `S`, `resolve_after(S, …)` is what a client reads: the
+/// slices of the cover that end at or before `S` do not exist.
 pub fn resolve_after(m: u64, n: u64, pending: &[SliceId]) -> Vec<SliceId> {
     resolve(n, pending)
         .into_iter()
@@ -145,21 +166,24 @@ pub fn fingerprint(h: &B256) -> [u8; 8] {
     h[4..12].try_into().unwrap()
 }
 
-/// Builds slice `slice` from the appearances of its blocks. `last_block_hash` is the hash of
-/// its last block; `roles` the role bits the importer detects.
+/// Builds slice `slice` of an index that starts at unit `first_unit` from the appearances of
+/// the blocks it holds ([`held`]). `last_block_hash` is the hash of its last block; `roles`
+/// the role bits the importer detects.
 pub fn build_slice(
     slice: SliceId,
+    first_unit: u64,
     appearances: &[Appearance],
     last_block_hash: B256,
     roles: u8,
 ) -> Result<BuiltSlice> {
-    build(slice, appearances, last_block_hash, roles, None)
+    build(slice, first_unit, appearances, last_block_hash, roles, None)
 }
 
 /// [`build_slice`], with the bucket count overridable for tests (`B` is otherwise
 /// `max(1, ⌈record bytes / T⌉)`).
 fn build(
     slice: SliceId,
+    first_unit: u64,
     appearances: &[Appearance],
     last_block_hash: B256,
     roles: u8,
@@ -167,7 +191,14 @@ fn build(
 ) -> Result<BuiltSlice> {
     let (level, index) = slice;
     ensure!(level <= L_MAX, "slice level {level} above {L_MAX}");
-    let (first, last) = (first_block(level, index), last_block(level, index));
+    ensure!(
+        !held(slice, first_unit).is_empty(),
+        "slice ({level}, {index}) ends before the index starts at unit {first_unit}"
+    );
+    let (first, last) = (
+        held_first_block(level, index, first_unit),
+        last_block(level, index),
+    );
     ensure!(
         last < 1 << 32,
         "slice ({level}, {index}) ends at block {last}, beyond the format's u32 block numbers"
@@ -255,6 +286,7 @@ fn build(
             level,
             index,
             bucket: k as u32,
+            base: first,
             body: BucketBody::Inline(recs),
         };
         let mut payload = inline.encode();
@@ -268,6 +300,7 @@ fn build(
                 level,
                 index,
                 bucket: k as u32,
+                base: first,
                 body: BucketBody::Paged {
                     count: recs.len() as u32,
                     pages: file.len().div_ceil(PAGE_SIZE) as u32,
@@ -288,6 +321,7 @@ fn build(
         record: SliceRecord {
             level,
             index,
+            first_block: first,
             last_block_hash,
             bucket_count,
             addresses: address_count,
@@ -306,7 +340,7 @@ fn build(
 mod tests {
     use super::*;
     use crate::addr::layout::{
-        UNIT_BLOCKS, decode_bucket_page, decode_spill_page, pages as split_pages,
+        UNIT_BLOCKS, decode_bucket_page, decode_spill_page, first_block, pages as split_pages,
     };
     use std::collections::BTreeSet;
 
@@ -411,12 +445,12 @@ mod tests {
             app(base + 2, 0, 0x22, 0x40),
             app(base + 63, 7, 0x11, 2),
         ];
-        let built = build_slice(slice, &apps, B256::repeat_byte(9), 0xdf).unwrap();
+        let built = build_slice(slice, 0, &apps, B256::repeat_byte(9), 0xdf).unwrap();
         assert_eq!(built.record.bucket_count, 1);
         assert_eq!(built.record.addresses, 2);
         assert_eq!(built.record.appearances, 3);
         assert!(built.files.is_empty());
-        let b = BucketRecord::decode(&built.buckets[0]).unwrap();
+        let b = BucketRecord::decode(&built.buckets[0], built.record.first_block).unwrap();
         let BucketBody::Inline(recs) = b.body else {
             panic!("inline expected")
         };
@@ -439,13 +473,56 @@ mod tests {
         );
         assert_eq!(built.record.buckets_root, keccak256(&built.buckets[0]));
         // Outside the slice, no roles, or a role the slice does not detect.
-        assert!(build_slice(slice, &[app(base + 64, 1, 1, 1)], B256::ZERO, 0xff).is_err());
-        assert!(build_slice(slice, &[app(base, 1, 1, 0)], B256::ZERO, 0xff).is_err());
-        assert!(build_slice(slice, &[app(base, 1, 1, 0x20)], B256::ZERO, 0xdf).is_err());
+        assert!(build_slice(slice, 0, &[app(base + 64, 1, 1, 1)], B256::ZERO, 0xff).is_err());
+        assert!(build_slice(slice, 0, &[app(base, 1, 1, 0)], B256::ZERO, 0xff).is_err());
+        assert!(build_slice(slice, 0, &[app(base, 1, 1, 0x20)], B256::ZERO, 0xdf).is_err());
         // An empty slice still has one bucket.
-        let empty = build_slice((0, 0), &[], B256::ZERO, 0).unwrap();
+        let empty = build_slice((0, 0), 0, &[], B256::ZERO, 0).unwrap();
         assert_eq!(empty.record.bucket_count, 1);
         assert_eq!(empty.buckets.len(), 1);
+    }
+
+    #[test]
+    fn slices_of_an_index_from_a_later_unit() {
+        // An index from unit 5: slice (3, 0) holds units 5..8, slice (2, 0) does not exist.
+        assert_eq!(held((3, 0), 5), 5..8);
+        assert_eq!(held((2, 1), 5), 5..8);
+        assert_eq!(held((0, 9), 5), 9..10);
+        assert!(held((2, 0), 5).is_empty());
+        assert_eq!(held((3, 0), 0), 0..8);
+        // Sizes as levels: (3, 0) holds 3 units from unit 5, (10, 0) 24 from unit 1000.
+        assert_eq!(held_level((3, 0), 5), 2);
+        assert_eq!(held_level((3, 0), 0), 3);
+        assert_eq!(held_level((10, 0), 1000), 5);
+        assert_eq!(held_level((0, 9), 5), 0);
+        let apps = vec![app(320, 1, 0x11, 1), app(511, 2, 0x11, 2)];
+        let built = build_slice((3, 0), 5, &apps, B256::ZERO, 0xff).unwrap();
+        assert_eq!(built.record.first_block, 5 * UNIT_BLOCKS);
+        let b = BucketRecord::decode(&built.buckets[0], built.record.first_block).unwrap();
+        let BucketBody::Inline(recs) = b.body else {
+            panic!("inline expected")
+        };
+        assert_eq!(
+            recs[0].entries,
+            Entries::Inline(vec![
+                Entry {
+                    block: 320,
+                    slot: 1,
+                    roles: 1
+                },
+                Entry {
+                    block: 511,
+                    slot: 2,
+                    roles: 2
+                },
+            ])
+        );
+        // A block before the start is outside the slice; a slice before it cannot be built.
+        assert!(build_slice((3, 0), 5, &[app(319, 1, 0x11, 1)], B256::ZERO, 0xff).is_err());
+        assert!(build_slice((2, 0), 5, &[], B256::ZERO, 0xff).is_err());
+        // What a client reads for 13 units: the cover's slices that end after the start.
+        assert_eq!(resolve_after(5, 13, &[]), vec![(3, 0), (2, 2), (0, 12)]);
+        assert_eq!(resolve_after(8, 13, &[]), vec![(2, 2), (0, 12)]);
     }
 
     #[test]
@@ -465,14 +542,18 @@ mod tests {
                 roles: 0x10,
             });
         }
-        let built = build_slice(slice, &apps, B256::ZERO, 0x11).unwrap();
+        let built = build_slice(slice, 0, &apps, B256::ZERO, 0x11).unwrap();
         assert_eq!(built.record.addresses, 2001);
         // Every bucket is at most one chunk.
         assert!(built.buckets.iter().all(|b| b.len() <= PAGE_SIZE));
         // The spilled address: its spill file decodes to its 400 entries.
         let busy = address_hash(&Address::repeat_byte(0xaa));
         let k = bucket_of(&busy, built.record.bucket_count) as usize;
-        let BucketBody::Inline(recs) = BucketRecord::decode(&built.buckets[k]).unwrap().body else {
+        let BucketBody::Inline(recs) =
+            BucketRecord::decode(&built.buckets[k], built.record.first_block)
+                .unwrap()
+                .body
+        else {
             panic!("inline expected")
         };
         let rec = recs.iter().find(|r| r.fp == fingerprint(&busy)).unwrap();
@@ -491,7 +572,7 @@ mod tests {
         assert_eq!(entries[399].block, 399);
 
         // Deterministic: building again gives identical bytes.
-        let again = build_slice(slice, &apps, B256::ZERO, 0x11).unwrap();
+        let again = build_slice(slice, 0, &apps, B256::ZERO, 0x11).unwrap();
         assert_eq!(again.buckets, built.buckets);
         assert_eq!(again.files, built.files);
         assert_eq!(again.record, built.record);
@@ -505,7 +586,7 @@ mod tests {
             apps.push(app(b * 3, 1, 0xaa, 1));
             apps.push(app(b * 3, 1, 0xbb, 1));
         }
-        let built = build_slice((3, 0), &apps, B256::ZERO, 0xff).unwrap();
+        let built = build_slice((3, 0), 0, &apps, B256::ZERO, 0xff).unwrap();
         assert_eq!(built.spilled, 2);
         assert_eq!(built.files.len(), 1);
         assert_eq!(built.paged, 0);
@@ -525,11 +606,11 @@ mod tests {
                 roles: 0x10,
             })
             .collect();
-        let built = build(slice, &apps, B256::ZERO, 0x10, Some(1)).unwrap();
+        let built = build(slice, 0, &apps, B256::ZERO, 0x10, Some(1)).unwrap();
         assert_eq!(built.buckets.len(), 1);
         assert_eq!(built.paged, 1);
         assert!(built.buckets[0].len() <= PAGE_SIZE);
-        let b = BucketRecord::decode(&built.buckets[0]).unwrap();
+        let b = BucketRecord::decode(&built.buckets[0], built.record.first_block).unwrap();
         let BucketBody::Paged {
             count,
             pages,

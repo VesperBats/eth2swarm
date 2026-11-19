@@ -5,7 +5,8 @@ Status: **implemented on a dev chain; mainnet scale in progress** (#8). Detectio
 slice building and the cover math (`src/addr/slice.rs`), measuring (`ethswarm addr-stats`),
 the importer (`ethswarm addr-import`) with a full read-back check (`ethswarm addr-verify`),
 and a client (`ethswarm addr-lookup`, head discovery from a finalized block, incremental
-sync, and a check against the chain). `ethswarm devnet-activity` generates test traffic on
+sync, and a check against the chain). An index can start at a later block instead of
+genesis (`addr-import --from-block`, *Starting at a later block*). `ethswarm devnet-activity` generates test traffic on
 a dev chain. The client reads every slice and whole spill and pages files; steps 3–5 of
 *Client lookup* (page search, last page first, stopping when the screen is full) and the
 time-based head estimate are not implemented. Still open:
@@ -266,6 +267,31 @@ dead on arrival and is skipped. Then it publishes head update 0 with `N0`, write
 record to the origin identifier (below), and from then on one slice and one head update per
 unit.
 
+**Starting at a later block.** An index need not start at genesis. It can cover the units
+from `S` on, where `S` is the unit of a chosen block: a recent history is ready in hours
+instead of weeks, and an importer without the old blocks (a node that expired them) can
+still publish one. The slice grid stays the one from genesis, with the same identifiers,
+covers and merges; only the slices that hold nothing are left out:
+
+- A slice `(L, i)` exists only if it ends after `S`, and it holds the units
+  `[max(i·2^L, S), (i+1)·2^L)`. Its `SliceRecord` says so in `first_block`
+  (`max(i·2^L, S)·U`), and its entries' block deltas start from that block.
+- Every head states `S` (as `first_block = S·U`), the same in every update; the origin
+  does too. `N0 > S`.
+- The backfill writes the slices of the cover of `[0, N0)` that end after `S`; every later
+  unit and merge proceeds as above. The importer records `S` and `N0` before the first
+  upload, and a backfill that fails is repeated with exactly those: the slice the start
+  falls into depends on `S`, its identifiers do not, and they are written once. A merge the start falls into holds its units from `S`
+  on, so it still holds exactly the entries of the slices it replaces.
+- A client reads what an incremental sync from unit `S` would read: the slices of the
+  resolved cover that end after `S`. It reports the blocks before `S·U` as **not covered**,
+  never as empty, and it compares with the chain only from `S·U` on.
+- The start is fixed for the life of the index. An earlier start cannot be added later (the
+  slices around the old start are written and immutable): it is a new index under another
+  key, which can run beside the first and replace it once it has caught up.
+
+`S = 0` is an index from genesis; every rule above then reduces to the ones before.
+
 **Incremental sync.** A client that has read everything up to unit `M` takes the cover of
 `[0, N)` and reads only its slices that end after unit `M`. A slice that starts before `M`
 is read whole and the entries before unit `M` are dropped. A client `d` units behind reads up
@@ -362,7 +388,7 @@ names its spill and pages files.
 | `unit_blocks` | u32 | `U` (64) |
 | `level` | u8 | `L` |
 | `index` | u32 | `i` |
-| `first_block` | u64 | `i·2^L·U` |
+| `first_block` | u64 | the first block the slice holds: `i·2^L·U`, or `S·U` for the slice the start of an index from unit `S` falls into (*Starting at a later block*); always a unit boundary within the slice |
 | `last_block` | u64 | `(i+1)·2^L·U − 1` |
 | `last_block_hash` | 32 bytes | hash of `last_block` |
 | `bucket_count` | u32 | number of buckets `B ≥ 1`; all of `0 … B−1` exist |
@@ -409,8 +435,9 @@ Address record:
 | `spill_ref` | 32 bytes | if spilled: Swarm reference of the spill file |
 
 Entry: `varint(block_delta) ‖ varint(slot) ‖ role (u8)`. `block_delta` of the first entry
-is relative to `first_block` of the slice, then to the block of the previous entry (0 for
-another slot in the same block).
+is relative to `first_block` of the slice (its `SliceRecord`'s, so a bucket is decoded with
+its descriptor), then to the block of the previous entry (0 for another slot in the same
+block).
 
 An address whose inline entries would take more than 256 bytes is **spilled**: its record
 holds only `n` and `spill_ref`, and its entries go to a spill file of their own.
@@ -457,26 +484,28 @@ The client learns the number of pages from the file's span (`⌈span / 4096⌉`)
 last page for the newest entries, and binary-searches pages by `first_block` for a block
 range. `u32` block numbers last until block 2^32, more than 1600 years of 12-second slots.
 
-### `HeadRecord` (kind 6), 62 + 5·p bytes
+### `HeadRecord` (kind 6), 70 + 5·p bytes
 
 | Field | Type | Meaning |
 |---|---|---|
 | header | 5 bytes | `"E2S" ‖ 0x01 ‖ 0x06` |
+| `first_block` | u64 | `S·U`, the first block the index covers (0 for an index from genesis); the same in every update and the origin, `S < N` |
 | `units` | u64 | `N`, the number of complete units, at most 2^26 (spill pages store block numbers as u32) |
 | `last_block` | u64 | `N·U − 1` |
 | `last_block_hash` | 32 bytes | hash of `last_block` |
 | `last_block_timestamp` | u64 | timestamp of `last_block` (seconds) |
 | `pending_count` | u8 | `p`, the number of deferred merges |
-| `pending` | `p` × (u8 level ‖ u32 index) | the deferred merged slices, strictly ascending by (first unit, level): an outer merge deferred while an inner one is pending starts at the same unit |
+| `pending` | `p` × (u8 level ‖ u32 index) | the deferred merged slices, strictly ascending by `(i·2^L, L)`, the grid's first unit and the level (for an index from unit `S`, not the unit the slice holds from): an outer merge deferred while an inner one is pending starts at the same unit; each ends after unit `S` |
 
 ## Client lookup
 
 Newest first, for address `A`:
 
-1. Read the head as described under *Identifiers* (from the cached head or the origin) → `N`
-   and the pending merges.
-2. Compute the cover of `[0, N)` and expand the pending slices, or take only the slices
-   after unit `M` for an incremental sync.
+1. Read the head as described under *Identifiers* (from the cached head or the origin) → `S`,
+   `N` and the pending merges.
+2. Compute the cover of `[0, N)`, expand the pending slices, and take the slices that end
+   after unit `S`, or after unit `M ≥ S` for an incremental sync. For `S > 0`, show the
+   blocks before `S·U` as not covered.
 3. For each slice, newest first: read the `SliceRecord` (immutable, cached forever), compute
    `k` and `fp`, read bucket `k`, and scan it for `fp` (records have variable length, so the
    2.8 KB are read front to back). For a paged bucket, binary-search its pages.
@@ -536,6 +565,10 @@ Oldest first is the same in the opposite order.
     requires the detection rules and canonical encodings above to be followed exactly.
   - Real proofs need an index committed by the protocol itself, or zero-knowledge proofs
     that a slice was built correctly from the blocks. Both are out of scope.
+- **An index from a later block claims nothing before it.** Its head states the start, and
+  every descriptor must start where that start makes it (`addr-verify` and `addr-lookup`
+  check this). Importers with different starts are compared on the slices that hold the
+  same units in both: those that begin at or after both starts.
 
 ## Measurements
 

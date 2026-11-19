@@ -27,7 +27,7 @@ use super::fetch::{FetchedSlice, fetch_slice};
 use super::layout::{
     HeadRecord, L_MAX, MAX_UNITS, UNIT_BLOCKS, bucket_id, first_block, head_id, origin_id, slice_id,
 };
-use super::slice::{BuiltSlice, SliceId, cover, new_slice, units};
+use super::slice::{BuiltSlice, SliceId, cover, held, held_level, new_slice, resolve_after, units};
 use crate::swarm::{bee::Bee, soc};
 
 /// Name of the state file in the state directory.
@@ -117,6 +117,8 @@ pub struct State {
     pub chain_id: u64,
     pub owner: Address,
     pub roles: u8,
+    /// The first unit the index covers (`S`, 0 from genesis), fixed by the first run.
+    pub first_unit: u64,
     /// Units of head update 0 (`N0`); update `n` announces `N0 + n` units.
     pub n0: u64,
     /// Units of the last head known to be published.
@@ -128,16 +130,25 @@ pub struct State {
     /// The next head, saved before it is uploaded (write-ahead): a run that finds it uploads
     /// exactly this record.
     pub prepared: Option<HeadRecord>,
+    /// A backfill of `n0` units from `first_unit` has started and not finished. Saved before
+    /// its first upload, so that a run after a failure repeats exactly that backfill: a slice
+    /// the start falls into depends on the start, and its identifiers do not.
+    #[serde(default)]
+    pub backfilling: bool,
 }
 
 impl State {
     pub fn load(dir: &Path) -> Result<Option<Self>> {
         let path = dir.join(STATE_FILE);
         match std::fs::read(&path) {
-            Ok(bytes) => Ok(Some(
-                serde_json::from_slice(&bytes)
-                    .with_context(|| format!("reading {}", path.display()))?,
-            )),
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "reading {} (a state without `first_unit` was written before an index \
+                     could start at a later block; its heads use the earlier format, so that \
+                     index cannot be continued: start a new one under another key)",
+                    path.display()
+                )
+            })?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
@@ -174,13 +185,23 @@ impl State {
         let mut keep: std::collections::BTreeSet<u64> =
             cover(n).iter().map(|s| units(*s).end - 1).collect();
         for s in &self.schedule.pending {
-            let r = units(*s);
+            let r = held(*s, self.first_unit);
             keep.insert(r.end - 1);
-            if r.start > 0 {
+            if r.start > self.first_unit {
                 keep.insert(r.start - 1);
             }
         }
         self.unit_hashes.retain(|u, _| keep.contains(u));
+    }
+
+    /// The hash a slice holding units from `start` on must continue: the published unit before
+    /// it, or none for a slice that starts with the index.
+    fn parent_of(&self, start: u64) -> Result<Option<B256>> {
+        if start == self.first_unit {
+            Ok(None)
+        } else {
+            self.unit_hash(start - 1).map(Some)
+        }
     }
 
     fn unit_hash(&self, unit: u64) -> Result<B256> {
@@ -216,7 +237,8 @@ impl StateLock {
 }
 
 /// Test hook: `ETH2SWARM_ADDR_FAILPOINT=before-head-upload` or `after-head-upload` makes a run
-/// stop around a head upload, as a crash would (used by `scripts/e2e-bee-factory.sh`).
+/// stop around a head upload, `backfill-slice` after the first slice of a backfill, as a crash
+/// would (used by `scripts/e2e-bee-factory.sh`).
 fn failpoint(name: &str) -> Result<()> {
     match std::env::var("ETH2SWARM_ADDR_FAILPOINT") {
         Ok(v) if v == name => bail!("failpoint {name}"),
@@ -232,6 +254,9 @@ pub struct ImportOptions {
     pub follow: bool,
     /// A first run: start a new index. Without it, a missing state file is an error.
     pub init: bool,
+    /// The first run's start: the index covers the unit of this block and every later one
+    /// (default: from genesis). A later run must state the same unit or nothing.
+    pub from_block: Option<u64>,
     pub traces: bool,
     pub batch: Option<B256>,
     /// Merges of this level and above are built in the background.
@@ -249,6 +274,8 @@ struct Ctx<P> {
     signer: PrivateKeySigner,
     batch: B256,
     chain_id: u64,
+    /// The first unit the index covers.
+    first_unit: u64,
     traces: bool,
     max_level: u8,
     concurrency: usize,
@@ -256,15 +283,16 @@ struct Ctx<P> {
 
 impl<P: Provider + Clone + 'static> Ctx<P> {
     async fn fetch(&self, slice: SliceId, parent: Option<B256>) -> Result<FetchedSlice> {
-        ensure!(
-            slice.0 <= self.max_level,
-            "slice ({}, {}) is above --max-level {}: building it in memory would need too \
-             much memory (external-memory building is part 4b of #8)",
-            slice.0,
-            slice.1,
-            self.max_level
-        );
-        fetch_slice(&self.provider, slice, self.traces, self.concurrency, parent).await
+        check_level(slice, self.first_unit, self.max_level)?;
+        fetch_slice(
+            &self.provider,
+            slice,
+            self.first_unit,
+            self.traces,
+            self.concurrency,
+            parent,
+        )
+        .await
     }
 
     /// Uploads a built slice: files first, then the buckets, the descriptor last.
@@ -363,6 +391,22 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
     }
 }
 
+/// A slice is built in memory only up to `max_level`, measured by what it holds
+/// ([`held_level`]): the slice a later start falls into holds less than its grid level.
+fn check_level(slice: SliceId, first_unit: u64, max_level: u8) -> Result<()> {
+    let level = held_level(slice, first_unit);
+    ensure!(
+        level <= max_level,
+        "slice ({}, {}) holds {} units (level {level}), above --max-level {max_level}: \
+         building it in memory would need too much memory (external-memory building is part \
+         4b of #8)",
+        slice.0,
+        slice.1,
+        held(slice, first_unit).count()
+    );
+    Ok(())
+}
+
 /// Waits for one upload task, if any is running.
 async fn join_one(set: &mut tokio::task::JoinSet<Result<()>>) -> Result<()> {
     match set.join_next().await {
@@ -401,12 +445,9 @@ impl MergeWorker {
         else {
             return Ok(());
         };
-        let r = units(slice);
+        let r = held(slice, state.first_unit);
         let end = state.unit_hash(r.end - 1)?;
-        let before = match r.start {
-            0 => None,
-            start => Some(state.unit_hash(start - 1)?),
-        };
+        let before = state.parent_of(r.start)?;
         let ctx = ctx.clone();
         self.running
             .spawn(async move { ctx.merge(slice, end, before).await });
@@ -497,18 +538,33 @@ where
         None => bee.usable_batch().await?,
     };
     let roles = role::mask(opts.traces);
+    let existing = State::load(dir)?;
+    let requested = opts.from_block.map(|b| b / UNIT_BLOCKS);
+    let first_unit = match &existing {
+        Some(s) => {
+            ensure!(
+                requested.is_none_or(|u| u == s.first_unit),
+                "the index in {} starts at block {}; --from-block cannot move it",
+                dir.display(),
+                s.first_unit * UNIT_BLOCKS
+            );
+            s.first_unit
+        }
+        None => requested.unwrap_or(0),
+    };
     let ctx = Ctx {
         provider: provider.clone(),
         bee: bee.clone(),
         signer: signer.clone(),
         batch,
         chain_id,
+        first_unit,
         traces: opts.traces,
         max_level: opts.max_level,
         concurrency: opts.concurrency,
     };
 
-    let mut state = match State::load(dir)? {
+    let mut state = match existing {
         Some(s) => {
             ensure!(
                 s.chain_id == chain_id && s.owner == signer.address() && s.roles == roles,
@@ -520,7 +576,16 @@ where
                 s.roles,
                 signer.address()
             );
-            s
+            if s.backfilling {
+                info!(
+                    units = s.n0,
+                    first_block = s.first_unit * UNIT_BLOCKS,
+                    "resuming the unfinished backfill as it started"
+                );
+                backfill(&ctx, s.n0, roles, dir).await?
+            } else {
+                s
+            }
         }
         None => {
             ensure!(
@@ -532,19 +597,24 @@ where
             // An origin under this key means an index exists: a second backfill would write
             // another origin and other heads under the same write-once identifiers. The read
             // is best effort: Bee 2.8.3 answers a missing chunk and a failed retrieval alike
-            // (500), so only finding the origin is conclusive; --init is the guard.
-            let reader = super::verify::IndexReader {
-                bee: bee.clone(),
-                owner: signer.address(),
-                chain_id,
-            };
-            match reader.origin().await {
-                Ok(origin) => bail!(
-                    "owner {} already published an index on chain {chain_id} (origin at {} \
-                     units); restore its state directory instead of starting over",
-                    signer.address(),
-                    origin.units
-                ),
+            // (500), so only finding the origin is conclusive; --init is the guard. Any SOC of
+            // this owner there counts, also one that no longer decodes (an earlier format).
+            let address = soc::soc_address(&origin_id(chain_id), &signer.address());
+            match bee.get_chunk(&address).await {
+                Ok(raw) => {
+                    let what = match soc::verify(&raw, &address, &signer.address())
+                        .and_then(|p| HeadRecord::decode(&p))
+                    {
+                        Ok(origin) => format!("origin at {} units", origin.units),
+                        Err(e) => format!("an origin this version cannot read: {e:#}"),
+                    };
+                    bail!(
+                        "owner {} already published an index on chain {chain_id} ({what}); \
+                         restore its state directory instead of starting over, or use another \
+                         key",
+                        signer.address()
+                    )
+                }
                 Err(e) => tracing::warn!(
                     "no origin found for owner {} on chain {chain_id}, starting a new index \
                      ({e:#})",
@@ -611,21 +681,10 @@ async fn import_unit<P: Provider + Clone + 'static>(
     };
     // A merge listed as pending must be buildable: fail before a head lists it.
     for s in [Some(now), deferred].into_iter().flatten() {
-        ensure!(
-            s.0 <= opts.max_level,
-            "unit {} needs slice ({}, {}), above --max-level {} (external-memory building \
-             is part 4b of #8)",
-            n - 1,
-            s.0,
-            s.1,
-            opts.max_level
-        );
+        check_level(s, state.first_unit, opts.max_level)
+            .with_context(|| format!("publishing unit {}", n - 1))?;
     }
-    let start = units(now).start;
-    let parent = match start {
-        0 => None,
-        s => Some(state.unit_hash(s - 1)?),
-    };
+    let parent = state.parent_of(held(now, state.first_unit).start)?;
     let f = ctx.fetch(now, parent).await?;
     ctx.upload_slice(&f.built).await?;
     state.unit_hashes.insert(n - 1, f.last_hash);
@@ -639,6 +698,7 @@ async fn import_unit<P: Provider + Clone + 'static>(
         merges.kick(ctx, state)?;
     }
     state.prepared = Some(HeadRecord {
+        first_unit: state.first_unit,
         units: n,
         last_block_hash: f.last_hash,
         last_block_timestamp: f.last_timestamp,
@@ -649,55 +709,65 @@ async fn import_unit<P: Provider + Clone + 'static>(
     ctx.publish_prepared(state, &opts.state_dir).await
 }
 
-/// First run: publishes the cover of `[0, target)` (every other past slice would never be
-/// read), then head update 0 and the origin, written ahead like every head.
+/// First run: publishes the slices of the cover of `[0, target)` that hold units from the
+/// index's start on (every other past slice would never be read), then head update 0 and the
+/// origin, written ahead like every head. The start and `target` are saved before the first
+/// upload, and a run after a failure resumes with them ([`State::backfilling`]).
 async fn backfill<P: Provider + Clone + 'static>(
     ctx: &Ctx<P>,
     target: u64,
     roles: u8,
     dir: &Path,
 ) -> Result<State> {
-    ensure!(target >= 1, "nothing to import: no complete unit");
-    let slices = cover(target);
-    if let Some(s) = slices.iter().find(|s| s.0 > ctx.max_level) {
-        bail!(
-            "the cover of {target} units contains slice ({}, {}), above --max-level {}; a \
-             backfill this long needs external-memory building (part 4b of #8)",
-            s.0,
-            s.1,
-            ctx.max_level
-        );
+    ensure!(
+        target > ctx.first_unit,
+        "nothing to import: {target} complete units, the index starts at unit {} (block {})",
+        ctx.first_unit,
+        ctx.first_unit * UNIT_BLOCKS
+    );
+    // What a client reads for head update 0: the cover's slices after the start.
+    let slices = resolve_after(ctx.first_unit, target, &[]);
+    for s in &slices {
+        check_level(*s, ctx.first_unit, ctx.max_level)
+            .with_context(|| format!("backfilling {target} units"))?;
     }
     let mut state = State {
         chain_id: ctx.chain_id,
         owner: ctx.signer.address(),
         roles,
+        first_unit: ctx.first_unit,
         n0: target,
         units: target,
         schedule: Schedule::default(),
         unit_hashes: BTreeMap::new(),
         prepared: None,
+        backfilling: true,
     };
+    state.save(dir)?;
     let (mut parent, mut last) = (None, None);
     for s in slices {
         info!(level = s.0, index = s.1, "backfill");
         let f = ctx.fetch(s, parent).await?;
         ctx.upload_slice(&f.built).await?;
+        failpoint("backfill-slice")?;
         parent = Some(f.last_hash);
         state.unit_hashes.insert(units(s).end - 1, f.last_hash);
         last = Some(f);
     }
     let last = last.expect("a cover of at least one unit");
     state.prepared = Some(HeadRecord {
+        first_unit: ctx.first_unit,
         units: target,
         last_block_hash: last.last_hash,
         last_block_timestamp: last.last_timestamp,
         pending: Vec::new(),
     });
+    state.backfilling = false;
     // From here on the origin's N0 is fixed: a later run publishes this head, never another.
     state.save(dir)?;
     info!(
         units = target,
+        first_block = ctx.first_unit * UNIT_BLOCKS,
         "backfill uploaded; publishing head 0 and the origin"
     );
     Ok(state)
@@ -706,7 +776,6 @@ async fn backfill<P: Provider + Clone + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::addr::slice::resolve;
     use std::collections::BTreeSet;
 
     #[test]
@@ -730,59 +799,64 @@ mod tests {
     }
 
     /// Simulates the importer: every head must only reference slices that are written, every
-    /// pending list must encode, and every merge must eventually leave the heads.
+    /// pending list must encode, and every merge must eventually leave the heads. Also for an
+    /// index that starts after genesis, whose backfill writes only the slices after its start.
     #[test]
     fn every_head_references_written_slices() {
-        for defer_level in [1u8, 2, 3, 5] {
-            for delay in [0u64, 1, 2, 5, 17] {
-                let n0 = 3;
-                let mut written: BTreeSet<SliceId> = cover(n0).into_iter().collect();
-                let mut schedule = Schedule::default();
-                // (finishes after unit, slice)
-                let mut running: Vec<(u64, SliceId)> = Vec::new();
-                for n in n0 + 1..=300 {
-                    running.retain(|(at, s)| {
-                        if *at <= n {
-                            written.insert(*s);
-                            schedule.merge_done(*s);
-                            false
-                        } else {
-                            true
-                        }
-                    });
-                    match unit_work(n, defer_level) {
-                        UnitWork::Build(s) => {
-                            written.insert(s);
-                        }
-                        UnitWork::Defer { level0, merge } => {
-                            written.insert(level0);
-                            schedule.defer(merge);
-                            // Bigger merges take longer.
-                            running.push((n + delay * merge.0 as u64, merge));
-                        }
+        for (first_unit, defer_level, delay) in [0u64, 2, 5, 37]
+            .into_iter()
+            .flat_map(|f| [1u8, 2, 3, 5].map(move |d| (f, d)))
+            .flat_map(|(f, d)| [0u64, 1, 2, 5, 17].map(move |x| (f, d, x)))
+        {
+            let n0 = first_unit + 3;
+            let mut written: BTreeSet<SliceId> =
+                resolve_after(first_unit, n0, &[]).into_iter().collect();
+            let mut schedule = Schedule::default();
+            // (finishes after unit, slice)
+            let mut running: Vec<(u64, SliceId)> = Vec::new();
+            for n in n0 + 1..=first_unit + 300 {
+                running.retain(|(at, s)| {
+                    if *at <= n {
+                        written.insert(*s);
+                        schedule.merge_done(*s);
+                        false
+                    } else {
+                        true
                     }
-                    let pending = schedule.next_head_pending();
-                    let head = HeadRecord {
-                        units: n,
-                        last_block_hash: B256::ZERO,
-                        last_block_timestamp: 0,
-                        pending: pending.clone(),
-                    };
-                    assert_eq!(HeadRecord::decode(&head.encode()).unwrap(), head);
-                    for s in resolve(n, &pending) {
-                        assert!(
-                            written.contains(&s),
-                            "defer {defer_level}, delay {delay}: head {n} reads {s:?}, \
-                             not written (pending {pending:?})"
-                        );
+                });
+                match unit_work(n, defer_level) {
+                    UnitWork::Build(s) => {
+                        written.insert(s);
+                    }
+                    UnitWork::Defer { level0, merge } => {
+                        written.insert(level0);
+                        schedule.defer(merge);
+                        // Bigger merges take longer.
+                        running.push((n + delay * merge.0 as u64, merge));
                     }
                 }
-                // Once everything finished, the next head lists nothing.
-                for (_, s) in running.drain(..) {
-                    schedule.merge_done(s);
+                let pending = schedule.next_head_pending();
+                let head = HeadRecord {
+                    first_unit,
+                    units: n,
+                    last_block_hash: B256::ZERO,
+                    last_block_timestamp: 0,
+                    pending: pending.clone(),
+                };
+                assert_eq!(HeadRecord::decode(&head.encode()).unwrap(), head);
+                for s in resolve_after(first_unit, n, &pending) {
+                    assert!(
+                        written.contains(&s),
+                        "start {first_unit}, defer {defer_level}, delay {delay}: head {n} \
+                             reads {s:?}, not written (pending {pending:?})"
+                    );
                 }
-                assert!(schedule.next_head_pending().is_empty());
             }
+            // Once everything finished, the next head lists nothing.
+            for (_, s) in running.drain(..) {
+                schedule.merge_done(s);
+            }
+            assert!(schedule.next_head_pending().is_empty());
         }
     }
 
@@ -793,6 +867,7 @@ mod tests {
             chain_id: 1337,
             owner: Address::repeat_byte(1),
             roles: 0xdf,
+            first_unit: 0,
             n0: 5,
             units: 9,
             schedule: Schedule {
@@ -801,11 +876,13 @@ mod tests {
             },
             unit_hashes: BTreeMap::new(),
             prepared: Some(HeadRecord {
+                first_unit: 0,
                 units: 10,
                 last_block_hash: B256::repeat_byte(2),
                 last_block_timestamp: 1_800_000_000,
                 pending: vec![(1, 4)],
             }),
+            backfilling: false,
         };
         s.save(&dir).unwrap();
         assert_eq!(State::load(&dir).unwrap(), Some(s.clone()));
@@ -846,5 +923,28 @@ mod tests {
         assert!(s2.unit_hash(top - 1).is_ok(), "the unit before the merge");
         assert!(s2.unit_hash(2 * top - 1).is_ok(), "the merge's last unit");
         assert!(s2.unit_hash(top - 2).is_err());
+
+        // An index from unit 5: a slice that starts with the index continues nothing; every
+        // other slice continues a kept unit.
+        let mut s3 = State {
+            first_unit: 5,
+            schedule: Schedule::default(),
+            unit_hashes: (5..13).map(|u| (u, B256::ZERO)).collect(),
+            ..s.clone()
+        };
+        assert_eq!(s3.parent_of(5).unwrap(), None);
+        s3.prune(13);
+        for n in 14..80 {
+            let start = held(new_slice(n), 5).start;
+            assert!(s3.parent_of(start).is_ok(), "unit {}: no parent", n - 1);
+            s3.unit_hashes.insert(n - 1, B256::ZERO);
+            s3.prune(n);
+        }
+        // A pending merge the start falls into keeps its last unit, and nothing before it.
+        s3.schedule.defer((7, 0)); // units 0..128, held from 5
+        s3.unit_hashes = (4..130).map(|u| (u, B256::ZERO)).collect();
+        s3.prune(130);
+        assert!(s3.unit_hash(127).is_ok());
+        assert!(s3.unit_hash(4).is_err());
     }
 }

@@ -97,7 +97,7 @@ pub fn window_stats(
             let lo = appearances.partition_point(|x| x.block < a);
             let hi = appearances.partition_point(|x| x.block <= b);
             // The hash of the last block is not needed for sizes.
-            let built = build_slice(slice, &appearances[lo..hi], Default::default(), roles)?;
+            let built = build_slice(slice, 0, &appearances[lo..hi], Default::default(), roles)?;
             s.slices += 1;
             s.addresses += built.record.addresses as u64;
             s.appearances += built.record.appearances;
