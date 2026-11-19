@@ -6,7 +6,8 @@ slice building and the cover math (`src/addr/slice.rs`), measuring (`ethswarm ad
 the importer (`ethswarm addr-import`) with a full read-back check (`ethswarm addr-verify`),
 and a client (`ethswarm addr-lookup`, head discovery from a finalized block, incremental
 sync, and a check against the chain). An index can start at a later block instead of
-genesis (`addr-import --from-block`, *Starting at a later block*). `ethswarm devnet-activity` generates test traffic on
+genesis (`addr-import --from-block`, *Starting at a later block*), and an import can be
+written to a directory and uploaded later (`--out`, `addr-upload`). `ethswarm devnet-activity` generates test traffic on
 a dev chain. The client reads every slice and whole spill and pages files; steps 3–5 of
 *Client lookup* (page search, last page first, stopping when the screen is full) and the
 time-based head estimate are not implemented. Still open:
@@ -291,6 +292,30 @@ covers and merges; only the slices that hold nothing are left out:
   key, which can run beside the first and replace it once it has caught up.
 
 `S = 0` is an index from genesis; every rule above then reduces to the ones before.
+
+**Exporting for a later upload.** The importer can write to a directory instead of a Bee
+node (`addr-import --out <dir>`), on a machine that has the chain but no Bee node or no
+fast link; `addr-upload <dir>` pushes the export through any Bee node and batch later. The
+SOCs are signed at export time, and their addresses and the files' references are computed
+locally, so the uploaded index is the one a direct import would have published; only the
+postage stamps come from the upload.
+
+- The export is one append-only log of records in upload order (`kind ‖ key ‖ length ‖
+  data`): files under their reference, slice descriptors and buckets as SOCs in wire form
+  under their address, and heads (and the origin) the same way. A head is a barrier:
+  `addr-upload` sends the records between two heads in parallel, and a head only after
+  everything before it, as the importer does with a Bee node.
+- At every save of its state the importer syncs the log, records its length in the state,
+  and only then lets the uploader read that far (a `committed` file). A run that resumes
+  truncates the log to the length in its state and writes the records of the unfinished
+  unit again, identically; the uploader never reads past what a resumed run keeps.
+- `addr-upload` checks every record before sending it (a file against its reference, a SOC
+  against its address and the export's owner) and every reference Bee returns. It keeps
+  its progress in the directory and resumes there, also while the importer goes on
+  appending; `--from-start` sends everything again.
+- An index that starts as an export stays one (every run passes the same `--out`), and an
+  uploaded one cannot switch to an export: a head on Swarm must not reference slices that
+  exist only in a directory.
 
 **Incremental sync.** A client that has read everything up to unit `M` takes the cover of
 `[0, N)` and reads only its slices that end after unit `M`. A slice that starts before `M`

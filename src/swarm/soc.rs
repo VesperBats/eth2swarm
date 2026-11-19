@@ -43,6 +43,16 @@ impl SignedSoc {
         out.extend_from_slice(&self.payload);
         out
     }
+
+    /// The SOC in wire form, `identifier ‖ signature ‖ span ‖ payload`: what
+    /// `GET /chunks/{address}` returns and [`parse`] reads.
+    pub fn wire(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(ID_LEN + SIG_LEN + SPAN_LEN + self.payload.len());
+        out.extend_from_slice(self.identifier.as_slice());
+        out.extend_from_slice(&self.signature);
+        out.extend_from_slice(&self.span_and_payload());
+        out
+    }
 }
 
 /// Sign `payload` as the SOC `identifier` of `signer`.
