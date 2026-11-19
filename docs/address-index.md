@@ -430,6 +430,14 @@ bounds the misses it cannot avoid. It caches the last head it read, or the origi
 
 All of this runs in the background; the client keeps showing what it has.
 
+- **Without a finalized block number or a clock it trusts** (the inspector): from the cached
+  update `n` it probes `n + 1`, `n + 2`, `n + 4`, `n + 8` … until one misses, then bisects
+  the last gap. A client one update behind pays two probes (one of them a miss), an up-to-date
+  one a single miss; far behind, about `2·log2(d)` probes for `d` new updates, half of the
+  bisection's probes misses. Bee answers a missing and an unretrievable chunk alike, so a
+  transient failure can settle the search below the newest update; the next search starts
+  from what it found and goes on from there.
+
 Unlike the block store, the identifiers are **not** namespaced by a trust anchor: the index
 grows incrementally. Each slice binds to the chain through the hash of its last block.
 

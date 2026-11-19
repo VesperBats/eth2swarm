@@ -279,7 +279,9 @@ function source(node) { return `<div class="muted" style="margin-bottom:8px">fro
 
 // ---- address index ----
 let addrView = '';
-function slicePath(l, i) { return `slice:${l}:${i}`; }
+// A slice or bucket view carries the address it highlights, so a shared link shows it too.
+function withAddr(view, a) { return a ? `${view}:${a}` : view; }
+function slicePath(l, i, a) { return withAddr(`slice:${l}:${i}`, a); }
 function addrLink(view, text) { return `<a class="ref mono" href="#addr/${esc(encodeURIComponent(view))}">${esc(text)}</a>`; }
 function tsIso(t) { return t ? new Date(t * 1000).toISOString().replace('.000', '') : ''; }
 function txCell(e) { return e.tx == null ? '<span class="muted">block</span>' : `tx ${e.tx}`; }
@@ -288,7 +290,7 @@ function entriesTable(list) {
   return '<table><tr><th>block</th><th>slot</th><th>roles</th></tr>' +
     list.map(e => `<tr><td class="mono">${e.block}</td><td>${txCell(e)}</td><td class="mono">${esc(e.roles)}</td></tr>`).join('') + '</table>';
 }
-function indexCard(ix) {
+function indexCard(ix, a) {
   if (!ix) return '';
   const h = ix.head, o = ix.origin;
   // The slice, bucket and spill views read only the origin.
@@ -305,7 +307,7 @@ function indexCard(ix) {
     ['last block time', `${h.lastBlockTimestamp} <span class="muted">(${tsIso(h.lastBlockTimestamp)})</span>`],
     ['pending merges', h.pending.length ? esc(h.pending.map(p => `(${p[0]}, ${p[1]})`).join(' ')) : '<span class="muted">none</span>'],
     ['origin', `${o.units} units, from block ${o.firstBlock}`],
-    ['slices a lookup reads (newest first)', ix.slices.map(([l, i]) => addrLink(slicePath(l, i), `(${l}, ${i})`)).join(' ')],
+    ['slices a lookup reads (newest first)', ix.slices.map(([l, i]) => addrLink(slicePath(l, i, a), `(${l}, ${i})`)).join(' ')],
   ]));
 }
 function sliceCard(sl, extra) {
@@ -325,20 +327,22 @@ const runners = {
     // A slice, bucket or spill view opened by a link or the URL; a lookup from the form
     // clears it.
     const sub = /^(slice|bucket|spill):/.test(addrView) ? addrView
-      : a ? `lookup:${a}:${$('addrUnits').value}:${$('addrSince').value}` : `index:${$('addrUnits').value}`;
+      : a ? `lookup:${a}:${$('addrUnits').value}:${$('addrSince').value}` : `index:${$('addrUnits').value}:${$('addrSince').value}`;
     setHash('addr', sub); busy('out-addr');
-    const base = { owner: $('owner').value.trim(), chain: $('chain').value, units: $('addrUnits').value, address: a };
     const parts = sub.split(':');
+    // A slice or bucket view highlights the address its fragment names, not the box's.
+    const va = parts[0] === 'slice' ? parts[3] : parts[0] === 'bucket' ? parts[4] : a;
+    const base = { owner: $('owner').value.trim(), chain: $('chain').value, units: $('addrUnits').value, address: va || '' };
     let d, html = source(node);
     if (parts[0] === 'slice') {
       d = await api('addr/slice', params({ ...base, level: parts[1], index: parts[2] }, node));
       if (stale()) return;
       if (d.error) html += errCard(d.error);
-      html += indexCard(d.index);
+      html += indexCard(d.index, va);
       if (d.slice) {
-        const pick = `<form class="query" style="margin-top:12px" onsubmit="event.preventDefault();location.hash='#addr/'+encodeURIComponent('bucket:${d.slice.level}:${d.slice.index}:'+this.k.value)">
+        const pick = `<form class="query" style="margin-top:12px" data-a="${esc(va || '')}" onsubmit="event.preventDefault();location.hash='#addr/'+encodeURIComponent('bucket:${d.slice.level}:${d.slice.index}:'+this.k.value+(this.dataset.a ? ':'+this.dataset.a : ''))">
           <label class="small">Bucket<input name="k" type="number" min="0" max="${d.slice.bucketCount - 1}" value="${d.addressBucket ?? 0}"></label><button>Open bucket</button></form>` +
-          (d.addressBucket != null ? `<div>The address's bucket: ${addrLink(`bucket:${d.slice.level}:${d.slice.index}:${d.addressBucket}`, 'bucket ' + d.addressBucket)}</div>` : '');
+          (d.addressBucket != null ? `<div>The address's bucket: ${addrLink(withAddr(`bucket:${d.slice.level}:${d.slice.index}:${d.addressBucket}`, va), 'bucket ' + d.addressBucket)}</div>` : '');
         html += sliceCard(d.slice, pick);
       }
     } else if (parts[0] === 'bucket') {
@@ -361,12 +365,12 @@ const runners = {
       if (stale()) return;
       if (d.error) html += errCard(d.error);
       if (d.slice) html += sliceCard(d.slice);
-      if (d.entries) html += card(`Spill file — ${d.count} entries` + (d.shown < d.count ? ` (first ${d.shown} shown)` : ''), kv([['reference', hash(d.spillRef)]]) + entriesTable(d.entries));
+      if (d.entries) html += card(`Spill file — ${d.count} entries` + (d.shown < d.count ? ` (the newest ${d.shown}, newest first)` : ', newest first'), kv([['reference', hash(d.spillRef)]]) + entriesTable(d.entries));
     } else {
       d = await api('addr/lookup', params({ ...base, since: $('addrSince').value }, node));
       if (stale()) return;
       if (d.error) html += errCard(d.error);
-      html += indexCard(d.index);
+      html += indexCard(d.index, a);
       if (d.lookup) {
         const l = d.lookup;
         html += card(`${l.count} appearances of ${d.address}`, kv([
@@ -495,11 +499,14 @@ function fromHash() {
   if (tab === 'epoch') $('epochK').value = val || 0;
   if (tab === 'bytes') $('bytesRef').value = val;
   if (tab === 'addr') {
-    // lookup:<address>:<units>:<since>, index:<units>, or a slice/bucket/spill view.
+    // lookup:<address>:<units>:<since>, index:<units>:<since>, slice:<L>:<i>[:<address>],
+    // bucket:<L>:<i>:<k>[:<address>] or spill:<L>:<i>:<ref>:<count>.
     addrView = val;
     const p = val.split(':');
     if (p[0] === 'lookup') { $('addrA').value = p[1] || ''; $('addrUnits').value = p[2] || ''; $('addrSince').value = p[3] || ''; }
-    if (p[0] === 'index') { $('addrA').value = ''; $('addrUnits').value = p[1] || ''; $('addrSince').value = ''; }
+    if (p[0] === 'index') { $('addrA').value = ''; $('addrUnits').value = p[1] || ''; $('addrSince').value = p[2] || ''; }
+    if (p[0] === 'slice') $('addrA').value = p[3] || '';
+    if (p[0] === 'bucket') $('addrA').value = p[4] || '';
   }
   if (tab === 'soc') {
     const i = val.indexOf(':');

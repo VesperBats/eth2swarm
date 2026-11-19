@@ -40,16 +40,20 @@ bookmarkable.
   owner on the chain ID in the settings bar, read with the code `ethswarm addr-lookup` uses
   (every SOC signature, chunk and file reference checked):
   - *Look up* an address: the head (the newest found by probing head updates, or the one with
-    the given units), what the index covers (an index from a later block says where it
+    the given units; the inspector remembers the newest it found per node, owner and chain and
+    probes on from there, so a repeated lookup costs one probe), what the index covers (an index from a later block says where it
     starts), the slices read, and the address's entries newest first (block, transaction or
     block slot, roles). *Since unit* reads incrementally.
   - Links open a **slice** (its descriptor, and the bucket the address falls into), a
     **bucket** (its records by fingerprint, the address's highlighted, inline entries and
     spill files; a paged bucket with its pages file's records) and a **spill file** (its
-    entries). Views are bookmarkable (`#addr/lookup:<address>`, `#addr/slice:<L>:<i>`,
-    `#addr/bucket:<L>:<i>:<k>`, `#addr/spill:<L>:<i>:<ref>:<count>`; a lookup's head units and
-    since unit are part of it: `#addr/lookup:<address>:<units>:<since>`). A lookup and a spill
-    file show their newest 500 entries (the API's `limit`), and always the full count.
+    entries). Views are bookmarkable: `#addr/lookup:<address>:<units>:<since>`,
+    `#addr/index:<units>:<since>` (the head without an address), `#addr/slice:<L>:<i>:<address>`,
+    `#addr/bucket:<L>:<i>:<k>:<address>` (the address is optional and is what the view
+    highlights) and `#addr/spill:<L>:<i>:<ref>:<count>`. A lookup and a spill file show their
+    newest 500 entries (the API's `limit`), newest first, and always the full count.
+  - A failed read keeps what was read before it: a lookup that fails in one slice still shows
+    the head and the slice links, a bucket or spill view still shows the slice.
   - The SOC tab decodes addr1 heads, slice descriptors and buckets too, with templates for
     `eth:<chain>:addr1:origin` and `eth:<chain>:addr1:slice:<L>:<i>`.
 
