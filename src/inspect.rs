@@ -7,9 +7,9 @@
 use crate::accumulator::{self, root_from_proof};
 use crate::addr::detect::role;
 use crate::addr::layout::{
-    BucketBody, BucketRecord, Entries, Entry, HeadRecord, SliceRecord, first_block,
+    AddressRecord, BucketBody, BucketRecord, Entries, Entry, HeadRecord, SliceRecord, first_block,
 };
-use crate::addr::lookup::lookup as addr_lookup;
+use crate::addr::lookup::{lookup as addr_lookup, newest_head_by_probing};
 use crate::addr::slice::{SliceId, bucket_of, fingerprint, resolve_after};
 use crate::addr::verify::IndexReader;
 use crate::chain::{Body, check_body, header_field_count};
@@ -355,7 +355,7 @@ fn decode_record(payload: &[u8]) -> Value {
     }
     // A bucket's entries are relative to its slice's first block, which only its descriptor
     // states; decoded here from the slice's grid start (the Address tab decodes it properly).
-    if payload.len() > 6 && payload[..5] == [b'E', b'2', b'S', 1, 5] {
+    if payload.len() >= 10 && payload[..5] == [b'E', b'2', b'S', 1, 5] {
         let level = payload[5];
         let index = u32::from_be_bytes(payload[6..10].try_into().unwrap_or_default());
         if let Ok(b) = BucketRecord::decode(payload, first_block(level.min(16), index)) {
@@ -387,13 +387,31 @@ struct AddrQuery {
     k: Option<String>,
     r#ref: Option<String>,
     count: Option<String>,
+    /// Entries returned at most (the count is always the full one).
+    limit: Option<String>,
 }
+
+/// Entries a view returns by default: a busy contract has millions.
+const ENTRY_LIMIT: usize = 500;
 
 fn opt_u64(s: Option<&str>, what: &str) -> Result<Option<u64>> {
     match s.map(str::trim).filter(|s| !s.is_empty()) {
         Some(v) => parse_u64(Some(v), what).map(Some),
         None => Ok(None),
     }
+}
+
+fn opt_address(q: &AddrQuery) -> Result<Option<Address>> {
+    q.address
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|a| a.parse().context("address must be 20 bytes of hex"))
+        .transpose()
+}
+
+fn limit(q: &AddrQuery) -> Result<usize> {
+    Ok(opt_u64(q.limit.as_deref(), "limit")?.map_or(ENTRY_LIMIT, |l| l as usize))
 }
 
 fn head_json(h: &HeadRecord) -> Value {
@@ -433,31 +451,33 @@ fn entry_json(e: &Entry) -> Value {
     })
 }
 
-fn bucket_json(b: &BucketRecord, highlight: Option<[u8; 8]>) -> Value {
-    let records = |recs: &[crate::addr::layout::AddressRecord]| {
-        recs.iter()
-            .map(|r| {
-                let (n, spill) = match &r.entries {
-                    Entries::Inline(e) => (e.len() as u64, Value::Null),
-                    Entries::Spilled { count, spill_ref } => (*count, json!(spill_ref)),
-                };
-                json!({
-                    "fp": hex0x(&r.fp),
-                    "entries": n,
-                    "spillRef": spill,
-                    "inline": match &r.entries {
-                        Entries::Inline(e) => e.iter().map(entry_json).collect::<Vec<_>>(),
-                        Entries::Spilled { .. } => Vec::new(),
-                    },
-                    "match": highlight == Some(r.fp),
-                })
+fn records_json(recs: &[AddressRecord], highlight: Option<[u8; 8]>) -> Vec<Value> {
+    recs.iter()
+        .map(|r| {
+            let (n, spill, inline) = match &r.entries {
+                Entries::Inline(e) => (
+                    e.len() as u64,
+                    Value::Null,
+                    e.iter().map(entry_json).collect::<Vec<_>>(),
+                ),
+                Entries::Spilled { count, spill_ref } => (*count, json!(spill_ref), Vec::new()),
+            };
+            json!({
+                "fp": hex0x(&r.fp),
+                "entries": n,
+                "spillRef": spill,
+                "inline": inline,
+                "match": highlight == Some(r.fp),
             })
-            .collect::<Vec<_>>()
-    };
+        })
+        .collect()
+}
+
+fn bucket_json(b: &BucketRecord, highlight: Option<[u8; 8]>) -> Value {
     match &b.body {
         BucketBody::Inline(recs) => json!({
             "level": b.level, "index": b.index, "bucket": b.bucket,
-            "paged": false, "records": records(recs),
+            "paged": false, "records": records_json(recs, highlight),
         }),
         BucketBody::Paged {
             count,
@@ -470,51 +490,48 @@ fn bucket_json(b: &BucketRecord, highlight: Option<[u8; 8]>) -> Value {
     }
 }
 
-/// The reader for the query's owner and chain, the origin, and the head to read: the one
-/// asked for, or the newest found by probing head updates (no RPC here: doubling up from
-/// update 1, then bisecting; a miss is a retrieval failure, which Bee does not tell apart
-/// from a missing chunk).
-async fn index_head(
-    st: &AppState,
-    q: &AddrQuery,
-) -> Result<(IndexReader, HeadRecord, HeadRecord, Value)> {
+/// The reader for the query's owner and chain, and the origin.
+async fn index_origin(st: &AppState, q: &AddrQuery) -> Result<(IndexReader, HeadRecord)> {
     let r = IndexReader {
         bee: st.bee(q.node.as_deref())?,
         owner: parse_owner(q.owner.as_deref())?,
         chain_id: parse_chain(q.chain.as_deref(), st.defaults.chain_id)?,
     };
     let origin = r.origin().await.context("reading the origin")?;
-    let (head, how) = match opt_u64(q.units.as_deref(), "units")? {
-        Some(u) => (r.head_at(&origin, u).await?, json!("as requested")),
+    Ok((r, origin))
+}
+
+/// The head to read: the one with the query's units, or the newest found by probing head
+/// updates (the inspector has no RPC); and a description of it, with the slices a lookup
+/// since unit `since` reads.
+async fn index_head(
+    r: &IndexReader,
+    origin: &HeadRecord,
+    q: &AddrQuery,
+    since: Option<u64>,
+) -> Result<(HeadRecord, Value)> {
+    let (head, how, miss) = match opt_u64(q.units.as_deref(), "units")? {
+        Some(u) => (
+            r.head_at(origin, u).await?,
+            "as requested".to_string(),
+            None,
+        ),
         None => {
-            let (mut lo, mut hi, mut probes) = (0u64, 1u64, 0u32);
-            loop {
-                probes += 1;
-                match r.probe_head(&origin, hi).await? {
-                    Ok(_) if hi < (1 << 26) => {
-                        lo = hi;
-                        hi *= 2;
-                    }
-                    _ => break,
-                }
-            }
-            while hi - lo > 1 {
-                let mid = lo + (hi - lo) / 2;
-                probes += 1;
-                match r.probe_head(&origin, mid).await? {
-                    Ok(_) => lo = mid,
-                    Err(_) => hi = mid,
-                }
-            }
-            let head = r.head_at(&origin, origin.units + lo).await?;
-            (
-                head,
-                json!(format!("newest found: update {lo}, after {probes} probes")),
-            )
+            let (head, probes, miss) = newest_head_by_probing(r, origin).await?;
+            let n = head.units - origin.units;
+            let how = format!("newest found: update {n}, after {probes} probes");
+            (head, how, miss)
         }
     };
-    let n = head.units - origin.units;
-    let plan: Vec<Value> = resolve_after(head.first_unit, head.units, &head.pending)
+    if let Some(m) = since {
+        anyhow::ensure!(
+            m <= head.units,
+            "since unit {m}, but this head has only {} units",
+            head.units
+        );
+    }
+    let from = since.unwrap_or(0).max(head.first_unit);
+    let plan: Vec<Value> = resolve_after(from, head.units, &head.pending)
         .into_iter()
         .rev()
         .map(|(l, i)| json!([l, i]))
@@ -522,13 +539,22 @@ async fn index_head(
     let index = json!({
         "owner": r.owner,
         "chainId": r.chain_id,
-        "origin": head_json(&origin),
+        "origin": head_json(origin),
         "head": head_json(&head),
-        "headUpdate": n,
+        "headUpdate": head.units - origin.units,
         "headFound": how,
+        // Why the probe stopped where it did: usually the next update is not published yet,
+        // but Bee answers a missing and an unretrievable chunk alike.
+        "lastMiss": miss,
         "slices": plan,
     });
-    Ok((r, origin, head, index))
+    Ok((head, index))
+}
+
+/// What the slice, bucket and spill views show of the index: no head is probed, only the
+/// origin is read (its start fixes where each slice starts).
+fn origin_json(r: &IndexReader, origin: &HeadRecord) -> Value {
+    json!({ "owner": r.owner, "chainId": r.chain_id, "origin": head_json(origin) })
 }
 
 async fn addr_lookup_handler(
@@ -539,19 +565,15 @@ async fn addr_lookup_handler(
 }
 
 async fn addr_lookup_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
-    let (r, _origin, head, index) = index_head(st, &q).await?;
+    let (r, origin) = index_origin(st, &q).await?;
+    let since = opt_u64(q.since.as_deref(), "since")?;
+    let (head, index) = index_head(&r, &origin, &q, since).await?;
     let mut out = json!({ "index": index });
-    let Some(a) = q
-        .address
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
+    let Some(address) = opt_address(&q)? else {
         return Ok(out);
     };
-    let address: Address = a.parse().context("address must be 20 bytes of hex")?;
-    let since = opt_u64(q.since.as_deref(), "since")?;
     let found = addr_lookup(&r, address, &head, since).await?;
+    let limit = limit(&q)?;
     out["address"] = json!(address);
     out["lookup"] = json!({
         "fromBlock": found.first_block,
@@ -560,7 +582,8 @@ async fn addr_lookup_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
         "files": found.files,
         "roles": role::names(found.roles),
         "count": found.entries.len(),
-        "entries": found.entries.iter().map(entry_json).collect::<Vec<_>>(),
+        "shown": found.entries.len().min(limit),
+        "entries": found.entries.iter().take(limit).map(entry_json).collect::<Vec<_>>(),
     });
     Ok(out)
 }
@@ -582,17 +605,11 @@ async fn addr_slice_handler(
 }
 
 async fn addr_slice_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
-    let (r, origin, _head, index) = index_head(st, &q).await?;
+    let (r, origin) = index_origin(st, &q).await?;
     let s = slice_param(&q)?;
     let rec = r.slice(s, origin.first_unit).await?;
-    let mut out = json!({ "index": index, "slice": slice_json(&rec) });
-    if let Some(a) = q
-        .address
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let address: Address = a.parse().context("address must be 20 bytes of hex")?;
+    let mut out = json!({ "index": origin_json(&r, &origin), "slice": slice_json(&rec) });
+    if let Some(address) = opt_address(&q)? {
         let h = keccak256(address.as_slice());
         out["addressBucket"] = json!(bucket_of(&h, rec.bucket_count));
         out["address"] = json!(address);
@@ -608,7 +625,7 @@ async fn addr_bucket_handler(
 }
 
 async fn addr_bucket_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
-    let (r, origin, _head, index) = index_head(st, &q).await?;
+    let (r, origin) = index_origin(st, &q).await?;
     let s = slice_param(&q)?;
     let rec = r.slice(s, origin.first_unit).await?;
     let k = u32::try_from(parse_u64(q.k.as_deref(), "bucket")?).context("bucket out of range")?;
@@ -619,32 +636,17 @@ async fn addr_bucket_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
         s.1,
         rec.bucket_count
     );
-    let highlight = match q
-        .address
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(a) => {
-            let address: Address = a.parse().context("address must be 20 bytes of hex")?;
-            Some(fingerprint(&keccak256(address.as_slice())))
-        }
-        None => None,
-    };
-    let (_, bucket) = r.bucket(&rec, k).await?;
+    let highlight = opt_address(&q)?.map(|a| fingerprint(&keccak256(a.as_slice())));
+    // One read of the bucket, and of a paged bucket's pages file, all checked.
+    let (payload, records, _) = r.bucket_records(&rec, k).await?;
+    let bucket = BucketRecord::decode(&payload, rec.first_block)?;
     let mut out = json!({
-        "index": index,
+        "index": origin_json(&r, &origin),
         "slice": slice_json(&rec),
         "bucket": bucket_json(&bucket, highlight),
     });
-    // A paged bucket: its records from the pages file, checked.
     if matches!(bucket.body, BucketBody::Paged { .. }) {
-        let (_, records, _) = r.bucket_records(&rec, k).await?;
-        let paged = BucketRecord {
-            body: BucketBody::Inline(records),
-            ..bucket
-        };
-        out["pagedRecords"] = bucket_json(&paged, highlight)["records"].clone();
+        out["pagedRecords"] = json!(records_json(&records, highlight));
     }
     Ok(out)
 }
@@ -657,18 +659,20 @@ async fn addr_spill_handler(
 }
 
 async fn addr_spill_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
-    let (r, origin, _head, index) = index_head(st, &q).await?;
+    let (r, origin) = index_origin(st, &q).await?;
     let s = slice_param(&q)?;
     let rec = r.slice(s, origin.first_unit).await?;
     let spill_ref = parse_b256(q.r#ref.as_deref().unwrap_or_default(), "spill reference")?;
     let count = parse_u64(q.count.as_deref(), "entry count")?;
     let entries = r.spill_entries(&rec, &spill_ref, count).await?;
+    let limit = limit(&q)?;
     Ok(json!({
-        "index": index,
+        "index": origin_json(&r, &origin),
         "slice": slice_json(&rec),
         "spillRef": spill_ref,
         "count": entries.len(),
-        "entries": entries.iter().map(entry_json).collect::<Vec<_>>(),
+        "shown": entries.len().min(limit),
+        "entries": entries.iter().take(limit).map(entry_json).collect::<Vec<_>>(),
     }))
 }
 
@@ -1106,6 +1110,24 @@ mod tests {
             transactions_root: EMPTY_ROOT_HASH,
             ommers_hash: EMPTY_OMMER_ROOT_HASH,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn decode_record_handles_addr1_records_and_short_payloads() {
+        let head = HeadRecord {
+            first_unit: 7,
+            units: 8,
+            last_block_hash: B256::repeat_byte(1),
+            last_block_timestamp: 1,
+            pending: vec![],
+        };
+        assert_eq!(decode_record(&head.encode())["kind"], "addrHead");
+        // A bucket header cut short must not panic: it is simply not a record.
+        for n in 5..12 {
+            let mut p = b"E2S\x01\x05".to_vec();
+            p.resize(n, 0);
+            let _ = decode_record(&p);
         }
     }
 

@@ -6,7 +6,7 @@ use alloy::providers::Provider;
 use anyhow::{Context, Result, bail, ensure};
 
 use super::fetch::fetch_appearances;
-use super::layout::{Entries, Entry, HeadRecord, UNIT_BLOCKS};
+use super::layout::{Entries, Entry, HeadRecord, MAX_UNITS, UNIT_BLOCKS};
 use super::slice::{SliceId, bucket_of, fingerprint, resolve_after};
 use super::verify::IndexReader;
 
@@ -70,6 +70,54 @@ pub async fn latest_head(r: &IndexReader, finalized: u64) -> Result<(HeadRecord,
     Ok((head, miss))
 }
 
+/// The newest head that can be read without knowing the chain's height (no RPC): doubling
+/// up from update 1 until a probe misses, then bisecting the last gap, with the head itself
+/// (as the last successful probe read it), the number of probes and the reason of the last
+/// miss. Bee 2.8.3 answers a missing and an unretrievable chunk alike, so a transient failure
+/// can settle the search below the newest update: the miss reason says so. With
+/// [`latest_head`], a finalized block number avoids the doubling.
+pub async fn newest_head_by_probing(
+    r: &IndexReader,
+    origin: &HeadRecord,
+) -> Result<(HeadRecord, u32, Option<String>)> {
+    let probe = IndexReader {
+        bee: r.bee.clone().with_retries(2),
+        ..r.clone()
+    };
+    let mut best = origin.clone();
+    let (mut lo, mut hi, mut probes) = (0u64, 1u64, 0u32);
+    let top = MAX_UNITS - origin.units;
+    let mut miss = loop {
+        probes += 1;
+        match probe.probe_head(origin, hi).await? {
+            Ok(head) => {
+                best = head;
+                lo = hi;
+                if hi >= top {
+                    return Ok((best, probes, None));
+                }
+                hi = (hi * 2).min(top);
+            }
+            Err(reason) => break Some(reason),
+        }
+    };
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        probes += 1;
+        match probe.probe_head(origin, mid).await? {
+            Ok(head) => {
+                best = head;
+                lo = mid;
+            }
+            Err(reason) => {
+                miss = Some(reason);
+                hi = mid;
+            }
+        }
+    }
+    Ok((best, probes, miss))
+}
+
 /// What a lookup found.
 #[derive(Debug, Default)]
 pub struct Found {
@@ -127,6 +175,13 @@ pub async fn lookup(
     since: Option<u64>,
 ) -> Result<Found> {
     let h = keccak256(address.as_slice());
+    if let Some(m) = since {
+        ensure!(
+            m <= head.units,
+            "read up to unit {m}, but this head has only {} units",
+            head.units
+        );
+    }
     let from = since.unwrap_or(0).max(head.first_unit);
     let slices = resolve_after(from, head.units, &head.pending);
     let min_block = from * UNIT_BLOCKS;

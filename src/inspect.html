@@ -291,15 +291,21 @@ function entriesTable(list) {
 function indexCard(ix) {
   if (!ix) return '';
   const h = ix.head, o = ix.origin;
+  // The slice, bucket and spill views read only the origin.
+  if (!h) return card('Address index', kv([
+    ['owner / chain', `${esc(ix.owner)} <span class="muted">on chain ${ix.chainId}</span>`],
+    ['origin', `${o.units} units, from block ${o.firstBlock}` + (o.firstBlock > 0 ? ' <span class="badge warn">earlier blocks are not covered</span>' : '')],
+  ]));
   return card('Address index', kv([
     ['owner / chain', `${esc(ix.owner)} <span class="muted">on chain ${ix.chainId}</span>`],
     ['covers', `blocks ${h.firstBlock} – ${h.lastBlock}` + (h.firstBlock > 0 ? ` <span class="badge warn">starts at block ${h.firstBlock}: earlier blocks are not covered</span>` : '')],
     ['head', `update ${ix.headUpdate}: ${h.units} units <span class="muted">(${esc(ix.headFound)})</span>`],
+    ix.lastMiss && ['probe stopped at', `<span class="muted">${esc(ix.lastMiss)} — usually the next update is not published yet; Bee answers a missing and an unretrievable chunk alike</span>`],
     ['last block hash', hash(h.lastBlockHash)],
     ['last block time', `${h.lastBlockTimestamp} <span class="muted">(${tsIso(h.lastBlockTimestamp)})</span>`],
     ['pending merges', h.pending.length ? esc(h.pending.map(p => `(${p[0]}, ${p[1]})`).join(' ')) : '<span class="muted">none</span>'],
     ['origin', `${o.units} units, from block ${o.firstBlock}`],
-    ['slices read (newest first)', ix.slices.map(([l, i]) => addrLink(slicePath(l, i), `(${l}, ${i})`)).join(' ')],
+    ['slices a lookup reads (newest first)', ix.slices.map(([l, i]) => addrLink(slicePath(l, i), `(${l}, ${i})`)).join(' ')],
   ]));
 }
 function sliceCard(sl, extra) {
@@ -318,7 +324,8 @@ const runners = {
     const a = $('addrA').value.trim();
     // A slice, bucket or spill view opened by a link or the URL; a lookup from the form
     // clears it.
-    const sub = /^(slice|bucket|spill):/.test(addrView) ? addrView : (a ? 'lookup:' + a : 'index');
+    const sub = /^(slice|bucket|spill):/.test(addrView) ? addrView
+      : a ? `lookup:${a}:${$('addrUnits').value}:${$('addrSince').value}` : `index:${$('addrUnits').value}`;
     setHash('addr', sub); busy('out-addr');
     const base = { owner: $('owner').value.trim(), chain: $('chain').value, units: $('addrUnits').value, address: a };
     const parts = sub.split(':');
@@ -354,7 +361,7 @@ const runners = {
       if (stale()) return;
       if (d.error) html += errCard(d.error);
       if (d.slice) html += sliceCard(d.slice);
-      if (d.entries) html += card(`Spill file — ${d.count} entries`, kv([['reference', hash(d.spillRef)]]) + entriesTable(d.entries));
+      if (d.entries) html += card(`Spill file — ${d.count} entries` + (d.shown < d.count ? ` (first ${d.shown} shown)` : ''), kv([['reference', hash(d.spillRef)]]) + entriesTable(d.entries));
     } else {
       d = await api('addr/lookup', params({ ...base, since: $('addrSince').value }, node));
       if (stale()) return;
@@ -366,7 +373,7 @@ const runners = {
           ['blocks looked at', `${l.fromBlock} – ${l.toBlock}`],
           ['slices / files read', `${l.slices} / ${l.files}`],
           ['roles the index detects', esc(l.roles) + (l.roles.includes('trace') ? '' : ' <span class="muted">(no trace: internal calls are not in this index)</span>')],
-        ]) + '<h2 style="margin-top:12px">Entries, newest first</h2>' + entriesTable(l.entries));
+        ]) + `<h2 style="margin-top:12px">Entries, newest first${l.shown < l.count ? ` (the newest ${l.shown} of ${l.count})` : ''}</h2>` + entriesTable(l.entries));
       }
     }
     $('out-addr').innerHTML = html;
@@ -487,7 +494,13 @@ function fromHash() {
   if (tab === 'block') $('blockN').value = val || 0;
   if (tab === 'epoch') $('epochK').value = val || 0;
   if (tab === 'bytes') $('bytesRef').value = val;
-  if (tab === 'addr') { addrView = val; if (val.startsWith('lookup:')) $('addrA').value = val.slice(7); }
+  if (tab === 'addr') {
+    // lookup:<address>:<units>:<since>, index:<units>, or a slice/bucket/spill view.
+    addrView = val;
+    const p = val.split(':');
+    if (p[0] === 'lookup') { $('addrA').value = p[1] || ''; $('addrUnits').value = p[2] || ''; $('addrSince').value = p[3] || ''; }
+    if (p[0] === 'index') { $('addrA').value = ''; $('addrUnits').value = p[1] || ''; $('addrSince').value = ''; }
+  }
   if (tab === 'soc') {
     const i = val.indexOf(':');
     const mode = i > 0 ? val.slice(0, i) : '';

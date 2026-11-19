@@ -47,7 +47,9 @@ bookmarkable.
     **bucket** (its records by fingerprint, the address's highlighted, inline entries and
     spill files; a paged bucket with its pages file's records) and a **spill file** (its
     entries). Views are bookmarkable (`#addr/lookup:<address>`, `#addr/slice:<L>:<i>`,
-    `#addr/bucket:<L>:<i>:<k>`, `#addr/spill:<L>:<i>:<ref>:<count>`).
+    `#addr/bucket:<L>:<i>:<k>`, `#addr/spill:<L>:<i>:<ref>:<count>`; a lookup's head units and
+    since unit are part of it: `#addr/lookup:<address>:<units>:<since>`). A lookup and a spill
+    file show their newest 500 entries (the API's `limit`), and always the full count.
   - The SOC tab decodes addr1 heads, slice descriptors and buckets too, with templates for
     `eth:<chain>:addr1:origin` and `eth:<chain>:addr1:slice:<L>:<i>`.
 
