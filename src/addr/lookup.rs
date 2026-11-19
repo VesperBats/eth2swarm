@@ -6,7 +6,7 @@ use alloy::providers::Provider;
 use anyhow::{Context, Result, bail, ensure};
 
 use super::fetch::fetch_appearances;
-use super::layout::{Entries, Entry, HeadRecord, UNIT_BLOCKS};
+use super::layout::{Entries, Entry, HeadRecord, MAX_UNITS, UNIT_BLOCKS};
 use super::slice::{SliceId, bucket_of, fingerprint, resolve_after};
 use super::verify::IndexReader;
 
@@ -70,6 +70,111 @@ pub async fn latest_head(r: &IndexReader, finalized: u64) -> Result<(HeadRecord,
     Ok((head, miss))
 }
 
+/// The newest existing update at or after `known` (one known to exist) and at most `top`, by
+/// `probe(n)` (`Ok(Err(reason))` for a miss): stepping up by 1, 1, 2, 4, … from `known` until a
+/// probe misses, then bisecting the last gap. Returns the update, what the probe returned for
+/// it if it was probed (not when it is `known` itself), the number of probes, and the reason
+/// of the last miss. Started from the last update a client found, a client one update behind
+/// pays two probes.
+pub async fn newest_by_stepping<T, F, Fut>(
+    known: u64,
+    top: u64,
+    mut probe: F,
+) -> Result<(u64, Option<T>, u32, Option<String>)>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<std::result::Result<T, String>>>,
+{
+    ensure!(
+        known <= top,
+        "update {known} beyond the last possible one {top}"
+    );
+    let (mut lo, mut best, mut probes, mut step) = (known, None, 0u32, 1u64);
+    if lo == top {
+        return Ok((lo, best, probes, None));
+    }
+    let mut hi = (lo + step).min(top);
+    let mut miss = loop {
+        probes += 1;
+        match probe(hi).await? {
+            Ok(v) => {
+                (lo, best) = (hi, Some(v));
+                if lo == top {
+                    return Ok((lo, best, probes, None));
+                }
+                // Steps 1, 1, 2, 4, …: one update behind settles in two probes.
+                hi = lo.saturating_add(step).min(top);
+                step = step.saturating_mul(2);
+            }
+            Err(reason) => break Some(reason),
+        }
+    };
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        probes += 1;
+        match probe(mid).await? {
+            Ok(v) => (lo, best) = (mid, Some(v)),
+            Err(reason) => {
+                miss = Some(reason);
+                hi = mid;
+            }
+        }
+    }
+    Ok((lo, best, probes, miss))
+}
+
+/// The newest head that can be read without knowing the chain's height (no RPC), by
+/// [`newest_by_stepping`] from update `known` (the last one this client found, or 0), with
+/// the number of probes and the reason of the last miss. A probe is one attempt and one retry.
+/// Bee 2.8.3 answers a missing and an unretrievable chunk alike, so a transient failure can
+/// settle the search below the newest update: the miss reason says so. With [`latest_head`],
+/// a finalized block number aims the search instead.
+pub async fn newest_head_by_probing(
+    r: &IndexReader,
+    origin: &HeadRecord,
+    known: u64,
+) -> Result<(HeadRecord, u32, Option<String>)> {
+    let probe = IndexReader {
+        bee: r.bee.clone().with_retries(2),
+        ..r.clone()
+    };
+    let top = MAX_UNITS - origin.units;
+    let (n, found, probes, miss) = newest_by_stepping(known.min(top), top, |n| {
+        let (probe, origin) = (probe.clone(), origin.clone());
+        async move { probe.probe_head(&origin, n).await }
+    })
+    .await?;
+    let head = match found {
+        Some(h) => h,
+        // Not probed (the known update itself, or update 0): read it, so that update 0 is
+        // checked against the origin too.
+        None => {
+            let h = r.head_at(origin, origin.units + n).await?;
+            ensure!(
+                n > 0 || h == *origin,
+                "head update 0 differs from the origin"
+            );
+            h
+        }
+    };
+    Ok((head, probes, miss))
+}
+
+/// What a lookup as of `head` reads: the slices (oldest first) and the first unit its
+/// entries cover, the index's start or the incremental sync's `since`. A `since` beyond the
+/// head's units is refused: that head is older than what was read.
+pub fn read_plan(head: &HeadRecord, since: Option<u64>) -> Result<(Vec<SliceId>, u64)> {
+    if let Some(m) = since {
+        ensure!(
+            m <= head.units,
+            "read up to unit {m}, but this head has only {} units",
+            head.units
+        );
+    }
+    let from = since.unwrap_or(0).max(head.first_unit);
+    Ok((resolve_after(from, head.units, &head.pending), from))
+}
+
 /// What a lookup found.
 #[derive(Debug, Default)]
 pub struct Found {
@@ -127,8 +232,7 @@ pub async fn lookup(
     since: Option<u64>,
 ) -> Result<Found> {
     let h = keccak256(address.as_slice());
-    let from = since.unwrap_or(0).max(head.first_unit);
-    let slices = resolve_after(from, head.units, &head.pending);
+    let (slices, from) = read_plan(head, since)?;
     let min_block = from * UNIT_BLOCKS;
     let mut results = std::collections::BTreeMap::new();
     let mut set = tokio::task::JoinSet::new();
@@ -300,6 +404,58 @@ mod tests {
             .unwrap();
         assert_eq!(r.1.is_some(), newest < aim);
         (r.0, reads.get())
+    }
+
+    /// Runs `newest_by_stepping` from `known` against updates `0..=newest` existing.
+    fn step_search(known: u64, newest: u64, top: u64) -> (u64, u32) {
+        let r = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(newest_by_stepping(known, top, |n| async move {
+                Ok(if n <= newest {
+                    Ok(n)
+                } else {
+                    Err(format!("{n} missing"))
+                })
+            }))
+            .unwrap();
+        // The update returned is the one probed for it, unless nothing above `known` was
+        // found; the last miss is given unless the search reached `top`.
+        assert_eq!(r.1, (r.0 > known).then_some(r.0));
+        assert_eq!(r.3.is_some(), r.0 < top);
+        (r.0, r.2)
+    }
+
+    #[test]
+    fn read_plan_follows_the_start_and_refuses_a_stale_head() {
+        let head = HeadRecord {
+            first_unit: 9,
+            units: 13,
+            last_block_hash: B256::ZERO,
+            last_block_timestamp: 0,
+            pending: vec![],
+        };
+        assert_eq!(read_plan(&head, None).unwrap(), (vec![(2, 2), (0, 12)], 9));
+        assert_eq!(read_plan(&head, Some(12)).unwrap(), (vec![(0, 12)], 12));
+        assert_eq!(read_plan(&head, Some(3)).unwrap().1, 9);
+        assert!(read_plan(&head, Some(14)).is_err());
+    }
+
+    #[test]
+    fn newest_by_stepping_finds_the_newest() {
+        let top = 1 << 20;
+        for newest in [0u64, 1, 2, 7, 8, 9, 1000, top - 1, top] {
+            assert_eq!(step_search(0, newest, top).0, newest, "newest {newest}");
+        }
+        // From the last update found, one behind costs two probes, up to date one.
+        assert_eq!(step_search(999, 1000, top), (1000, 2));
+        assert_eq!(step_search(1000, 1000, top), (1000, 1));
+        // Far behind: still logarithmic.
+        let (n, probes) = step_search(0, 123_456, top);
+        assert_eq!(n, 123_456);
+        assert!(probes <= 2 * 20 + 2, "{probes} probes");
+        // Already at the top: no probe.
+        assert_eq!(step_search(top, top, top), (top, 0));
     }
 
     #[test]

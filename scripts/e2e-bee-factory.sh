@@ -469,5 +469,44 @@ echo "ok: inspector verified block $BLOCK"
 FOREIGN=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' "http://$INSPECTOR_ADDR/api/config")
 [ "$FOREIGN" = 403 ] || { echo "FAIL: inspector answered a foreign Host header with $FOREIGN"; exit 1; }
 echo "ok: inspector rejected a foreign Host header"
+if [ -n "${ACT_OWNER:-}" ]; then
+  # The Address index tab's lookup finds what addr-lookup found for the busy address, and
+  # the newest head by probing.
+  RESULT=$(curl -s "http://$INSPECTOR_ADDR/api/addr/lookup?node=read&owner=$ACT_OWNER&chain=$CHAIN_ID&address=$BUSY") \
+    || serve_fail "inspector address lookup failed"
+  GOT=$(printf '%s' "$RESULT" | python3 -c 'import json, sys; d = json.load(sys.stdin); print(d.get("error") or "%s %s" % (d["lookup"]["count"], d["index"]["head"]["units"]))')
+  [ "$GOT" = "$N $ACT_UNITS" ] || { echo "FAIL: inspector address lookup gave '$GOT', expected '$N $ACT_UNITS'"; exit 1; }
+  echo "ok: inspector's address-index lookup found the busy address's $N entries at head $ACT_UNITS"
+  # The slice, bucket and spill views along the busy address's path: the one slice that
+  # holds all its entries, its bucket, its record and the spill file.
+  jget() { python3 -c "import json, sys; d = json.load(sys.stdin); e = d.get('error'); print('ERROR ' + e if e else $1)"; }
+  api() { curl -s "http://$INSPECTOR_ADDR/api/addr/$1?node=read&owner=$ACT_OWNER&chain=$CHAIN_ID&units=$ACT_UNITS&address=$BUSY&$2"; }
+  REF=""
+  for S in $(printf '%s' "$RESULT" | jget "' '.join('%d:%d' % tuple(s) for s in d['index']['slices'])"); do
+    SL=${S%:*} SI=${S#*:}
+    K=$(api slice "level=$SL&index=$SI" | jget "d['addressBucket']")
+    REC=$(api bucket "level=$SL&index=$SI&k=$K" \
+      | jget "' '.join(str(r.get('spillRef')) + ' ' + str(r['entries']) for r in (d['pagedRecords'] if d['bucket']['paged'] else d['bucket']['records']) if r['match'])")
+    case "$REC" in ERROR*) echo "FAIL: inspector bucket $K of slice ($SL, $SI): $REC"; exit 1 ;; esac
+    [ -n "$REC" ] || continue
+    read -r REF CNT <<<"$REC"
+    break
+  done
+  [ "${CNT:-}" = "$N" ] && [ "${REF#0x}" != "$REF" ] \
+    || { echo "FAIL: the busy address's record in bucket $K of slice ($SL, $SI): '$REC'"; exit 1; }
+  GOT=$(api spill "level=$SL&index=$SI&ref=$REF&count=$CNT&limit=3" | jget "'%s %s %s' % (d['count'], d['shown'], d['entries'][0]['block'] >= d['entries'][-1]['block'])")
+  [ "$GOT" = "$N 3 True" ] || { echo "FAIL: inspector spill view gave '$GOT', expected '$N 3 True'"; exit 1; }
+  echo "ok: inspector's slice ($SL, $SI), bucket $K and spill views lead to the busy address's $N entries, newest first"
+fi
+if [ -n "${LM_OWNER:-}" ]; then
+  # Head probing across several updates (the index from block 64: updates 0-3, 5 units):
+  # stepping up, a miss, bisecting; the second lookup starts from the head the first found.
+  for want in "5 3 from update 0" "5 3 from update 3"; do
+    GOT=$(curl -s "http://$INSPECTOR_ADDR/api/addr/lookup?node=read&owner=$LM_OWNER&chain=$CHAIN_ID" \
+      | python3 -c 'import json, re, sys; d = json.load(sys.stdin)["index"]; print(d["head"]["units"], d["headUpdate"], re.search(r"from update \d+", d["headFound"]).group(0))')
+    [ "$GOT" = "$want" ] || { echo "FAIL: inspector head probing gave '$GOT', expected '$want'"; exit 1; }
+  done
+  echo "ok: inspector's head probing found update 3 of the index from block 64, then again from its cache"
+fi
 
 echo "== all checks passed (anchor $ANCHOR)"

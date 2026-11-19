@@ -544,6 +544,18 @@ impl BucketRecord {
         w.0
     }
 
+    /// Decodes a bucket from the grid start of the slice its header names: right for an
+    /// index from genesis, where every slice starts there; for the slice a later start falls
+    /// into, use [`BucketRecord::decode`] with its descriptor's `first_block`. For tools that
+    /// look at one bucket without its descriptor.
+    pub fn decode_at_grid_start(buf: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(buf, KIND_BUCKET)?;
+        let level = r.u8()?;
+        ensure!(level <= L_MAX, "bucket level {level} above {L_MAX}");
+        let index = r.u32()?;
+        Self::decode(buf, first_block(level, index))
+    }
+
     /// Decodes a bucket of a slice whose first block is `base` (from its `SliceRecord`).
     pub fn decode(buf: &[u8], base: u64) -> Result<Self> {
         ensure!(
