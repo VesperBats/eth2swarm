@@ -31,7 +31,8 @@ for (let i = 0; i < 60 && !target; i++) {
   try {
     const list = await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json();
     target = list.find(t => t.type === 'page');
-  } catch { await sleep(500); }
+  } catch { /* not up yet */ }
+  if (!target) await sleep(500);
 }
 if (!target) { console.error('no page target'); chrome.kill(); process.exit(1); }
 
@@ -90,6 +91,7 @@ window.__mark = (n, sel, text, nth, side) => {
   return 'ok';
 };`;
 
+try {
 for (const s of shots) {
   await send('Page.navigate', { url: `${s.base || base}/${s.hash ? '#' + s.hash : ''}` });
   await sleep(800);
@@ -123,4 +125,6 @@ for (const s of shots) {
   writeFileSync(`${outDir}/${s.name}.webp`, buf);
   console.log(`${s.name}.webp ${clip.width}x${Math.round(clip.height)} ${buf.length} B`);
 }
-ws.close(); chrome.kill();
+} finally {
+  ws.close(); chrome.kill();
+}

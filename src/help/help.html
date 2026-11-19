@@ -106,7 +106,8 @@ green check here means the client would accept the data too. Underlined terms li
   <li><b>Tabs</b>: what to look at. The URL fragment (<code>#block/97</code>,
     <code>#addr/lookup:…</code>) names the view, so a view can be bookmarked or shared.</li>
   <li><b>reset settings</b>: back to the node, owner, chain ID and anchor <code>ethswarm serve</code>
-    was started with. The browser keeps your own values otherwise.</li>
+    was started with. Otherwise the browser keeps your own values, until
+    <code>ethswarm serve</code> is restarted with a different default for that field.</li>
   <li><b>help</b>: this page.</li>
 </ol>
 
@@ -188,7 +189,7 @@ record ──holds──▶ entries: (block, slot, roles), or a reference to a s
     <a class="g" href="#g-units">units</a>. In brackets, how it was found: the inspector
     <a class="g" href="#g-probe">probes</a> head updates until one is missing.</li>
   <li><b>probe stopped at</b>: the chunk whose fetch ended the search, with Bee's error. A
-    <code>500 read chunk failed</code> here is normal: it is usually the next head update, which
+    <code>read chunk failed</code> (HTTP 500) here is normal: it is usually the next head update, which
     is not published yet.</li>
   <li><b>pending merges</b>: <a class="g" href="#g-pending">merged slices</a> still being
     uploaded. A lookup reads the smaller slices they replace instead, so this only costs a few
@@ -247,7 +248,7 @@ in them.</div>
 <p>One bucket of a slice: the <a class="g" href="#g-record">address records</a> it holds. Here,
 the bucket of USDT's token contract in a level-6 slice.</p>
 <figure><img src="help/addr-bucket.webp" alt="A bucket view: records by fingerprint, the looked-up address highlighted, inline entries and links to spill files" width="1240">
-<figcaption>Shortened: a bucket holds about 100–150 records.</figcaption></figure>
+<figcaption>Shortened: a bucket holds about 120–180 records.</figcaption></figure>
 <ol class="callouts">
   <li><b>Bucket k of slice (L, i)</b>: which bucket this is. A
     <a class="g" href="#g-paged">paged</a> bucket says so here, with its page count.</li>
@@ -394,7 +395,7 @@ importer's address, or start <code>ethswarm serve</code> with <code>--owner</cod
 <tr><td><code>no address index of owner … on chain … could be read from this node</code></td>
 <td>The <a class="g" href="#g-origin">origin</a> was not found: a wrong owner, a wrong chain ID,
 or a node that cannot retrieve it. Check those three first.</td></tr>
-<tr><td><code>500 Internal Server Error: read chunk failed</code></td><td>Bee could not find the
+<tr><td><code>read chunk failed</code> (500 Internal Server Error)</td><td>Bee could not find the
 chunk. It answers a chunk that does not exist and one it cannot reach the same way. Under
 <em>probe stopped at</em> it is expected (the next head update does not exist yet).</td></tr>
 <tr><td>Amber ⚠ verdict</td><td>Verified, but against the owner's
@@ -447,7 +448,7 @@ record holds its reference (body ref); the body is checked against the header's 
 
 <dt id="g-bucket">Bucket</dt>
 <dd>One SOC of a slice, holding the <a href="#g-record">records</a> of the addresses whose hash
-falls into it: about 2.8 KB, about 100–200 addresses. A lookup reads one bucket per slice. That
+falls into it: about 2.8 KB, about 120–180 addresses. A lookup reads one bucket per slice. That
 the bucket also holds other addresses' records gives some privacy: the node serving it does not
 learn which address was looked up.</dd>
 
@@ -470,8 +471,8 @@ It is part of every identifier string (<code>eth:&lt;chain&gt;:…</code>).</dd>
 
 <dt id="g-cover">Cover</dt>
 <dd>The set of slices that together hold every unit of the index exactly once: every complete
-top-level slice, then one slice for every set bit of the unit count, largest first. For an index from genesis, that is 13
-slices at mainnet's height today. An index that starts at a later block reads only the slices after its
+top-level slice, then one slice for every set bit of the unit count, largest first. For an index from genesis that is at most
+(units ÷ 65,536) + 16 slices: 22 at most until late 2027. An index that starts at a later block reads only the slices after its
 start.</dd>
 
 <dt id="g-emitter">Emitter</dt>

@@ -354,7 +354,7 @@ async fn help_image(Path(file): Path<String>) -> Response {
         Some((_, bytes)) => (
             [
                 (header::CONTENT_TYPE, "image/webp"),
-                (header::CACHE_CONTROL, "max-age=3600"),
+                (header::CACHE_CONTROL, "no-cache"),
             ],
             *bytes,
         )
@@ -1555,6 +1555,7 @@ async fn bytes_inspect(st: &AppState, q: BytesQuery) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::consensus::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
 
     #[test]
     fn help_images_match_the_page() {
@@ -1585,7 +1586,6 @@ mod tests {
             );
         }
     }
-    use alloy::consensus::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
 
     fn header() -> Header {
         Header {
