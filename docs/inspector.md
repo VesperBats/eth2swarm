@@ -50,10 +50,16 @@ bookmarkable.
     entries). Views are bookmarkable: `#addr/lookup:<address>:<units>:<since>`,
     `#addr/index:<units>:<since>` (the head without an address), `#addr/slice:<L>:<i>:<address>`,
     `#addr/bucket:<L>:<i>:<k>:<address>` (the address is optional and is what the view
-    highlights) and `#addr/spill:<L>:<i>:<ref>:<count>`. A lookup and a spill file show their
+    highlights), `#addr/spill:<L>:<i>:<ref>:<count>` and `#addr/examples:<units>`. A lookup and a spill file show their
     newest 500 entries (the API's `limit`), newest first, and always the full count.
   - A failed read keeps what was read before it: a lookup that fails in one slice still shows
     the head and the slice links, a bucket or spill view still shows the slice.
+  - *Show example addresses*: well-known addresses of the chain (mainnet: tokens, the
+    deposit contract, a router, block builders; dev chains: the Anvil accounts), each with
+    the number of entries it has in the index, counted from the buckets alone (no spill
+    files), read in parallel. An address whose bucket cannot be read shows why, and the others
+    are still counted. A click looks the address up as of the head the count was made at. The
+    index stores fingerprints, not addresses, so it cannot list its own.
   - The SOC tab decodes addr1 heads, slice descriptors and buckets too, with templates for
     `eth:<chain>:addr1:origin` and `eth:<chain>:addr1:slice:<L>:<i>`.
 
@@ -78,6 +84,32 @@ antd --network-id 1337 --api-addr 127.0.0.1:1733 --allow-private-dials --no-disk
 
 Peer IDs: `curl -s localhost:1633/addresses` (use the `/ip4/127.0.0.1/…` underlay).
 
-The UI has no authentication. It listens on `127.0.0.1:8090` by default and warns when
-`--listen` is not a loopback address; requests whose `Host` header isn't the listen address
-or a loopback name are rejected (protection against DNS rebinding).
+## Opening it from another machine
+
+The UI has no authentication. It listens on `127.0.0.1:8090` by default and warns when it
+listens anywhere else. To open it from another machine:
+
+```sh
+cargo run -- serve --tailscale        # this machine's Tailscale IPv4, port 8090
+cargo run -- serve --listen 0.0.0.0:8090   # every address (LAN included)
+```
+
+`--tailscale` listens on the Tailscale address only, not on the LAN or loopback addresses.
+That alone does not make it tailnet-only: Linux accepts a packet for any of its addresses on
+any interface, so a host on the same LAN can add a route to the Tailscale address via this
+machine and reach the port. Tailscale's ACLs do not see that path; a host firewall that drops
+traffic to the port from anything but `tailscale0` closes it.
+
+`--tailscale` also accepts the machine's full MagicDNS name
+(`http://<host>.<tailnet>.ts.net:8090/`); when `tailscale status` gives none, the inspector
+says so at startup and accepts only the IP. The short host name, which most tailnets resolve
+too, is not accepted unless given with `--allow-host <host>`.
+
+Requests are answered only for a `Host` header that is, on the listen port, the listen
+address, a loopback address or `localhost` (any IP address when listening on `0.0.0.0`), or
+one given with `--allow-host` on its own port: `name`, `name:port`, `ip` or `ip:port`, the
+port defaulting to the listen port. A port forward or proxy on another port needs its entry,
+e.g. `--allow-host localhost:9000` for `ssh -L 9000:127.0.0.1:8090`, or `--allow-host
+inspector.example:443` for a TLS proxy that passes the `Host` on (a `Host` without a port
+matches an entry on 80 or 443). Other names are rejected, which keeps a web page from reaching
+the inspector through a DNS name it controls (DNS rebinding).

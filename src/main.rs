@@ -278,9 +278,24 @@ enum Command {
     },
     /// Local web UI to inspect SOCs, blocks, epochs and raw references on Swarm nodes.
     Serve {
-        /// Address to listen on (keep it on loopback: the UI has no authentication).
+        /// Address to listen on. The UI has no authentication: anything else than loopback
+        /// lets whoever reaches the address read the configured nodes through it.
+        /// `0.0.0.0:8090` listens on every address.
         #[arg(long, default_value = "127.0.0.1:8090")]
         listen: std::net::SocketAddr,
+        /// Listen on this machine's Tailscale IPv4 address instead (the port from --listen),
+        /// not on the LAN or loopback addresses, and accept its MagicDNS name as Host. On
+        /// Linux a host on the same LAN can still route to that address unless a host firewall
+        /// drops it: the bind alone does not make the UI tailnet-only.
+        #[arg(long)]
+        tailscale: bool,
+        /// Further hosts the UI is opened by (repeatable), as `name`, `name:port`, `ip` or
+        /// `ip:port`: a DNS name of this machine, a port forward (`localhost:9000` for
+        /// `ssh -L 9000:…`), a proxy (`name:443`). The port defaults to the listen port. The
+        /// address listened on needs no entry, nor does any IP address on the listen port when
+        /// listening on every address; unknown names are refused (DNS rebinding).
+        #[arg(long = "allow-host")]
+        allow_hosts: Vec<String>,
         /// Nodes to read from, as `name=url` (repeatable). Defaults to antd on :1733 and the
         /// bee-factory nodes.
         #[arg(long = "node", value_parser = inspect::parse_node)]
@@ -540,6 +555,8 @@ async fn main() -> Result<()> {
         }
         Command::Serve {
             listen,
+            tailscale,
+            allow_hosts,
             nodes,
             owner,
             chain_id,
@@ -565,7 +582,14 @@ async fn main() -> Result<()> {
                 chain_id,
                 anchor,
             };
-            inspect::serve(listen, nodes, defaults).await?;
+            let mut listen = listen;
+            let mut allow_hosts = allow_hosts;
+            if tailscale {
+                let (ip, name) = inspect::tailscale_identity()?;
+                listen.set_ip(ip);
+                allow_hosts.extend(name);
+            }
+            inspect::serve(listen, &allow_hosts, nodes, defaults).await?;
         }
     }
     Ok(())

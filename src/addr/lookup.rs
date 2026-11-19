@@ -6,7 +6,9 @@ use alloy::providers::Provider;
 use anyhow::{Context, Result, bail, ensure};
 
 use super::fetch::fetch_appearances;
-use super::layout::{Entries, Entry, HeadRecord, MAX_UNITS, UNIT_BLOCKS};
+use super::layout::{
+    AddressRecord, Entries, Entry, HeadRecord, MAX_UNITS, SliceRecord, UNIT_BLOCKS,
+};
 use super::slice::{SliceId, bucket_of, fingerprint, resolve_after};
 use super::verify::IndexReader;
 
@@ -191,7 +193,22 @@ pub struct Found {
 }
 
 /// Slices read at the same time.
-const CONCURRENCY: usize = 8;
+pub const CONCURRENCY: usize = 8;
+
+/// The records of the address with hash `h` in the slice `rec` describes (matched by
+/// fingerprint), from its bucket and, for a paged bucket, its pages file, every read checked;
+/// with the number of files read.
+pub async fn address_records(
+    r: &IndexReader,
+    rec: &SliceRecord,
+    h: &B256,
+) -> Result<(Vec<AddressRecord>, u64)> {
+    let fp = fingerprint(h);
+    let (_, records, files) = r
+        .bucket_records(rec, bucket_of(h, rec.bucket_count))
+        .await?;
+    Ok((records.into_iter().filter(|x| x.fp == fp).collect(), files))
+}
 
 /// The entries of the address with hash `h` in slice `s` of an index from unit `first_unit`,
 /// with the files read.
@@ -202,12 +219,9 @@ async fn in_slice(
     h: B256,
 ) -> Result<(Vec<Entry>, u64, u8)> {
     let rec = r.slice(s, first_unit).await?;
-    let fp = fingerprint(&h);
-    let (_, records, mut files) = r
-        .bucket_records(&rec, bucket_of(&h, rec.bucket_count))
-        .await?;
+    let (records, mut files) = address_records(&r, &rec, &h).await?;
     let mut entries = Vec::new();
-    for address_rec in records.into_iter().filter(|x| x.fp == fp) {
+    for address_rec in records {
         match address_rec.entries {
             Entries::Inline(e) => entries.extend(e),
             Entries::Spilled { count, spill_ref } => {

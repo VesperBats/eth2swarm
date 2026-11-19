@@ -497,6 +497,14 @@ if [ -n "${ACT_OWNER:-}" ]; then
   GOT=$(api spill "level=$SL&index=$SI&ref=$REF&count=$CNT&limit=3" | jget "'%s %s %s' % (d['count'], d['shown'], d['entries'][0]['block'] >= d['entries'][-1]['block'])")
   [ "$GOT" = "$N 3 True" ] || { echo "FAIL: inspector spill view gave '$GOT', expected '$N 3 True'"; exit 1; }
   echo "ok: inspector's slice ($SL, $SI), bucket $K and spill views lead to the busy address's $N entries, newest first"
+  # Example addresses: the dev accounts, counted from the buckets alone. Account #0 ($OWNER)
+  # sent the traffic: its count is what the full lookup at the same head finds.
+  EX=$(curl -s "http://$INSPECTOR_ADDR/api/addr/examples?node=read&owner=$ACT_OWNER&chain=$CHAIN_ID" \
+    | python3 -c 'import json, sys; d = json.load(sys.stdin); print(d.get("error") or "%s %s" % (d["examples"][0]["address"].lower(), d["examples"][0]["entries"]))')
+  WANT_EX=$(lookup "$OWNER" | count)
+  [ "$EX" = "$(echo "$OWNER" | tr 'A-F' 'a-f') $WANT_EX" ] \
+    || { echo "FAIL: inspector examples gave '$EX' for dev account #0, the lookup finds $WANT_EX"; exit 1; }
+  echo "ok: inspector's example addresses count $WANT_EX entries for dev account #0, as the lookup does"
 fi
 if [ -n "${LM_OWNER:-}" ]; then
   # Head probing across several updates (the index from block 64: updates 0-3, 5 units):
