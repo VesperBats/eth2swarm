@@ -33,6 +33,16 @@ pub fn held(slice: SliceId, first_unit: u64) -> Range<u64> {
     r.start.max(first_unit).min(r.end)..r.end
 }
 
+/// The size of what `slice` holds in an index from unit `first_unit`, as a level: the
+/// smallest `L` with `2^L` units at least [`held`]'s. The slice's own level from genesis, less
+/// for the slice a later start falls into. What building it in memory costs grows with this.
+pub fn held_level(slice: SliceId, first_unit: u64) -> u8 {
+    held(slice, first_unit)
+        .count()
+        .next_power_of_two()
+        .trailing_zeros() as u8
+}
+
 /// The cover of `[0, n)` units, oldest first.
 pub fn cover(n: u64) -> Vec<SliceId> {
     cover_with(n, L_MAX)
@@ -480,6 +490,11 @@ mod tests {
         assert_eq!(held((0, 9), 5), 9..10);
         assert!(held((2, 0), 5).is_empty());
         assert_eq!(held((3, 0), 0), 0..8);
+        // Sizes as levels: (3, 0) holds 3 units from unit 5, (10, 0) 24 from unit 1000.
+        assert_eq!(held_level((3, 0), 5), 2);
+        assert_eq!(held_level((3, 0), 0), 3);
+        assert_eq!(held_level((10, 0), 1000), 5);
+        assert_eq!(held_level((0, 9), 5), 0);
         let apps = vec![app(320, 1, 0x11, 1), app(511, 2, 0x11, 2)];
         let built = build_slice((3, 0), 5, &apps, B256::ZERO, 0xff).unwrap();
         assert_eq!(built.record.first_block, 5 * UNIT_BLOCKS);

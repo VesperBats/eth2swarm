@@ -39,8 +39,13 @@ pub fn last_block(level: u8, index: u32) -> u64 {
 }
 
 /// First block slice `(level, index)` holds in an index that starts at unit `first_unit`: its
-/// own first block, or the index's for the slice the start falls into.
+/// own first block, or the index's for the slice the start falls into. Only for a slice that
+/// exists in that index, i.e. ends after `first_unit` (`slice::held` is not empty).
 pub fn held_first_block(level: u8, index: u32, first_unit: u64) -> u64 {
+    debug_assert!(
+        ((index as u64 + 1) << level) > first_unit,
+        "slice ({level}, {index}) ends before the index starts at unit {first_unit}"
+    );
     first_block(level, index).max(first_unit * UNIT_BLOCKS)
 }
 
@@ -567,6 +572,8 @@ impl BucketRecord {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeadRecord {
     /// `S`, the first unit the index covers (0: from genesis). The same in every head.
+    /// Required in a saved state too: a state file from before this field belongs to an index
+    /// in the earlier head format, which cannot be continued (see `State::load`).
     pub first_unit: u64,
     /// `N`, the number of complete units.
     pub units: u64,

@@ -127,16 +127,16 @@ pub async fn lookup(
     since: Option<u64>,
 ) -> Result<Found> {
     let h = keccak256(address.as_slice());
-    let from = since.map_or(head.first_unit, |m| m.max(head.first_unit));
+    let from = since.unwrap_or(0).max(head.first_unit);
     let slices = resolve_after(from, head.units, &head.pending);
     let min_block = from * UNIT_BLOCKS;
     let mut results = std::collections::BTreeMap::new();
     let mut set = tokio::task::JoinSet::new();
     let mut next = 0;
+    let first_unit = head.first_unit;
     while next < slices.len() || !set.is_empty() {
         while set.len() < CONCURRENCY && next < slices.len() {
             let (reader, s, i) = (r.clone(), slices[next], next);
-            let first_unit = head.first_unit;
             set.spawn(async move { (i, in_slice(reader, s, first_unit, h).await) });
             next += 1;
         }
