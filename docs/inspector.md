@@ -36,6 +36,20 @@ bookmarkable.
   `eth:<chain>:<anchor>:hdr:<n>`, `…:epoch:<k>` and `eth:<chain>:accumulator`.
 - **Bytes** — fetch a `/bytes` reference and decode it as a block body or a header sequence
   (epoch file), with a hex preview.
+- **Address index** — the addr1 index ([address-index.md](address-index.md)) of the SOC
+  owner on the chain ID in the settings bar, read with the code `ethswarm addr-lookup` uses
+  (every SOC signature, chunk and file reference checked):
+  - *Look up* an address: the head (the newest found by probing head updates, or the one with
+    the given units), what the index covers (an index from a later block says where it
+    starts), the slices read, and the address's entries newest first (block, transaction or
+    block slot, roles). *Since unit* reads incrementally.
+  - Links open a **slice** (its descriptor, and the bucket the address falls into), a
+    **bucket** (its records by fingerprint, the address's highlighted, inline entries and
+    spill files; a paged bucket with its pages file's records) and a **spill file** (its
+    entries). Views are bookmarkable (`#addr/lookup:<address>`, `#addr/slice:<L>:<i>`,
+    `#addr/bucket:<L>:<i>:<k>`, `#addr/spill:<L>:<i>:<ref>:<count>`).
+  - The SOC tab decodes addr1 heads, slice descriptors and buckets too, with templates for
+    `eth:<chain>:addr1:origin` and `eth:<chain>:addr1:slice:<L>:<i>`.
 
 Leaving the anchor empty uses the owner's published anchor. The verdict is then shown as an
 amber warning rather than a green check, because it means trusting the publisher. Records

@@ -469,5 +469,14 @@ echo "ok: inspector verified block $BLOCK"
 FOREIGN=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' "http://$INSPECTOR_ADDR/api/config")
 [ "$FOREIGN" = 403 ] || { echo "FAIL: inspector answered a foreign Host header with $FOREIGN"; exit 1; }
 echo "ok: inspector rejected a foreign Host header"
+if [ -n "${ACT_OWNER:-}" ]; then
+  # The Address index tab's lookup finds what addr-lookup found for the busy address, and
+  # the newest head by probing.
+  RESULT=$(curl -s "http://$INSPECTOR_ADDR/api/addr/lookup?node=read&owner=$ACT_OWNER&chain=$CHAIN_ID&address=$BUSY") \
+    || serve_fail "inspector address lookup failed"
+  GOT=$(printf '%s' "$RESULT" | python3 -c 'import json, sys; d = json.load(sys.stdin); print(d.get("error") or "%s %s" % (d["lookup"]["count"], d["index"]["head"]["units"]))')
+  [ "$GOT" = "$N $ACT_UNITS" ] || { echo "FAIL: inspector address lookup gave '$GOT', expected '$N $ACT_UNITS'"; exit 1; }
+  echo "ok: inspector's address-index lookup found the busy address's $N entries at head $ACT_UNITS"
+fi
 
 echo "== all checks passed (anchor $ANCHOR)"
