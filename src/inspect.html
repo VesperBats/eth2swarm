@@ -280,22 +280,15 @@ function source(node) { return `<div class="muted" style="margin-bottom:8px">fro
 
 // ---- address index ----
 let addrView = '';
-async function showExamples() {
-  const node = $('node').value;
-  $('out-addr').innerHTML = '<div class="spinner">counting the example addresses…</div>';
-  const d = await api('addr/examples', params({ owner: $('owner').value.trim(), chain: $('chain').value, units: $('addrUnits').value }, node));
-  let html = source(node);
-  if (d.error) html += errCard(d.error);
-  html += indexCard(d.index);
-  if (d.examples) {
-    html += card('Example addresses', d.examples.length
-      ? '<table><tr><th>address</th><th></th><th>entries</th></tr>' + d.examples.map(e =>
-          `<tr><td>${e.entries ? addrLink(`lookup:${e.address}::`, e.address) : `<span class="mono muted">${esc(e.address)}</span>`}</td>` +
-          `<td>${esc(e.label)}</td><td>${e.entries ? e.entries : '<span class="muted">none in this period</span>'}</td></tr>`).join('') + '</table>' +
-        '<div class="muted" style="margin-top:8px">Counted from the buckets alone (no spill files): a click looks the address up.</div>'
-      : '<div class="muted">No example addresses for this chain ID.</div>');
-  }
-  $('out-addr').innerHTML = html;
+function examplesCard(list, units) {
+  if (!list.length) return card('Example addresses', '<div class="muted">No example addresses for this chain ID.</div>');
+  // A click looks the address up as of the head the count was made at.
+  const cell = e => e.error ? `<span class="badge warn">not counted</span> <span class="muted">${esc(e.error)}</span>`
+    : e.entries ? e.entries : '<span class="muted">none in this period</span>';
+  return card('Example addresses', '<table><tr><th>address</th><th></th><th>entries</th></tr>' + list.map(e =>
+      `<tr><td>${e.entries ? addrLink(`lookup:${e.address}:${units}:`, e.address) : `<span class="mono muted">${esc(e.address)}</span>`}</td>` +
+      `<td>${esc(e.label)}</td><td>${cell(e)}</td></tr>`).join('') + '</table>' +
+    '<div class="muted" style="margin-top:8px">Counted from the buckets alone (no spill files): a click looks the address up.</div>');
 }
 // A slice or bucket view carries the address it highlights, so a shared link shows it too.
 function withAddr(view, a) { return a ? `${view}:${a}` : view; }
@@ -344,7 +337,7 @@ const runners = {
     const a = $('addrA').value.trim();
     // A slice, bucket or spill view opened by a link or the URL; a lookup from the form
     // clears it.
-    const sub = /^(slice|bucket|spill):/.test(addrView) ? addrView
+    const sub = /^(slice|bucket|spill|examples):/.test(addrView) ? addrView
       : a ? `lookup:${a}:${$('addrUnits').value}:${$('addrSince').value}` : `index:${$('addrUnits').value}:${$('addrSince').value}`;
     setHash('addr', sub); busy('out-addr');
     const parts = sub.split(':');
@@ -352,7 +345,13 @@ const runners = {
     const va = parts[0] === 'slice' ? parts[3] : parts[0] === 'bucket' ? parts[4] : a;
     const base = { owner: $('owner').value.trim(), chain: $('chain').value, units: $('addrUnits').value, address: va || '' };
     let d, html = source(node);
-    if (parts[0] === 'slice') {
+    if (parts[0] === 'examples') {
+      d = await api('addr/examples', params({ owner: base.owner, chain: base.chain, units: parts[1] || '' }, node));
+      if (stale()) return;
+      if (d.error) html += errCard(d.error);
+      html += indexCard(d.index);
+      if (d.examples) html += examplesCard(d.examples, d.index ? d.index.head.units : '');
+    } else if (parts[0] === 'slice') {
       d = await api('addr/slice', params({ ...base, level: parts[1], index: parts[2] }, node));
       if (stale()) return;
       if (d.error) html += errCard(d.error);
@@ -525,6 +524,7 @@ function fromHash() {
     if (p[0] === 'index') { $('addrA').value = ''; $('addrUnits').value = p[1] || ''; $('addrSince').value = p[2] || ''; }
     if (p[0] === 'slice') $('addrA').value = p[3] || '';
     if (p[0] === 'bucket') $('addrA').value = p[4] || '';
+    if (p[0] === 'examples') { $('addrA').value = ''; $('addrUnits').value = p[1] || ''; }
   }
   if (tab === 'soc') {
     const i = val.indexOf(':');
@@ -566,7 +566,7 @@ document.querySelectorAll('form[data-run]').forEach(f => f.addEventListener('sub
   e.preventDefault(); if (f.dataset.run === 'addr') addrView = ''; run(f.dataset.run);
 }));
 document.querySelectorAll('input[name=socmode]').forEach(r => r.addEventListener('change', socMode));
-$('addrExamples').onclick = () => { show('addr'); showExamples().catch(e => { $('out-addr').innerHTML = errCard(String(e)); }); };
+$('addrExamples').onclick = () => { addrView = `examples:${$('addrUnits').value}`; run('addr'); };
 $('prev').onclick = () => { $('blockN').value = Math.max(0, +$('blockN').value - 1); run('block'); };
 $('next').onclick = () => { $('blockN').value = +$('blockN').value + 1; run('block'); };
 // hashchange covers link clicks, edits of the URL fragment and Back/Forward between

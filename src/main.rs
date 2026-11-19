@@ -287,8 +287,10 @@ enum Command {
         /// reachable only from the tailnet, and accept its MagicDNS name as Host.
         #[arg(long)]
         tailscale: bool,
-        /// Further host names the UI is opened by (repeatable), e.g. a DNS name of this
-        /// machine. IP addresses need no entry; unknown names are refused (DNS rebinding).
+        /// Further host names or IP addresses the UI is opened by (repeatable, without a
+        /// port), e.g. a DNS name of this machine or the address of a port forward. The
+        /// address listened on needs no entry, nor does any IP address when listening on
+        /// every address; unknown names are refused (DNS rebinding).
         #[arg(long = "allow-host")]
         allow_hosts: Vec<String>,
         /// Nodes to read from, as `name=url` (repeatable). Defaults to antd on :1733 and the
@@ -584,11 +586,7 @@ async fn main() -> Result<()> {
                 listen.set_ip(ip);
                 allow_hosts.extend(name);
             }
-            let hosts = inspect::HostPolicy::new(listen, &allow_hosts);
-            for h in &allow_hosts {
-                println!("  accepting Host {h}:{}", listen.port());
-            }
-            inspect::serve(listen, hosts, nodes, defaults).await?;
+            inspect::serve(listen, &allow_hosts, nodes, defaults).await?;
         }
     }
     Ok(())

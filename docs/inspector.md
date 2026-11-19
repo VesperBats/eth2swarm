@@ -50,14 +50,16 @@ bookmarkable.
     entries). Views are bookmarkable: `#addr/lookup:<address>:<units>:<since>`,
     `#addr/index:<units>:<since>` (the head without an address), `#addr/slice:<L>:<i>:<address>`,
     `#addr/bucket:<L>:<i>:<k>:<address>` (the address is optional and is what the view
-    highlights) and `#addr/spill:<L>:<i>:<ref>:<count>`. A lookup and a spill file show their
+    highlights), `#addr/spill:<L>:<i>:<ref>:<count>` and `#addr/examples:<units>`. A lookup and a spill file show their
     newest 500 entries (the API's `limit`), newest first, and always the full count.
   - A failed read keeps what was read before it: a lookup that fails in one slice still shows
     the head and the slice links, a bucket or spill view still shows the slice.
   - *Show example addresses*: well-known addresses of the chain (mainnet: tokens, the
     deposit contract, a router, block builders; dev chains: the Anvil accounts), each with
     the number of entries it has in the index, counted from the buckets alone (no spill
-    files). The index stores fingerprints, not addresses, so it cannot list its own.
+    files), read in parallel. An address whose bucket cannot be read shows why, and the others
+    are still counted. A click looks the address up as of the head the count was made at. The
+    index stores fingerprints, not addresses, so it cannot list its own.
   - The SOC tab decodes addr1 heads, slice descriptors and buckets too, with templates for
     `eth:<chain>:addr1:origin` and `eth:<chain>:addr1:slice:<L>:<i>`.
 
@@ -90,8 +92,10 @@ cargo run -- serve --tailscale        # this machine's Tailscale IPv4, port 8090
 cargo run -- serve --listen 0.0.0.0:8090   # every address (LAN included)
 ```
 
-`--tailscale` also accepts the machine's MagicDNS name (`http://<host>.<tailnet>.ts.net:8090/`).
-Requests are answered only for a `Host` header that is an IP address (the listen address,
-or any when listening on `0.0.0.0`), a loopback name, or a name given with `--allow-host`;
-other names are rejected, which keeps a web page from reaching the inspector through a DNS
-name it controls (DNS rebinding).
+`--tailscale` also accepts the machine's MagicDNS name (`http://<host>.<tailnet>.ts.net:8090/`);
+when `tailscale status` gives none, the inspector says so at startup and accepts only the IP.
+Requests are answered only for a `Host` header that is an IP address (the listen address, a
+loopback address, any when listening on `0.0.0.0`, or one given with `--allow-host`, e.g. a
+port forward's), a loopback name, or a name given with `--allow-host` (without a port: the
+port is always the one listened on); other names are rejected, which keeps a web page from
+reaching the inspector through a DNS name it controls (DNS rebinding).

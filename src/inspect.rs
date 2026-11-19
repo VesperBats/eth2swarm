@@ -9,7 +9,9 @@ use crate::addr::detect::role;
 use crate::addr::layout::{
     AddressRecord, BucketBody, BucketRecord, Entries, Entry, HeadRecord, SliceRecord,
 };
-use crate::addr::lookup::{lookup as addr_lookup, newest_head_by_probing, read_plan};
+use crate::addr::lookup::{
+    CONCURRENCY, address_records, lookup as addr_lookup, newest_head_by_probing, read_plan,
+};
 use crate::addr::slice::{SliceId, bucket_of, fingerprint, held};
 use crate::addr::verify::IndexReader;
 use crate::chain::{Body, check_body, header_field_count};
@@ -93,12 +95,20 @@ impl AppState {
     }
 }
 
+/// Serves the inspector on `listen`, answering the `Host` headers [`HostPolicy`] accepts for
+/// the address actually bound (with `allow_hosts`, further names or IP addresses).
 pub async fn serve(
     listen: SocketAddr,
-    hosts: HostPolicy,
+    allow_hosts: &[String],
     nodes: Vec<Node>,
     defaults: Defaults,
 ) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("binding {listen}"))?;
+    // The bound address: with port 0 the system picked the port.
+    let listen = listener.local_addr()?;
+    let hosts = HostPolicy::new(listen, allow_hosts)?;
     let state = Arc::new(AppState {
         nodes,
         defaults,
@@ -124,10 +134,10 @@ pub async fn serve(
              authentication; anyone who can reach it can read the configured nodes through it."
         );
     }
-    let listener = tokio::net::TcpListener::bind(listen)
-        .await
-        .with_context(|| format!("binding {listen}"))?;
     println!("Swarm inspector on http://{listen}/");
+    for h in allow_hosts {
+        println!("  accepting Host {h}:{}", listen.port());
+    }
     for n in &state.nodes {
         println!("  node {:<10} {}", n.name, n.url);
     }
@@ -144,33 +154,59 @@ pub async fn serve(
 pub struct HostPolicy {
     port: u16,
     listen_ip: std::net::IpAddr,
+    /// Further IP addresses the UI is opened by (a port forward, a proxy).
+    ips: Vec<std::net::IpAddr>,
     names: Vec<String>,
 }
 
 impl HostPolicy {
-    pub fn new(listen: SocketAddr, extra_names: &[String]) -> Self {
+    /// The policy for a server bound to `listen`, accepting `extra` too: host names or IP
+    /// addresses, without a port (the port is always the listen port).
+    pub fn new(listen: SocketAddr, extra: &[String]) -> Result<Self> {
         let mut names: Vec<String> = ["localhost".to_string()].into();
-        names.extend(
-            extra_names
-                .iter()
-                .map(|n| n.trim_end_matches('.').to_ascii_lowercase()),
-        );
-        Self {
+        let mut ips = Vec::new();
+        for h in extra {
+            let h = h.trim();
+            let bare = h
+                .strip_prefix('[')
+                .and_then(|v| v.strip_suffix(']'))
+                .unwrap_or(h);
+            if let Ok(ip) = bare.parse() {
+                ips.push(ip);
+                continue;
+            }
+            anyhow::ensure!(
+                !h.is_empty()
+                    && h.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-.".contains(c)),
+                "--allow-host {h:?}: a host name or IP address, without a port"
+            );
+            names.push(h.trim_end_matches('.').to_ascii_lowercase());
+        }
+        Ok(Self {
             port: listen.port(),
             listen_ip: listen.ip(),
+            ips,
             names,
-        }
+        })
     }
 
     /// Whether a request whose `Host` header is `host` is answered.
     pub fn allows(&self, host: &str) -> bool {
-        let (name, port) = split_host(host);
+        let Some((name, port)) = split_host(host) else {
+            return false;
+        };
         // A missing port is the scheme's default, which is ours only on port 80.
         if port.unwrap_or(80) != self.port {
             return false;
         }
         match name.parse::<std::net::IpAddr>() {
-            Ok(ip) => ip.is_loopback() || ip == self.listen_ip || self.listen_ip.is_unspecified(),
+            Ok(ip) => {
+                ip.is_loopback()
+                    || ip == self.listen_ip
+                    || self.listen_ip.is_unspecified()
+                    || self.ips.contains(&ip)
+            }
             Err(_) => {
                 let name = name.trim_end_matches('.').to_ascii_lowercase();
                 self.names.contains(&name)
@@ -180,25 +216,18 @@ impl HostPolicy {
 }
 
 /// `name:port`, `[v6]:port`, `name` or `[v6]` into the name (an IPv6 literal without brackets)
-/// and the port.
-fn split_host(host: &str) -> (&str, Option<u16>) {
+/// and the port; `None` for anything else (a malformed port, a stray bracket).
+fn split_host(host: &str) -> Option<(&str, Option<u16>)> {
     if let Some(rest) = host.strip_prefix('[') {
-        if let Some((ip, tail)) = rest.split_once(']') {
-            let port = tail.strip_prefix(':').and_then(|p| p.parse().ok());
-            return (
-                ip,
-                if tail.is_empty() {
-                    None
-                } else {
-                    port.or(Some(0))
-                },
-            );
+        let (ip, tail) = rest.split_once(']')?;
+        if tail.is_empty() {
+            return Some((ip, None));
         }
-        return (host, Some(0));
+        return Some((ip, Some(tail.strip_prefix(':')?.parse().ok()?)));
     }
     match host.rsplit_once(':') {
-        Some((name, port)) => (name, Some(port.parse().unwrap_or(0))),
-        None => (host, None),
+        Some((name, port)) => Some((name, Some(port.parse().ok()?))),
+        None => Some((host, None)),
     }
 }
 
@@ -240,14 +269,28 @@ pub fn tailscale_identity() -> Result<(std::net::IpAddr, Option<String>)> {
     let name = std::process::Command::new("tailscale")
         .args(["status", "--self", "--json"])
         .output()
-        .ok()
-        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
+        .context("running `tailscale status --self --json`")
+        .and_then(|o| {
+            anyhow::ensure!(o.status.success(), "it failed");
+            serde_json::from_slice::<Value>(&o.stdout).context("its output is not JSON")
+        })
         .and_then(|v| {
             v["Self"]["DNSName"]
                 .as_str()
                 .map(|s| s.trim_end_matches('.').to_string())
-        })
-        .filter(|s| !s.is_empty());
+                .filter(|s| !s.is_empty())
+                .context("it names no MagicDNS name (is MagicDNS on?)")
+        });
+    let name = match name {
+        Ok(n) => Some(n),
+        Err(e) => {
+            eprintln!(
+                "WARNING: no MagicDNS name for this machine ({e:#}): only {ip} is accepted as \
+                 Host; add a name with --allow-host"
+            );
+            None
+        }
+    };
     Ok((ip, name))
 }
 
@@ -893,45 +936,87 @@ async fn addr_examples_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
         let (head, index) = index_head(st, &q, &r, &origin, &p).await?;
         out["index"] = index;
         let (slices, _) = read_plan(&head, None)?;
-        let mut descriptors = Vec::with_capacity(slices.len());
-        for s in &slices {
-            descriptors.push(r.slice(*s, head.first_unit).await?);
-        }
+        let first_unit = head.first_unit;
+        let reads: Vec<_> = slices
+            .iter()
+            .map(|s| {
+                let (r, s) = (r.clone(), *s);
+                async move { r.slice(s, first_unit).await }
+            })
+            .collect();
+        let descriptors = bounded(reads)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
         let descriptors = Arc::new(descriptors);
-        let mut set = tokio::task::JoinSet::new();
-        for (i, (a, label)) in example_addresses(r.chain_id).iter().enumerate() {
+        let examples = example_addresses(r.chain_id);
+        // One job per address and slice; an address whose bucket cannot be read gets an
+        // error of its own, the others are still counted.
+        let mut jobs = Vec::new();
+        for (a, _) in examples {
             let address: Address = a.parse().expect("example addresses are valid");
-            let (r, descriptors) = (r.clone(), descriptors.clone());
-            set.spawn(async move {
-                let h = keccak256(address.as_slice());
-                let fp = fingerprint(&h);
-                let mut count = 0u64;
-                for rec in descriptors.iter() {
-                    let (_, records, _) = r
-                        .bucket_records(rec, bucket_of(&h, rec.bucket_count))
-                        .await?;
-                    for x in records.iter().filter(|x| x.fp == fp) {
-                        count += match &x.entries {
-                            Entries::Inline(e) => e.len() as u64,
-                            Entries::Spilled { count, .. } => *count,
-                        };
-                    }
+            let h = keccak256(address.as_slice());
+            for i in 0..descriptors.len() {
+                let (r, descriptors) = (r.clone(), descriptors.clone());
+                jobs.push(async move {
+                    let (records, _) = address_records(&r, &descriptors[i], &h).await?;
+                    Ok::<u64, anyhow::Error>(
+                        records
+                            .iter()
+                            .map(|x| match &x.entries {
+                                Entries::Inline(e) => e.len() as u64,
+                                Entries::Spilled { count, .. } => *count,
+                            })
+                            .sum(),
+                    )
+                });
+            }
+        }
+        let counts = bounded(jobs).await;
+        let n = descriptors.len();
+        let rows: Vec<Value> = examples
+            .iter()
+            .enumerate()
+            .map(|(k, (a, label))| {
+                let mine = &counts[k * n..(k + 1) * n];
+                match mine.iter().find_map(|c| c.as_ref().err()) {
+                    Some(e) => json!({ "address": a, "label": label, "entries": null,
+                                       "error": format!("{e:#}") }),
+                    None => json!({ "address": a, "label": label,
+                                    "entries": mine.iter().flatten().sum::<u64>() }),
                 }
-                Ok::<_, anyhow::Error>((
-                    i,
-                    json!({ "address": address, "label": label, "entries": count }),
-                ))
-            });
-        }
-        let mut found = Vec::new();
-        while let Some(done) = set.join_next().await {
-            found.push(done.context("example check panicked")??);
-        }
-        found.sort_by_key(|(i, _)| *i);
-        out["examples"] = json!(found.into_iter().map(|(_, v)| v).collect::<Vec<_>>());
+            })
+            .collect();
+        out["examples"] = json!(rows);
         Ok(())
     })
     .await
+}
+
+/// Runs `jobs`, at most [`CONCURRENCY`] at a time, and returns their results in order.
+async fn bounded<T, F>(jobs: impl IntoIterator<Item = F>) -> Vec<T>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut jobs = jobs.into_iter().enumerate();
+    let mut out: Vec<Option<T>> = Vec::new();
+    let mut set = tokio::task::JoinSet::new();
+    loop {
+        while set.len() < CONCURRENCY {
+            let Some((i, job)) = jobs.next() else { break };
+            out.push(None);
+            set.spawn(async move { (i, job.await) });
+        }
+        let Some(done) = set.join_next().await else {
+            break;
+        };
+        match done {
+            Ok((i, v)) => out[i] = Some(v),
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
+    }
+    out.into_iter().map(|v| v.expect("every job ran")).collect()
 }
 
 async fn addr_spill_handler(
@@ -1409,7 +1494,11 @@ mod tests {
 
     #[test]
     fn host_policy() {
-        let lo = HostPolicy::new("127.0.0.1:8090".parse().unwrap(), &[]);
+        let policy = |listen: &str, extra: &[&str]| {
+            let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+            HostPolicy::new(listen.parse().unwrap(), &extra).unwrap()
+        };
+        let lo = policy("127.0.0.1:8090", &[]);
         assert!(
             lo.allows("127.0.0.1:8090") && lo.allows("localhost:8090") && lo.allows("[::1]:8090")
         );
@@ -1419,19 +1508,32 @@ mod tests {
             "another IP when bound to loopback"
         );
         // On a Tailscale address with its MagicDNS name.
-        let ts = HostPolicy::new(
-            "100.64.0.1:8090".parse().unwrap(),
-            &["nuc.example.ts.net.".to_string()],
-        );
+        let ts = policy("100.64.0.1:8090", &["nuc.example.ts.net."]);
         assert!(ts.allows("100.64.0.1:8090") && ts.allows("NUC.example.ts.net:8090"));
         assert!(!ts.allows("192.168.1.5:8090") && !ts.allows("rebind.attacker.example:8090"));
         // On every address: any IP literal, still no unknown name.
-        let any = HostPolicy::new("0.0.0.0:8090".parse().unwrap(), &[]);
+        let any = policy("0.0.0.0:8090", &[]);
         assert!(any.allows("192.168.1.5:8090") && any.allows("[fe80::1]:8090"));
         assert!(!any.allows("rebind.attacker.example:8090") && !any.allows("192.168.1.5"));
         // Port 80 may be left out.
-        let p80 = HostPolicy::new("0.0.0.0:80".parse().unwrap(), &[]);
+        let p80 = policy("0.0.0.0:80", &[]);
         assert!(p80.allows("192.168.1.5") && p80.allows("localhost"));
+        // Further IP addresses (a port forward), and malformed ports or brackets refused.
+        let fwd = policy("127.0.0.1:8090", &["192.168.1.5", "[fe80::2]"]);
+        assert!(fwd.allows("192.168.1.5:8090") && fwd.allows("[fe80::2]:8090"));
+        assert!(!fwd.allows("192.168.1.6:8090"));
+        for bad in [
+            "localhost:abc",
+            "localhost:",
+            "[::1]x",
+            "[::1",
+            "[::1]:99999",
+        ] {
+            assert!(!lo.allows(bad), "{bad}");
+        }
+        // A name with a port is refused when the server starts, not silently never matched.
+        let with_port = vec!["nuc.lan:8090".to_string()];
+        assert!(HostPolicy::new("0.0.0.0:8090".parse().unwrap(), &with_port).is_err());
     }
 
     #[test]
