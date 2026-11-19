@@ -242,7 +242,9 @@ async fn soc_handler(State(st): State<Arc<AppState>>, Query(q): Query<SocQuery>)
 
 async fn soc_inspect(st: &AppState, q: SocQuery) -> Result<Value> {
     let mut derivation = Value::Null;
-    let (address, owner) = if let Some(a) = q.addr.as_deref().filter(|s| !s.trim().is_empty()) {
+    // The page sends `addr` only in by-address mode, so its presence picks the mode: a blank
+    // one is reported as a bad SOC address, not as a missing owner.
+    let (address, owner) = if let Some(a) = q.addr.as_deref() {
         // The owner is optional here; an unparsable one is reported, not fatal.
         let owner = match q.owner.as_deref().filter(|s| !s.trim().is_empty()) {
             Some(o) => match parse_owner(Some(o)) {
@@ -806,6 +808,27 @@ mod tests {
         h.transactions_root = keccak256(b"txs");
         h.ommers_hash = keccak256(b"uncles");
         assert_eq!(body_contents(&h), ["txs", "uncles", "withdrawals"]);
+    }
+
+    #[tokio::test]
+    async fn blank_soc_address_is_not_a_missing_owner() {
+        let st = AppState {
+            nodes: Vec::new(),
+            defaults: Defaults {
+                owner: None,
+                chain_id: 1,
+                anchor: None,
+            },
+        };
+        let q = SocQuery {
+            node: None,
+            addr: Some(String::new()),
+            owner: Some(String::new()),
+            id: None,
+            idstr: None,
+        };
+        let e = format!("{:#}", soc_inspect(&st, q).await.unwrap_err());
+        assert!(e.contains("SOC address must be 32 bytes of hex"), "{e}");
     }
 
     #[test]
