@@ -21,7 +21,7 @@ By default it offers these nodes (pick one in the header bar):
 
 Override with repeated `--node name=url`.
 
-Block and Epoch lookups, and SOC lookups by owner + identifier, need the SOC owner. Without
+Every lookup except Bytes and a SOC lookup by address needs the SOC owner. Without
 `--owner` / `ETH2SWARM_OWNER` the owner field starts empty and is outlined in amber; such a
 lookup then fails with "owner address is required" until an address is entered there.
 
