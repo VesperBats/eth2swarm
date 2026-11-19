@@ -70,7 +70,8 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
 <body>
 <header>
   <h1>Swarm <span>Inspector</span> <small class="muted" style="font-weight:400">eth2swarm</small>
-    <button type="button" class="ghost" id="reset" style="float:right;font-size:12px;padding:3px 8px" title="Reset node, owner, chain ID and anchor to the values ethswarm serve was started with">reset settings</button></h1>
+    <button type="button" class="ghost" id="reset" style="float:right;font-size:12px;padding:3px 8px" title="Reset node, owner, chain ID and anchor to the values ethswarm serve was started with">reset settings</button>
+    <a id="help" href="help" target="_blank" rel="noopener" class="ghost" style="float:right;margin-right:8px;font:600 12px var(--sans);padding:4px 10px;border:1px solid var(--line);border-radius:4px;color:var(--ink);text-decoration:none" title="What every field and term means, with annotated screenshots">help</a></h1>
   <div class="settings">
     <label>Node<select id="node"></select></label>
     <label>SOC owner<input id="owner" placeholder="0x… importer address" spellcheck="false"></label>
@@ -127,7 +128,8 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
     <div class="muted" style="margin:-8px 0 14px;font-size:12px">The addr1 address index of the SOC owner above on the chain ID above
       (eth2swarm <code>docs/address-index.md</code>). Every SOC signature, chunk and file reference is checked with the code
       <code>ethswarm addr-lookup</code> uses. Don't know an address with entries?
-      <button type="button" class="ref" id="addrExamples">Show example addresses</button> (well-known addresses of the chain, counted against the index).</div>
+      <button type="button" class="ref" id="addrExamples">Show example addresses</button> (well-known addresses of the chain, counted against the index).
+      <a href="help#addr" target="_blank" rel="noopener">What do slice, bucket, slot and roles mean?</a></div>
     <div id="out-addr"></div>
   </section>
   <section id="tab-bytes" class="hidden">

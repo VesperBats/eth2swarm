@@ -23,7 +23,7 @@ use alloy::primitives::{Address, B256, keccak256};
 use alloy::rlp::Decodable;
 use alloy::transports::http::reqwest::Url;
 use anyhow::{Context, Result, anyhow, bail};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -35,6 +35,29 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 const PAGE: &str = include_str!("inspect.html");
+
+/// The help page (`/help`) and its screenshots (`/help/<name>.webp`), embedded like the page.
+/// `scripts/inspector-help-shots.mjs` takes the screenshots from a running inspector.
+const HELP: &str = include_str!("help/help.html");
+/// One embedded screenshot: its file name and bytes.
+macro_rules! help_image {
+    ($name:literal) => {
+        ($name, include_bytes!(concat!("help/", $name)))
+    };
+}
+const HELP_IMAGES: &[(&str, &[u8])] = &[
+    help_image!("header.webp"),
+    help_image!("addr-lookup.webp"),
+    help_image!("addr-slice.webp"),
+    help_image!("addr-bucket.webp"),
+    help_image!("addr-spill.webp"),
+    help_image!("addr-examples.webp"),
+    help_image!("block-verify.webp"),
+    help_image!("block-record.webp"),
+    help_image!("epoch.webp"),
+    help_image!("soc.webp"),
+    help_image!("bytes.webp"),
+];
 
 /// A named Swarm node the UI can read from.
 #[derive(Clone)]
@@ -114,6 +137,8 @@ pub async fn serve(
     });
     let app = Router::new()
         .route("/", get(|| async { Html(PAGE) }))
+        .route("/help", get(|| async { Html(HELP) }))
+        .route("/help/{file}", get(help_image))
         .route("/api/config", get(config))
         .route("/api/soc", get(soc_handler))
         .route("/api/block", get(block_handler))
@@ -321,6 +346,20 @@ impl IntoResponse for ApiResult {
             Json(body),
         )
             .into_response()
+    }
+}
+
+async fn help_image(Path(file): Path<String>) -> Response {
+    match HELP_IMAGES.iter().find(|(name, _)| *name == file) {
+        Some((_, bytes)) => (
+            [
+                (header::CONTENT_TYPE, "image/webp"),
+                (header::CACHE_CONTROL, "max-age=3600"),
+            ],
+            *bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -1516,6 +1555,36 @@ async fn bytes_inspect(st: &AppState, q: BytesQuery) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_images_match_the_page() {
+        let referenced: std::collections::BTreeSet<&str> = HELP
+            .split("src=\"help/")
+            .skip(1)
+            .map(|s| &s[..s.find('"').unwrap()])
+            .collect();
+        let served: std::collections::BTreeSet<&str> =
+            HELP_IMAGES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(referenced, served, "help.html and HELP_IMAGES disagree");
+        for (name, bytes) in HELP_IMAGES {
+            assert!(
+                bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+                "{name} is not a WebP image"
+            );
+        }
+    }
+
+    #[test]
+    fn help_page_anchors_exist() {
+        // Every in-page link (`href="#x"`) has its target (`id="x"`).
+        for link in HELP.split("href=\"#").skip(1) {
+            let id = &link[..link.find('"').unwrap()];
+            assert!(
+                HELP.contains(&format!("id=\"{id}\"")),
+                "help.html links to #{id}, which has no id"
+            );
+        }
+    }
     use alloy::consensus::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
 
     fn header() -> Header {

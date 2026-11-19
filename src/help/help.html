@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swarm Inspector help</title>
+<style>
+:root {
+  --bg: #f6f5f1; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a64; --line: #e3e1da;
+  --accent: #d9661f; --callout: #7b2cbf; --code: #f0eee8; --warn: #b7791f;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151514; --panel: #1e1e1c; --ink: #ecebe6; --muted: #9a988f; --line: #33322e;
+          --accent: #f08a3e; --callout: #b57be8; --code: #262624; --warn: #e0a84a; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.6 var(--sans); }
+header { padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { margin: 0; font-size: 18px; }
+header h1 span { color: var(--accent); }
+header a { color: var(--accent); font-size: 13px; }
+.layout { display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 28px; max-width: 1320px; padding: 0 20px; }
+nav.toc { position: sticky; top: 0; align-self: start; max-height: 100vh; overflow: auto; padding: 18px 0; font-size: 13.5px; }
+nav.toc a { display: block; color: var(--muted); text-decoration: none; padding: 2px 0; }
+nav.toc a:hover { color: var(--ink); }
+nav.toc a.sub { padding-left: 14px; }
+main { padding: 6px 0 80px; min-width: 0; }
+h2 { font-size: 22px; margin: 36px 0 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+h3 { font-size: 17px; margin: 28px 0 6px; }
+p, li { max-width: 78ch; }
+code, .mono { font-family: var(--mono); font-size: 0.88em; background: var(--code); padding: 1px 4px; border-radius: 3px; }
+a { color: var(--accent); }
+a.g { color: inherit; text-decoration: underline dotted var(--accent); text-underline-offset: 3px; }
+figure { margin: 14px 0 6px; }
+figure img { display: block; max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 6px; }
+figcaption { font-size: 13px; color: var(--muted); margin-top: 4px; }
+ol.callouts { list-style: none; padding: 0; margin: 10px 0 0; counter-reset: c; }
+ol.callouts li { position: relative; padding: 3px 0 3px 34px; margin: 2px 0; max-width: 90ch; }
+ol.callouts li::before { counter-increment: c; content: counter(c); position: absolute; left: 0; top: 4px;
+  width: 22px; height: 22px; border-radius: 50%; background: var(--callout); color: #fff;
+  font: 700 12.5px/22px var(--sans); text-align: center; }
+.look { background: var(--panel); border-left: 3px solid var(--accent); padding: 8px 14px; margin: 12px 0; max-width: 86ch; }
+.look b { color: var(--accent); }
+.warnbox { border-left-color: var(--warn); }
+table { border-collapse: collapse; margin: 10px 0; font-size: 14px; }
+td, th { text-align: left; padding: 4px 12px 4px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+pre { background: var(--code); padding: 10px 12px; border-radius: 4px; overflow: auto; font: 13px/1.5 var(--mono); max-width: 90ch; }
+dl.glossary dt { font-weight: 700; margin-top: 14px; scroll-margin-top: 10px; }
+dl.glossary dd { margin: 2px 0 0 0; max-width: 80ch; }
+:target { background: color-mix(in srgb, var(--accent) 14%, transparent); border-radius: 3px; }
+@media (max-width: 860px) { .layout { grid-template-columns: 1fr; } nav.toc { position: static; max-height: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Swarm <span>Inspector</span> help</h1>
+  <a href="./">← back to the inspector</a>
+</header>
+<div class="layout">
+<nav class="toc">
+  <a href="#start">The settings bar</a>
+  <a href="#owner">Where the owner comes from</a>
+  <a href="#addr">Address index</a>
+  <a class="sub" href="#addr-model">How the index is built</a>
+  <a class="sub" href="#addr-lookup">Looking up an address</a>
+  <a class="sub" href="#addr-slice">A slice</a>
+  <a class="sub" href="#addr-bucket">A bucket</a>
+  <a class="sub" href="#addr-spill">A spill file</a>
+  <a class="sub" href="#addr-examples">Example addresses</a>
+  <a href="#block">Block</a>
+  <a href="#epoch">Epoch</a>
+  <a href="#soc">SOC</a>
+  <a href="#bytes">Bytes</a>
+  <a href="#errors">Errors and warnings</a>
+  <a href="#glossary">Glossary A–Z</a>
+</nav>
+<main>
+
+<p>The inspector shows what the Swarm nodes hold for eth2swarm: Ethereum blocks stored as
+<a class="g" href="#g-soc">SOCs</a> (the Block, Epoch, SOC and Bytes tabs) and the
+<a class="g" href="#g-address-index">address index</a> (the Address index tab). Everything it
+shows is checked with the same code the <code>ethswarm</code> command-line client uses, so a
+green check here means the client would accept the data too. Underlined terms link to the
+<a href="#glossary">glossary</a>.</p>
+
+<h2 id="start">The settings bar</h2>
+<p>The bar at the top applies to every tab.</p>
+<figure><img src="help/header.webp" alt="The inspector's header: node, SOC owner, chain ID and trust anchor fields, the tabs, and the reset and help buttons" width="1240"></figure>
+<ol class="callouts">
+  <li><b>Node</b>: the Bee or ant node the inspector reads from. Every chunk is fetched through
+    it, so switching nodes shows what <em>that</em> node can retrieve. Each result says which
+    node it came from.</li>
+  <li><b>SOC owner</b>: the <a class="g" href="#g-owner">owner</a>, the Ethereum address of the
+    key that imported the data. Every lookup except Bytes and a SOC lookup by address needs it.
+    See <a href="#owner">where the owner comes from</a>.</li>
+  <li><b>Chain ID</b>: which chain the data is about (1 = Ethereum mainnet, 1337 = the
+    bee-factory dev chain). It is part of every <a class="g" href="#g-identifier">identifier</a>,
+    so a wrong chain ID finds nothing.</li>
+  <li><b>Trust anchor</b>: the 32-byte <a class="g" href="#g-anchor">trust anchor</a> blocks are
+    verified against. Leave it blank to use the owner's
+    <a class="g" href="#g-published-anchor">published anchor</a>; the verdict is then amber, not
+    green. The address index does not use it.</li>
+  <li><b>Tabs</b>: what to look at. The URL fragment (<code>#block/97</code>,
+    <code>#addr/lookup:…</code>) names the view, so a view can be bookmarked or shared.</li>
+  <li><b>reset settings</b>: back to the node, owner, chain ID and anchor <code>ethswarm serve</code>
+    was started with. The browser keeps your own values otherwise.</li>
+  <li><b>help</b>: this page.</li>
+</ol>
+
+<h2 id="owner">Where the owner comes from</h2>
+<p>The owner cannot be discovered from Swarm. A SOC's address is
+<code>keccak256(identifier ‖ owner)</code>, so the data can only be found once the owner is known,
+and nodes have no "list owners" API. Choosing an owner is also choosing whom to trust. Ways to
+get it:</p>
+<ul>
+  <li><b>Start the inspector with it</b>: <code>ethswarm serve --owner 0x…</code> or
+    <code>ETH2SWARM_OWNER=0x…</code> fills the field for everyone who opens the page.</li>
+  <li><b>An export directory</b> (<code>addr-import --out &lt;dir&gt;</code>): its
+    <code>addr1-export.json</code> holds <code>owner</code> and <code>chain_id</code>.</li>
+  <li><b>The importer's key</b>: <code>cast wallet address --private-key $ETH2SWARM_KEY</code>.
+    <code>addr-upload</code> and <code>addr-verify</code> also print the owner.</li>
+  <li><b>Any one of its SOCs</b>: open it in the <a href="#soc">SOC tab</a> by
+    <em>SOC address</em>; the <a class="g" href="#g-recovered-signer">recovered signer</a> is the
+    owner.</li>
+  <li><b>The bee-factory dev chain</b>: the Anvil dev key,
+    <code>0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266</code>, chain ID 1337.</li>
+</ul>
+
+<h2 id="addr">Address index</h2>
+<p>The address index lists the transactions an Ethereum address
+<a class="g" href="#g-appearance">appears in</a>, newest first, without downloading the chain.
+The tab reads it as <code>ethswarm addr-lookup</code> does and checks every SOC signature, chunk
+and file reference on the way. The full design is <code>docs/address-index.md</code>.</p>
+
+<h3 id="addr-model">How the index is built</h3>
+<p>Five nested ideas explain every number on this tab:</p>
+<pre>chain ──cut into──▶ units (64 blocks each)
+units ──grouped into──▶ slices (L, i): 2^L units each, merged like a binary counter
+slice ──hashed into──▶ buckets: one SOC each, about 2.8 KB
+bucket ──holds──▶ address records: one per address, found by its fingerprint
+record ──holds──▶ entries: (block, slot, roles), or a reference to a spill file</pre>
+<ul>
+  <li>A <a class="g" href="#g-unit">unit</a> is 64 finalized blocks. The
+    <a class="g" href="#g-head">head</a> says how many units the index has
+    (<a class="g" href="#g-units">units</a>), so it covers blocks up to
+    <code>units × 64 − 1</code>.</li>
+  <li>A <a class="g" href="#g-slice">slice</a> <code>(L, i)</code> holds units
+    <code>i·2<sup>L</sup></code> to <code>(i+1)·2<sup>L</sup> − 1</code>.
+    <a class="g" href="#g-level">Level</a> 0 is one unit (64 blocks), level 10 is 1,024 units
+    (65,536 blocks, about 9 days), level 16, the top, about 1.6 years. Slices are never changed:
+    two neighbouring slices of one level are merged into a new one of the next level, like a
+    binary counter carrying.</li>
+  <li>The few slices that together hold every unit exactly once are the
+    <a class="g" href="#g-cover">cover</a>. A lookup reads one bucket from each slice of the
+    cover, so a full-history lookup costs a handful of chunks.</li>
+  <li>A slice spreads its addresses over <a class="g" href="#g-bucket">buckets</a> by their hash.
+    Each bucket is one SOC holding the <a class="g" href="#g-record">records</a> of the
+    addresses that hash into it. Records carry an 8-byte
+    <a class="g" href="#g-fingerprint">fingerprint</a>, not the address itself.</li>
+  <li>A record's <a class="g" href="#g-entry">entries</a> say where the address appears: the
+    <a class="g" href="#g-block">block</a>, the <a class="g" href="#g-slot">slot</a> (which
+    transaction, or the block itself) and the <a class="g" href="#g-roles">roles</a> (sender,
+    recipient, log emitter, …). An address with many entries keeps them in a
+    <a class="g" href="#g-spill-file">spill file</a> instead.</li>
+</ul>
+
+<h3 id="addr-lookup">Looking up an address</h3>
+<p>Type an address and press <b>Look up</b>. Here: vitalik.eth on the mainnet index.</p>
+<figure><img src="help/addr-lookup.webp" alt="An address lookup: the query form, the Address index card and the list of appearances" width="1240">
+<figcaption>The entry list is shortened in this picture.</figcaption></figure>
+<ol class="callouts">
+  <li><b>Address</b>: the address to look up. Leave it blank to see only the index (its head
+    and cover).</li>
+  <li><b>Head units</b>: blank uses the newest <a class="g" href="#g-head">head</a> found. A
+    number reads the index as it was at that many <a class="g" href="#g-units">units</a>: the
+    same slices and entries a client with that head would have seen.</li>
+  <li><b>Since unit</b>: blank reads everything. A unit number reads only what is newer, as an
+    <a class="g" href="#g-incremental">incremental sync</a> does: fewer slices, and entries
+    before that unit dropped.</li>
+  <li><b>owner / chain</b>: whose index this is and for which chain.</li>
+  <li><b>covers</b>: the blocks the index holds. An amber badge means the index
+    <a class="g" href="#g-first-block">starts at a later block</a>: earlier blocks are
+    <em>not covered</em>, which is not the same as "no entries there".</li>
+  <li><b>head</b>: the <a class="g" href="#g-head-update">head update</a> used and its
+    <a class="g" href="#g-units">units</a>. In brackets, how it was found: the inspector
+    <a class="g" href="#g-probe">probes</a> head updates until one is missing.</li>
+  <li><b>probe stopped at</b>: the chunk whose fetch ended the search, with Bee's error. A
+    <code>500 read chunk failed</code> here is normal: it is usually the next head update, which
+    is not published yet.</li>
+  <li><b>pending merges</b>: <a class="g" href="#g-pending">merged slices</a> still being
+    uploaded. A lookup reads the smaller slices they replace instead, so this only costs a few
+    more chunks. Usually <em>none</em>.</li>
+  <li><b>origin</b>: the <a class="g" href="#g-origin">origin</a>, a copy of the index's first
+    head, read once to know where head updates start.</li>
+  <li><b>slices a lookup reads</b>: the <a class="g" href="#g-cover">cover</a>, newest first.
+    Each <code>(L, i)</code> opens <a href="#addr-slice">that slice</a>.</li>
+  <li><b>N appearances of …</b>: how many <a class="g" href="#g-entry">entries</a> the address
+    has in the blocks looked at.</li>
+  <li><b>blocks looked at</b>: the block range the lookup read (with <em>Since unit</em>, only
+    the newer part).</li>
+  <li><b>slices / files read</b>: how many slices were read, and how many
+    <a class="g" href="#g-spill-file">spill files</a>. 0 files means every record was inline in
+    its bucket.</li>
+  <li><b>roles the index detects</b>: which <a class="g" href="#g-roles">roles</a> the importer
+    looked for. Without <code>trace</code>, addresses that only occur inside internal calls (a
+    multisig paying out, a router forwarding) are missing.</li>
+  <li><b>slot</b>: <code>tx N</code> is the transaction with index N in the block;
+    <code>block</code> means the address appears in the block itself (fee recipient,
+    withdrawal, uncle miner). See <a class="g" href="#g-slot">slot</a>.</li>
+  <li><b>roles</b>: how the address took part, e.g. <code>from</code> (sent it),
+    <code>to</code> (received it), <code>topic</code> (named in a log, typically a token
+    transfer), <code>word</code> (an address-shaped value in the data). Several roles are joined
+    with <code>|</code>. See <a class="g" href="#g-roles">roles</a>.</li>
+</ol>
+<div class="look"><b>What to look for.</b> The newest entry should be close to the end of
+<em>covers</em>; the index runs up to about half an hour behind the chain, plus upload time. An entry's
+block and <code>tx</code> number find the transaction in any block explorer. An address with no
+entries gets "0 appearances", not an error: the buckets were read, and its fingerprint was not
+in them.</div>
+
+<h3 id="addr-slice">A slice</h3>
+<p>A click on a slice in the lookup opens its descriptor, the
+<a class="g" href="#g-slice-record">slice record</a>.</p>
+<figure><img src="help/addr-slice.webp" alt="A slice view: its blocks, bucket count, address and appearance counts, buckets root and detected roles, with a bucket picker" width="1240"></figure>
+<ol class="callouts">
+  <li><b>blocks</b>: the blocks the slice holds. For the slice the index start falls into, this
+    begins at the start, not at the slice's usual first block.</li>
+  <li><b>last block hash</b>: the hash of the slice's last block. This binds the slice to the
+    chain: compare it with the block hash an explorer shows for that block.</li>
+  <li><b>buckets</b>: the <a class="g" href="#g-bucket-count">bucket count</a>
+    <code>B</code>. Buckets <code>0 … B−1</code> all exist.</li>
+  <li><b>addresses / appearances</b>: distinct addresses in the slice, and its
+    <a class="g" href="#g-entry">entries</a> in total.</li>
+  <li><b>buckets root</b>: a <a class="g" href="#g-buckets-root">Merkle root</a> over all
+    buckets. Two importers who built the same slice get the same root.</li>
+  <li><b>roles detected</b>: the <a class="g" href="#g-roles">roles</a> the importer looked for
+    in this slice.</li>
+  <li><b>Bucket</b>: open any bucket by number.</li>
+  <li><b>The address's bucket</b>: the bucket the looked-up address hashes into, which is the
+    one a lookup reads.</li>
+</ol>
+
+<h3 id="addr-bucket">A bucket</h3>
+<p>One bucket of a slice: the <a class="g" href="#g-record">address records</a> it holds. Here,
+the bucket of USDT's token contract in a level-6 slice.</p>
+<figure><img src="help/addr-bucket.webp" alt="A bucket view: records by fingerprint, the looked-up address highlighted, inline entries and links to spill files" width="1240">
+<figcaption>Shortened: a bucket holds about 100–150 records.</figcaption></figure>
+<ol class="callouts">
+  <li><b>Bucket k of slice (L, i)</b>: which bucket this is. A
+    <a class="g" href="#g-paged">paged</a> bucket says so here, with its page count.</li>
+  <li><b>fingerprint</b>: the record's <a class="g" href="#g-fingerprint">fingerprint</a>, 8
+    bytes of the address's hash. The bucket does not store addresses: you can check that an
+    address is in it, but not list who is.</li>
+  <li><b>entries</b>: how many <a class="g" href="#g-entry">entries</a> the record has.</li>
+  <li><b>block/slot · roles</b>: the entries themselves when they fit inline:
+    <code>block/tx N</code> or <code>block/blk</code> (the block itself), then the roles.</li>
+  <li><b>address</b> badge: the record whose fingerprint matches the address in the URL, the
+    one a lookup reads.</li>
+  <li><b>spill file</b>: this record's entries did not fit (more than 256 bytes), so the bucket
+    holds only their count and a reference to a <a class="g" href="#g-spill-file">spill
+    file</a>. The link opens it.</li>
+  <li>An inline record: its entries are right here in the bucket.</li>
+</ol>
+
+<h3 id="addr-spill">A spill file</h3>
+<figure><img src="help/addr-spill.webp" alt="A spill file view: entry count, reference and the newest entries" width="1240">
+<figcaption>Shortened: the view shows the newest 500 entries.</figcaption></figure>
+<ol class="callouts">
+  <li><b>Spill file — N entries</b>: the record's full entry count. The view lists the newest
+    500, newest first.</li>
+  <li><b>reference</b>: the file's Swarm reference (open it in the <a href="#bytes">Bytes
+    tab</a> to see the raw pages).</li>
+  <li><b>block</b>, <b>slot</b>, <b>roles</b>: as in a lookup. The busy token contracts are
+    mostly <code>emitter</code>: they emit a Transfer log in every transaction that moves the
+    token.</li>
+</ol>
+
+<h3 id="addr-examples">Example addresses</h3>
+<p>Don't know an address with entries? <b>Show example addresses</b> counts well-known ones
+(tokens, the deposit contract, block builders; on a dev chain, the Anvil accounts).</p>
+<figure><img src="help/addr-examples.webp" alt="The example addresses with their entry counts" width="1240"></figure>
+<ol class="callouts">
+  <li><b>Show example addresses</b>: runs the count.</li>
+  <li>An address with entries is a link: a click looks it up as of the head the count used.</li>
+  <li><b>entries</b>: counted from the buckets alone, in parallel, without reading spill files.
+    <em>none in this period</em> means the address is not in the blocks the index covers.</li>
+</ol>
+
+<h2 id="block">Block</h2>
+<p>Fetches the <a class="g" href="#g-header-record">header record</a> of block <em>n</em> and
+runs every check the client runs, one by one. It needs the owner and the chain ID; the trust
+anchor decides whether the verdict is green or amber.</p>
+<figure><img src="help/block-verify.webp" alt="The Block tab: block number, verdict and the verification steps" width="1240"></figure>
+<ol class="callouts">
+  <li><b>Block number</b>: the block to fetch.</li>
+  <li><b>◀ ▶</b>: previous and next block.</li>
+  <li><b>Verdict</b>: green ✓ verified against a pinned anchor; amber ⚠ verified, but only
+    against the owner's <a class="g" href="#g-published-anchor">published anchor</a>, which
+    trusts the publisher; red ✗ a check failed (the failing step says which).</li>
+  <li><b>trust anchor</b>: which <a class="g" href="#g-anchor">anchor</a> was used, pinned or
+    published.</li>
+  <li><b>fetch header SOC</b>: the SOC address computed from the owner and the
+    <a class="g" href="#g-identifier-string">identifier string</a>
+    <code>eth:&lt;chain&gt;:&lt;anchor&gt;:hdr:&lt;n&gt;</code>, and its fetch.</li>
+  <li><b>SOC signature</b>: the chunk is signed by the owner.</li>
+  <li><b>accumulator proof → anchor</b>: the block hash, with the
+    <a class="g" href="#g-epoch-proof">epoch</a> and <a class="g" href="#g-master-proof">master</a>
+    proofs, hashes up to the anchor. This is the check that ties the block to the anchor.</li>
+  <li><b>body matches header roots</b>: the <a class="g" href="#g-body">body</a> hashes to the
+    header's transactions, ommers and withdrawals roots.</li>
+</ol>
+<figure><img src="help/block-record.webp" alt="The Block tab, further down: SOC location, the header record with its proofs, and the decoded header" width="1240"></figure>
+<ol class="callouts">
+  <li><b>identifier string</b>: the text whose keccak256 is the SOC's
+    <a class="g" href="#g-identifier">identifier</a>.</li>
+  <li><b>SOC address</b>: <code>keccak256(identifier ‖ owner)</code>, where the chunk lives.</li>
+  <li><b>geometry</b>: <a class="g" href="#g-epoch">epochs</a> × epoch size = the blocks the
+    accumulator covers.</li>
+  <li><b>block hash</b>: keccak256 of the header's RLP, recomputed here (it is not stored).</li>
+  <li><b>body ref</b>: the Swarm reference of the block's <a class="g" href="#g-body">body</a>;
+    the link opens it in the Bytes tab.</li>
+  <li><b>epoch proof</b>: sibling hashes from the block up to its
+    <a class="g" href="#g-epoch-root">epoch root</a>.</li>
+  <li><b>master proof</b>: sibling hashes from the epoch root up to the master root, which with
+    the geometry gives the anchor.</li>
+  <li><b>Decoded header</b>: the header fields. A parent hash links to the previous block.</li>
+  <li><b>fields</b>: how many fields the header has, which tells the fork it is from.</li>
+</ol>
+
+<h2 id="epoch">Epoch</h2>
+<p>Fetches an <a class="g" href="#g-epoch">epoch</a>'s record and its header file and verifies
+every header in it.</p>
+<figure><img src="help/epoch.webp" alt="The Epoch tab: verdict, epoch record, and the epoch's headers" width="1240">
+<figcaption>The header list is shortened in this picture.</figcaption></figure>
+<ol class="callouts">
+  <li><b>Verdict</b>: as in the Block tab, for all headers of the epoch.</li>
+  <li><b>signed by owner</b>: the record's signature was checked against the configured owner.
+    <em>unverified</em> means it was not, or failed.</li>
+  <li><b>epoch root</b>: the Merkle root over the epoch's block hashes.</li>
+  <li><b>headers file</b>: the Swarm reference of the epoch's concatenated headers.</li>
+  <li><b>master proof</b>: from the epoch root up to the anchor.</li>
+  <li><b>body</b>: what each block's body holds (<code>txs</code>, <code>uncles</code>,
+    <code>withdrawals</code>), read from its header's roots; <em>empty</em> means nothing. A click
+    on the number opens the block.</li>
+</ol>
+
+<h2 id="soc">SOC</h2>
+<p>Any single <a class="g" href="#g-soc">SOC</a>, decoded down to its fields. It recognises
+every eth2swarm record: block headers, epochs, the published anchor, and the address index's
+heads, slice descriptors and buckets.</p>
+<figure><img src="help/soc.webp" alt="The SOC tab: lookup modes, address derivation and the decoded chunk" width="1240"></figure>
+<ol class="callouts">
+  <li><b>Mode</b>: find the SOC by owner + <a class="g" href="#g-identifier-string">identifier
+    string</a>, by owner + identifier in hex, or by its SOC address (owner optional).</li>
+  <li><b>Input</b>: the identifier string, identifier or address.</li>
+  <li><b>Templates</b>: fill in the identifier strings eth2swarm uses
+    (<code>hdr:&lt;n&gt;</code>, <code>epoch:&lt;k&gt;</code>, <code>accumulator</code>,
+    <code>addr1:origin</code>, <code>addr1:slice:&lt;L&gt;:&lt;i&gt;</code>).</li>
+  <li><b>identifier</b>: keccak256 of the identifier string.</li>
+  <li><b>SOC address</b>: keccak256(identifier ‖ owner).</li>
+  <li><b>signature</b>: the owner's signature over the identifier and the content address.</li>
+  <li><b>span</b>: the payload's length as the chunk declares it.</li>
+  <li><b>signed CAC address</b>: the content address of the payload that was signed
+    (<a class="g" href="#g-cac">CAC</a>).</li>
+  <li><b>recovered signer</b>: the address recovered from the signature. It is the
+    <a class="g" href="#g-owner">owner</a>; this is how a SOC reveals its owner.</li>
+  <li><b>address = keccak(id ‖ signer)</b>: the chunk sits at the address its signer and
+    identifier give. ✗ means it does not belong there.</li>
+  <li><b>signer = configured owner</b>: the signer is the owner in the settings bar.
+    <em>n/a</em> when no owner was given.</li>
+  <li><b>Payload</b>: the raw payload in hex. Below the picture, the decoded record follows.</li>
+</ol>
+
+<h2 id="bytes">Bytes</h2>
+<p>Fetches a Swarm file by its reference (<code>/bytes</code>) and decodes it if it can: a block
+body, an epoch's header file, or text; otherwise a hex preview.</p>
+<figure><img src="help/bytes.webp" alt="The Bytes tab: a block body decoded from its reference" width="1240"></figure>
+<ol class="callouts">
+  <li><b>Bytes reference</b>: 64 hex characters, e.g. a body ref, headers file or spill file.</li>
+  <li><b>size</b>: the file's length and how many 4 KB data chunks it spans.</li>
+  <li><b>decoded as</b>: what the bytes were recognised as.</li>
+  <li>The decoded content, here a block body: its transactions with recovered senders.</li>
+</ol>
+
+<h2 id="errors">Errors and warnings</h2>
+<table>
+<tr><th>Message</th><th>Meaning and what to do</th></tr>
+<tr><td><code>owner address is required</code></td><td>The SOC owner field is empty. Enter the
+importer's address, or start <code>ethswarm serve</code> with <code>--owner</code>. See
+<a href="#owner">where the owner comes from</a>.</td></tr>
+<tr><td><code>no address index of owner … on chain … could be read from this node</code></td>
+<td>The <a class="g" href="#g-origin">origin</a> was not found: a wrong owner, a wrong chain ID,
+or a node that cannot retrieve it. Check those three first.</td></tr>
+<tr><td><code>500 Internal Server Error: read chunk failed</code></td><td>Bee could not find the
+chunk. It answers a chunk that does not exist and one it cannot reach the same way. Under
+<em>probe stopped at</em> it is expected (the next head update does not exist yet).</td></tr>
+<tr><td>Amber ⚠ verdict</td><td>Verified, but against the owner's
+<a class="g" href="#g-published-anchor">published anchor</a>. Pin an anchor to verify on your
+own terms.</td></tr>
+<tr><td><em>unverified</em> badge</td><td>The record's signature was not checked against an
+owner (none was given) or did not match it.</td></tr>
+<tr><td><em>earlier blocks are not covered</em></td><td>The index
+<a class="g" href="#g-first-block">starts at a later block</a>; it says nothing about the blocks
+before.</td></tr>
+<tr><td><code>slice (L, i) ends before the index starts</code></td><td>That slice holds only
+blocks before the index's start, so it was never written.</td></tr>
+</table>
+
+<h2 id="glossary">Glossary A–Z</h2>
+<dl class="glossary">
+<dt id="g-accumulator">Accumulator</dt>
+<dd>The Merkle structure over all block hashes of the block store: one tree per
+<a href="#g-epoch">epoch</a>, and a master tree over the epoch roots. It hashes down to the
+<a href="#g-anchor">trust anchor</a>, so one 32-byte value vouches for every block.</dd>
+
+<dt id="g-address-index">Address index (addr1)</dt>
+<dd>The index from an address to the blocks and transactions it appears in, stored on Swarm
+under the owner's key. <code>addr1</code> is its format version: a change of its parameters
+would be a new name.</dd>
+
+<dt id="g-addresses">Addresses (count)</dt>
+<dd>The number of distinct addresses in a <a href="#g-slice">slice</a>, which is also its number of
+<a href="#g-record">records</a>.</dd>
+
+<dt id="g-anchor">Anchor, trust anchor</dt>
+<dd>A 32-byte hash of the <a href="#g-accumulator">accumulator</a>'s master root and its
+geometry. Blocks verified against an anchor you pinned yourself are trusted only as far as that
+anchor is. It is also part of the block store's identifiers, so each import has its own set of
+SOCs.</dd>
+
+<dt id="g-appearance">Appearance</dt>
+<dd>An address occurring at a (block, slot) in some <a href="#g-roles">role</a>. All appearances
+of one address at one (block, slot) are merged into one <a href="#g-entry">entry</a>.</dd>
+
+<dt id="g-appearances">Appearances (count)</dt>
+<dd>The number of <a href="#g-entry">entries</a> in a slice, or found for an address.</dd>
+
+<dt id="g-block">Block</dt>
+<dd>In an entry: the block number the address appears in.</dd>
+
+<dt id="g-body">Body, body ref</dt>
+<dd>A block's transactions, ommers (uncles) and withdrawals, stored as a Swarm file. The header
+record holds its reference (body ref); the body is checked against the header's roots.</dd>
+
+<dt id="g-bucket">Bucket</dt>
+<dd>One SOC of a slice, holding the <a href="#g-record">records</a> of the addresses whose hash
+falls into it: about 2.8 KB, about 100–200 addresses. A lookup reads one bucket per slice. That
+the bucket also holds other addresses' records gives some privacy: the node serving it does not
+learn which address was looked up.</dd>
+
+<dt id="g-bucket-count">Bucket count (B)</dt>
+<dd>How many buckets a slice has, chosen so a bucket averages 2,816 bytes. An address goes into
+bucket <code>(first 4 bytes of keccak256(address) × B) &gt;&gt; 32</code>.</dd>
+
+<dt id="g-buckets-root">Buckets root</dt>
+<dd>A Merkle root over the hashes of all buckets of a slice. Two importers who build the same slice
+get the same root, so slices can be compared by this value. It does not prove a single bucket
+to a reader.</dd>
+
+<dt id="g-cac">CAC (content-addressed chunk)</dt>
+<dd>A Swarm chunk whose address is the hash of its content. A SOC signs the CAC address of its
+payload.</dd>
+
+<dt id="g-chain-id">Chain ID</dt>
+<dd>Which chain the data belongs to: 1 for Ethereum mainnet, 1337 for the bee-factory dev chain.
+It is part of every identifier string (<code>eth:&lt;chain&gt;:…</code>).</dd>
+
+<dt id="g-cover">Cover</dt>
+<dd>The set of slices that together hold every unit of the index exactly once: every complete
+top-level slice, then one slice for every set bit of the unit count, largest first. For an index from genesis, that is 13
+slices at mainnet's height today. An index that starts at a later block reads only the slices after its
+start.</dd>
+
+<dt id="g-emitter">Emitter</dt>
+<dd>The <a href="#g-roles">role</a> of a contract that emitted a log in the transaction. Token
+contracts are emitters in every transfer of their token.</dd>
+
+<dt id="g-entry">Entry</dt>
+<dd>One line of an address's history: <a href="#g-block">block</a>, <a href="#g-slot">slot</a>
+and <a href="#g-roles">roles</a>. Entries are sorted by block and slot; the inspector shows them
+newest first.</dd>
+
+<dt id="g-epoch">Epoch</dt>
+<dd>In the block store: a group of consecutive blocks (64 on bee-factory, 8,192 for mainnet
+geometry) with one Merkle tree. Not the beacon chain's epoch.</dd>
+
+<dt id="g-epoch-proof">Epoch proof</dt>
+<dd>The sibling hashes from a block hash up to its <a href="#g-epoch-root">epoch root</a>.</dd>
+
+<dt id="g-epoch-root">Epoch root</dt>
+<dd>The Merkle root over the block hashes of one epoch.</dd>
+
+<dt id="g-fingerprint">Fingerprint (fp)</dt>
+<dd>Bytes 4–11 of keccak256(address): how a record names its address without storing it. A
+lookup computes the fingerprint and looks for it in the bucket. Two addresses can share one by
+chance; verification against the chain sorts that out.</dd>
+
+<dt id="g-first-block">First block, start of an index</dt>
+<dd>An index can start at a later block instead of genesis. Its head names that block, and the
+blocks before it are <em>not covered</em>: the index says nothing about them.</dd>
+
+<dt id="g-geometry">Geometry</dt>
+<dd>Number of epochs × epoch size of the block store's accumulator. It is part of the anchor.</dd>
+
+<dt id="g-head">Head</dt>
+<dd>The record that says how far the index goes: the number of <a href="#g-units">units</a>, the
+first and last block, the last block's hash and time, and the <a href="#g-pending">pending
+merges</a>. A new head is published for every unit.</dd>
+
+<dt id="g-head-update">Head update</dt>
+<dd>The head is a feed: update 0, 1, 2, … each at its own SOC. Update <em>n</em> announces the
+origin's units + <em>n</em>.</dd>
+
+<dt id="g-header-record">Header record</dt>
+<dd>The SOC of one block: the header's RLP, the reference of its body, and the epoch and master
+proofs.</dd>
+
+<dt id="g-identifier">Identifier</dt>
+<dd>32 bytes that, with the owner, give a SOC its address. eth2swarm makes every identifier the
+keccak256 of an <a href="#g-identifier-string">identifier string</a>.</dd>
+
+<dt id="g-identifier-string">Identifier string</dt>
+<dd>The readable name of a SOC, e.g. <code>eth:1:0x…:hdr:97</code> (block 97),
+<code>eth:1:addr1:origin</code> or <code>eth:1:addr1:bucket:6:6456:242</code>.</dd>
+
+<dt id="g-incremental">Incremental sync (Since unit)</dt>
+<dd>Reading only what is new since a unit already read: the slices of the cover that end after
+it, dropping older entries. A client a day behind reads up to 7 slices.</dd>
+
+<dt id="g-level">Level (L), index (i)</dt>
+<dd>A slice's name <code>(L, i)</code>: level L slices hold 2<sup>L</sup> units, and index i
+counts them from genesis. Level 0 = 64 blocks, level 6 = 4,096 blocks (about 14 hours),
+level 10 = 65,536 blocks (about 9 days), level 16 = about 1.6 years and is never merged again.</dd>
+
+<dt id="g-master-proof">Master proof</dt>
+<dd>The sibling hashes from an epoch root up to the master root of the accumulator.</dd>
+
+<dt id="g-node">Node</dt>
+<dd>A Bee or ant node the inspector reads through. Different nodes can retrieve different
+chunks.</dd>
+
+<dt id="g-origin">Origin</dt>
+<dd>A fixed copy of head update 0 at a well-known identifier (<code>eth:&lt;chain&gt;:addr1:origin</code>).
+A reader starts there to learn the index's start and its first unit count.</dd>
+
+<dt id="g-owner">Owner, SOC owner</dt>
+<dd>The Ethereum address of the key that signed the data. Every SOC address depends on it, and
+every signature is checked against it. See <a href="#owner">where the owner comes from</a>.</dd>
+
+<dt id="g-paged">Paged bucket, pages file</dt>
+<dd>A bucket whose records do not fit in one 4 KB chunk (rare: about 1 in 3,000) keeps them in a
+separate file of 4 KB pages; the bucket SOC holds only its count, page count and reference.</dd>
+
+<dt id="g-payload">Payload</dt>
+<dd>The data a SOC carries, up to 4,096 bytes: here always an eth2swarm record.</dd>
+
+<dt id="g-pending">Pending merge</dt>
+<dd>A merged slice the importer is still building or uploading. The head lists it, and readers
+use the smaller slices it replaces until it is done.</dd>
+
+<dt id="g-probe">Probe</dt>
+<dd>Fetching head update n+1, n+2, n+4, … until one is missing, then narrowing down, to find the
+newest head. A missing chunk costs a timeout in Swarm, so the inspector remembers the newest head
+per node, owner and chain and continues from there.</dd>
+
+<dt id="g-published-anchor">Published anchor</dt>
+<dd>The anchor the owner publishes at <code>eth:&lt;chain&gt;:accumulator</code>. Convenient, but
+using it trusts the owner completely; the inspector shows such verdicts in amber.</dd>
+
+<dt id="g-record">Record, address record</dt>
+<dd>One address's data in a bucket: its <a href="#g-fingerprint">fingerprint</a>, its entry count,
+and either the entries themselves (inline) or a <a href="#g-spill-file">spill file</a>
+reference.</dd>
+
+<dt id="g-recovered-signer">Recovered signer</dt>
+<dd>The address computed from a SOC's signature. If the chunk is genuine, it is the owner.</dd>
+
+<dt id="g-roles">Roles</dt>
+<dd>How an address took part in a transaction or block. An entry can have several, joined with
+<code>|</code>:
+<table>
+<tr><th>Role</th><th>Meaning</th></tr>
+<tr><td><code>from</code></td><td>sent the transaction</td></tr>
+<tr><td><code>to</code></td><td>its recipient, or the contract it created</td></tr>
+<tr><td><code>emitter</code></td><td>a contract that emitted a log in it</td></tr>
+<tr><td><code>topic</code></td><td>named in a log topic, e.g. the sender or receiver of a token transfer</td></tr>
+<tr><td><code>word</code></td><td>an address-shaped 32-byte value in the input, a log's data or an authorization; can be noise</td></tr>
+<tr><td><code>trace</code></td><td>in an internal call, creation or self-destruct (needs a tracing node)</td></tr>
+<tr><td><code>block</code></td><td>in the block itself: fee recipient, uncle miner, withdrawal recipient</td></tr>
+<tr><td><code>auth</code></td><td>signed an EIP-7702 authorization in the transaction</td></tr>
+</table>
+A wallet that wants only what you took part in keeps <code>from to topic trace block auth</code>.
+<em>Roles detected</em> lists the roles the importer looked for at all.</dd>
+
+<dt id="g-slice">Slice</dt>
+<dd>An immutable part of the index holding the appearances of 2<sup>L</sup>
+<a href="#g-unit">units</a>, named <code>(L, i)</code>. Two slices of one level are merged into
+one of the next, up to level 16. See <a href="#addr-model">how the index is built</a>.</dd>
+
+<dt id="g-slice-record">Slice record, slice descriptor</dt>
+<dd>The SOC describing a slice: its blocks, last block hash, bucket count, address and
+appearance counts, buckets root and detected roles. A reader needs it to find and decode the
+slice's buckets.</dd>
+
+<dt id="g-slot">Slot</dt>
+<dd>Where in the block the address appears. Slot 0 is the block itself (shown as
+<code>block</code> or <code>blk</code>); slot <em>s</em> &gt; 0 is the transaction with index
+<em>s</em> − 1 (shown as <code>tx s−1</code>). So <code>tx 131</code> is the 132nd transaction
+of the block, as block explorers count from 0.</dd>
+
+<dt id="g-soc">SOC (single-owner chunk)</dt>
+<dd>A Swarm chunk at an address computed from an <a href="#g-identifier">identifier</a> and an
+<a href="#g-owner">owner</a>, signed by the owner. Anyone who knows both can find it, and the
+signature proves who wrote it. Every eth2swarm record is a SOC.</dd>
+
+<dt id="g-soc-address">SOC address</dt>
+<dd>keccak256(identifier ‖ owner): where a SOC is stored.</dd>
+
+<dt id="g-span">Span</dt>
+<dd>The length of the data under a chunk, stored in the chunk. For a file's root chunk, the length
+of the whole file.</dd>
+
+<dt id="g-spill-file">Spill file</dt>
+<dd>A separate Swarm file holding the entries of one address in one slice, when they take more
+than 256 bytes. Busy addresses (token contracts, routers, builders) are spilled; the bucket keeps
+only the count and the reference.</dd>
+
+<dt id="g-tx">tx</dt>
+<dd>The transaction index within a block, counted from 0 as block explorers do. See
+<a href="#g-slot">slot</a>.</dd>
+
+<dt id="g-unit">Unit</dt>
+<dd>64 consecutive blocks, the smallest piece the index grows by. Unit u holds blocks
+<code>64·u … 64·u + 63</code>. Units contain finalized blocks only, so the index runs about
+13–32 minutes behind the chain, plus upload time.</dd>
+
+<dt id="g-units">Units (count)</dt>
+<dd>How many complete units a head announces: the index covers blocks up to units × 64 − 1. Also
+the <em>Head units</em> field, which reads the index as of an older head.</dd>
+
+<dt id="g-verdict">Verdict</dt>
+<dd>The Block and Epoch tabs' result: green ✓ verified against a pinned anchor, amber ⚠ verified
+against the published anchor, red ✗ a check failed.</dd>
+</dl>
+</main>
+</div>
+</body>
+</html>
