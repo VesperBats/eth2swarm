@@ -223,8 +223,10 @@ EXP_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
 EXP_STATE=$(mktemp -d)
 EXP_DIR=$(mktemp -d)/export
 # No Bee node: the export must not need one (port 9 refuses connections).
+# A sort buffer of four appearances: every slice is built from many runs on disk, merged in
+# rounds, and must still match the in-memory build (slice (2, 0) below).
 exp_import() {
-  $BIN --bee http://127.0.0.1:9 addr-import --key "$EXP_KEY" --state "$EXP_STATE" \
+  ETH2SWARM_ADDR_SORT_BUFFER_BYTES=180 $BIN --bee http://127.0.0.1:9 addr-import --key "$EXP_KEY" --state "$EXP_STATE" \
     --out "$EXP_DIR" --defer-level 1 "${TRACE_FLAG[@]}" "$@"
 }
 exp_upload() { $BIN --bee "$UPLOAD_BEE" addr-upload "$EXP_DIR" "$@"; }
@@ -280,6 +282,13 @@ OUT=$($BIN --bee "$READ_BEE" addr-verify --owner "$EXP_OWNER" --chain-id "$CHAIN
 EXPORTED=$(echo "$OUT" | awk '/slice \(2, 0\)/ {print $NF}')
 [ "$EXPORTED" = "$LOCAL" ] || { echo "FAIL: exported (2, 0) root '$EXPORTED', local build '$LOCAL'"; exit 1; }
 rm -rf "$EXP_STATE" "$(dirname "$EXP_DIR")"
+# One directory for state, export and sort runs works too (a new export there is fresh).
+ONE_DIR=$(mktemp -d)
+ETH2SWARM_ADDR_SORT_BUFFER_BYTES=180 $BIN --bee http://127.0.0.1:9 addr-import \
+  --key 0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n') --state "$ONE_DIR" --out "$ONE_DIR" \
+  --init --units 2 "${TRACE_FLAG[@]}" >/dev/null \
+  || { echo "FAIL: an export into its own state directory"; exit 1; }
+rm -rf "$ONE_DIR"
 echo "ok: an index exported without a Bee node, through two crashes, uploads, resumes its upload and verifies (slice (2, 0) root $EXPORTED)"
 
 if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
@@ -321,8 +330,8 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   ACT_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
   ACT_STATE=$(mktemp -d)
   # The backfill covers the whole dev chain from genesis; its blocks are nearly empty, so
-  # building even large slices in memory is fine here (--max-level 16), only slower on an
-  # old stack.
+  # even large slices are quick to build here (--max-level 16, above the default of 12), only
+  # slower on an old stack.
   OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$ACT_KEY" --state "$ACT_STATE" --init \
     --units "$ACT_UNITS" --max-level 16 "${TRACE_FLAG[@]}") \
     || { echo "FAIL: addr-import $ACT_UNITS units"; exit 1; }
@@ -392,7 +401,7 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   LATE_STATE=$(mktemp -d)
   LATE_DIR=$(mktemp -d)/export
   # Exported and uploaded later: this index has spill files, so files take that path too.
-  OUT=$($BIN --bee http://127.0.0.1:9 addr-import --key "$LATE_KEY" --state "$LATE_STATE" --init \
+  OUT=$(ETH2SWARM_ADDR_SORT_BUFFER_BYTES=180 $BIN --bee http://127.0.0.1:9 addr-import --key "$LATE_KEY" --state "$LATE_STATE" --init \
     --from-block "$LATE_FROM" --units "$ACT_UNITS" --max-level 16 --out "$LATE_DIR" "${TRACE_FLAG[@]}") \
     || { echo "FAIL: addr-import --from-block $LATE_FROM --out"; exit 1; }
   LATE_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')

@@ -1,5 +1,6 @@
 //! Address → transaction index (`docs/address-index.md`).
 
+pub mod build;
 pub mod detect;
 pub mod export;
 pub mod fetch;

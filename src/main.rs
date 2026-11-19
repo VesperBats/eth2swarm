@@ -107,9 +107,21 @@ enum Command {
         /// Merges of this level and above are built in the background.
         #[arg(long, default_value_t = 6)]
         defer_level: u8,
-        /// Highest slice level built in memory.
-        #[arg(long, default_value_t = 8)]
+        /// Highest slice level built. Memory is bounded by --sort-memory-mb except for the
+        /// busiest address of a slice, whose entries and spill file are held whole: up to
+        /// level 12 (about a month) that stays in the hundreds of MB; above it a token
+        /// contract can need GBs and a spill file beyond what clients read (still open).
+        #[arg(long, default_value_t = 12)]
         max_level: u8,
+        /// Directory for the sort runs of the slice being built (default: --state); they go in
+        /// an `ethswarm-sort` directory of their own there. About 45 bytes per appearance of
+        /// the largest slice, removed once it is built.
+        #[arg(long)]
+        sort_dir: Option<std::path::PathBuf>,
+        /// Memory for one sort buffer, in MiB. A background merge and the newest unit can each
+        /// hold one.
+        #[arg(long, default_value_t = 512, value_parser = clap::value_parser!(u64).range(1..=1 << 20))]
+        sort_memory_mb: u64,
         /// Blocks fetched, and chunks uploaded, in parallel.
         #[arg(long, default_value_t = 16)]
         concurrency: usize,
@@ -341,6 +353,8 @@ async fn main() -> Result<()> {
             defer_level,
             max_level,
             concurrency,
+            sort_dir,
+            sort_memory_mb,
         } => {
             let opts = addr::import::ImportOptions {
                 state_dir: state,
@@ -354,6 +368,8 @@ async fn main() -> Result<()> {
                 defer_level,
                 max_level,
                 concurrency,
+                sort_dir,
+                sort_buffer: usize::try_from(sort_memory_mb << 20)?,
             };
             let s = addr::import::run(&provider, &bee, &key, opts).await?;
             println!(
@@ -624,9 +640,7 @@ where
 
     ensure!(level <= L_MAX, "slice level {level} above {L_MAX}");
     let (first, last) = (first_block(level, index), last_block(level, index));
-    let built = addr::fetch::fetch_slice(provider, (level, index), 0, traces, 16, None)
-        .await?
-        .built;
+    let built = addr::fetch::fetch_slice(provider, (level, index), traces, 16).await?;
     let r = &built.record;
     let file_bytes: usize = built.files.iter().map(|(_, f)| f.len()).sum();
     let chunks: usize = built.files.iter().map(|(_, f)| file_chunks(f.len())).sum();

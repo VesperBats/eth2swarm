@@ -1,20 +1,14 @@
 //! Slices: which slices cover the chain (`docs/address-index.md`, "Slices and covers"), and
 //! building one slice from its appearances ("Record formats").
 
-use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 
-use alloy::primitives::{Address, B256, keccak256};
-use anyhow::{Result, ensure};
+use alloy::primitives::B256;
+use anyhow::Result;
 
+use super::build::{Output, SliceBuilder};
 use super::detect::Appearance;
-use super::layout::{
-    AddressRecord, BUCKET_TARGET, BucketBody, BucketRecord, Entries, Entry, L_MAX, PAGE_SIZE,
-    SPILL_INLINE_MAX, SliceRecord, bucket_pages_file, entries_len, held_first_block, last_block,
-    spill_file,
-};
-use crate::accumulator::{Tree, depth_for};
-use crate::swarm::file::file_reference;
+use super::layout::{L_MAX, SliceRecord};
 
 /// A slice `(level, index)`: units `[index·2^level, (index+1)·2^level)`.
 pub type SliceId = (u8, u32);
@@ -35,7 +29,7 @@ pub fn held(slice: SliceId, first_unit: u64) -> Range<u64> {
 
 /// The size of what `slice` holds in an index from unit `first_unit`, as a level: the
 /// smallest `L` with `2^L` units at least [`held`]'s. The slice's own level from genesis, less
-/// for the slice a later start falls into. What building it in memory costs grows with this.
+/// for the slice a later start falls into. What building it costs grows with this.
 pub fn held_level(slice: SliceId, first_unit: u64) -> u8 {
     held(slice, first_unit)
         .count()
@@ -139,27 +133,15 @@ pub struct BuiltSlice {
     pub paged: u32,
 }
 
-/// Adds `file` under `reference` unless a file with that reference is already there.
-fn add_file(
-    files: &mut Vec<(B256, Vec<u8>)>,
-    seen: &mut HashSet<B256>,
-    reference: B256,
-    file: Vec<u8>,
-) {
-    if seen.insert(reference) {
-        files.push((reference, file));
-    }
-}
-
-/// keccak256 of the address bytes: bucket from `h[0..4]`, fingerprint `h[4..12]`.
-fn address_hash(a: &Address) -> B256 {
-    keccak256(a.as_slice())
-}
-
 /// Bucket of a hash among `buckets` (multiply-shift).
 pub fn bucket_of(h: &B256, buckets: u32) -> u32 {
-    let prefix = u32::from_be_bytes(h[..4].try_into().unwrap()) as u64;
-    ((prefix * buckets as u64) >> 32) as u32
+    bucket_of_prefix(u32::from_be_bytes(h[..4].try_into().unwrap()), buckets)
+}
+
+/// Bucket of an address whose hash starts with `prefix` (`h[0..4]` big-endian), among
+/// `buckets`: what the streaming builder computes from its sort items.
+pub fn bucket_of_prefix(prefix: u32, buckets: u32) -> u32 {
+    ((prefix as u64 * buckets as u64) >> 32) as u32
 }
 
 pub fn fingerprint(h: &B256) -> [u8; 8] {
@@ -180,7 +162,9 @@ pub fn build_slice(
 }
 
 /// [`build_slice`], with the bucket count overridable for tests (`B` is otherwise
-/// `max(1, ⌈record bytes / T⌉)`).
+/// `max(1, ⌈record bytes / T⌉)`). Builds in memory (one sort buffer for every appearance)
+/// and collects the buckets and files; the importer streams them instead
+/// (`build::SliceBuilder`).
 fn build(
     slice: SliceId,
     first_unit: u64,
@@ -189,156 +173,222 @@ fn build(
     roles: u8,
     force_buckets: Option<u32>,
 ) -> Result<BuiltSlice> {
-    let (level, index) = slice;
-    ensure!(level <= L_MAX, "slice level {level} above {L_MAX}");
-    ensure!(
-        !held(slice, first_unit).is_empty(),
-        "slice ({level}, {index}) ends before the index starts at unit {first_unit}"
-    );
-    let (first, last) = (
-        held_first_block(level, index, first_unit),
-        last_block(level, index),
-    );
-    ensure!(
-        last < 1 << 32,
-        "slice ({level}, {index}) ends at block {last}, beyond the format's u32 block numbers"
-    );
-
-    // Entries per address, merged per (block, slot).
-    let mut by_address: BTreeMap<Address, BTreeMap<(u64, u32), u8>> = BTreeMap::new();
+    let mut b = SliceBuilder::new(
+        slice,
+        first_unit,
+        roles,
+        &std::env::temp_dir(),
+        (appearances.len() + 1) * 64,
+    )?;
     for a in appearances {
-        ensure!(
-            a.roles != 0 && a.roles & !roles == 0,
-            "appearance with roles {:#04x} outside the slice's {roles:#04x}",
-            a.roles
-        );
-        ensure!(
-            (first..=last).contains(&a.block),
-            "appearance in block {} outside slice ({level}, {index}), blocks {first}..={last}",
-            a.block
-        );
-        *by_address
-            .entry(a.address)
-            .or_default()
-            .entry((a.block, a.slot))
-            .or_default() |= a.roles;
+        b.push(a)?;
     }
-
-    let mut files = Vec::new();
-    let mut seen = HashSet::new();
-    let mut spilled = 0u32;
-    let mut appearance_count = 0u64;
-    // (hash, address, record, encoded length)
-    let mut records: Vec<(B256, Address, AddressRecord, usize)> = by_address
-        .into_iter()
-        .map(|(address, entries)| {
-            let entries: Vec<Entry> = entries
-                .into_iter()
-                .map(|((block, slot), roles)| Entry { block, slot, roles })
-                .collect();
-            appearance_count += entries.len() as u64;
-            let h = address_hash(&address);
-            let entries = if entries_len(&entries, first) > SPILL_INLINE_MAX {
-                let file = spill_file(&entries);
-                let spill_ref = file_reference(&file);
-                add_file(&mut files, &mut seen, spill_ref, file);
-                spilled += 1;
-                Entries::Spilled {
-                    count: entries.len() as u64,
-                    spill_ref,
-                }
-            } else {
-                Entries::Inline(entries)
-            };
-            let rec = AddressRecord {
-                fp: fingerprint(&h),
-                entries,
-            };
-            let len = rec.encoded_len(first);
-            (h, address, rec, len)
-        })
-        .collect();
-
-    let total: usize = records.iter().map(|r| r.3).sum();
-    let bucket_count = match force_buckets {
-        Some(b) => b,
-        None => u32::try_from(total.div_ceil(BUCKET_TARGET).max(1))?,
-    };
-
-    // Records per bucket, ordered by (fingerprint, address).
-    records.sort_by(|a, b| {
-        (bucket_of(&a.0, bucket_count), fingerprint(&a.0), a.1).cmp(&(
-            bucket_of(&b.0, bucket_count),
-            fingerprint(&b.0),
-            b.1,
-        ))
-    });
-    let address_count = u32::try_from(records.len())?;
-    let mut grouped: Vec<Vec<AddressRecord>> = vec![Vec::new(); bucket_count as usize];
-    for (h, _, rec, _) in records {
-        grouped[bucket_of(&h, bucket_count) as usize].push(rec);
-    }
-
-    let mut buckets = Vec::with_capacity(grouped.len());
-    let mut paged = 0u32;
-    for (k, recs) in grouped.into_iter().enumerate() {
-        let inline = BucketRecord {
-            level,
-            index,
-            bucket: k as u32,
-            base: first,
-            body: BucketBody::Inline(recs),
-        };
-        let mut payload = inline.encode();
-        if payload.len() > PAGE_SIZE {
-            let BucketBody::Inline(recs) = inline.body else {
-                unreachable!()
-            };
-            let file = bucket_pages_file(&recs, first);
-            let pages_ref = file_reference(&file);
-            let paged_bucket = BucketRecord {
-                level,
-                index,
-                bucket: k as u32,
-                base: first,
-                body: BucketBody::Paged {
-                    count: recs.len() as u32,
-                    pages: file.len().div_ceil(PAGE_SIZE) as u32,
-                    pages_ref,
-                },
-            };
-            add_file(&mut files, &mut seen, pages_ref, file);
-            payload = paged_bucket.encode();
-            paged += 1;
+    let (mut buckets, mut files) = (Vec::new(), Vec::new());
+    let built = b.finish(last_block_hash, force_buckets, &mut |out| {
+        match out {
+            Output::File(r, f) => files.push((r, f)),
+            Output::Bucket(k, p) => {
+                anyhow::ensure!(k as usize == buckets.len(), "bucket {k} out of order");
+                buckets.push(p)
+            }
         }
-        buckets.push(payload);
-    }
-
-    let leaves: Vec<B256> = buckets.iter().map(keccak256).collect();
-    let buckets_root = Tree::new(&leaves, depth_for(leaves.len())).root();
-
+        Ok(())
+    })?;
     Ok(BuiltSlice {
-        record: SliceRecord {
-            level,
-            index,
-            first_block: first,
-            last_block_hash,
-            bucket_count,
-            addresses: address_count,
-            appearances: appearance_count,
-            buckets_root,
-            roles,
-        },
+        record: built.record,
         buckets,
         files,
-        spilled,
-        paged,
+        spilled: built.spilled,
+        paged: built.paged,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accumulator::{Tree, depth_for};
+    use crate::addr::layout::{
+        AddressRecord, BUCKET_TARGET, BucketBody, BucketRecord, Entries, Entry, PAGE_SIZE,
+        SPILL_INLINE_MAX, bucket_pages_file, entries_len, held_first_block, last_block, spill_file,
+    };
+    use crate::swarm::file::file_reference;
+    use alloy::primitives::{Address, keccak256};
+    use anyhow::ensure;
+    use std::collections::{BTreeMap, HashSet};
+
+    /// keccak256 of the address bytes: bucket from `h[0..4]`, fingerprint `h[4..12]`.
+    fn address_hash(a: &Address) -> B256 {
+        keccak256(a.as_slice())
+    }
+
+    /// Adds `file` under `reference` unless a file with that reference is already there.
+    fn add_file(
+        files: &mut Vec<(B256, Vec<u8>)>,
+        seen: &mut HashSet<B256>,
+        reference: B256,
+        file: Vec<u8>,
+    ) {
+        if seen.insert(reference) {
+            files.push((reference, file));
+        }
+    }
+
+    /// The in-memory builder the streaming one replaced, kept as the reference it must match.
+    fn reference_build(
+        slice: SliceId,
+        first_unit: u64,
+        appearances: &[Appearance],
+        last_block_hash: B256,
+        roles: u8,
+        force_buckets: Option<u32>,
+    ) -> Result<BuiltSlice> {
+        let (level, index) = slice;
+        ensure!(level <= L_MAX, "slice level {level} above {L_MAX}");
+        ensure!(
+            !held(slice, first_unit).is_empty(),
+            "slice ({level}, {index}) ends before the index starts at unit {first_unit}"
+        );
+        let (first, last) = (
+            held_first_block(level, index, first_unit),
+            last_block(level, index),
+        );
+        ensure!(
+            last < 1 << 32,
+            "slice ({level}, {index}) ends at block {last}, beyond the format's u32 block numbers"
+        );
+
+        // Entries per address, merged per (block, slot).
+        let mut by_address: BTreeMap<Address, BTreeMap<(u64, u32), u8>> = BTreeMap::new();
+        for a in appearances {
+            ensure!(
+                a.roles != 0 && a.roles & !roles == 0,
+                "appearance with roles {:#04x} outside the slice's {roles:#04x}",
+                a.roles
+            );
+            ensure!(
+                (first..=last).contains(&a.block),
+                "appearance in block {} outside slice ({level}, {index}), blocks {first}..={last}",
+                a.block
+            );
+            *by_address
+                .entry(a.address)
+                .or_default()
+                .entry((a.block, a.slot))
+                .or_default() |= a.roles;
+        }
+
+        let mut files = Vec::new();
+        let mut seen = HashSet::new();
+        let mut spilled = 0u32;
+        let mut appearance_count = 0u64;
+        // (hash, address, record, encoded length)
+        let mut records: Vec<(B256, Address, AddressRecord, usize)> = by_address
+            .into_iter()
+            .map(|(address, entries)| {
+                let entries: Vec<Entry> = entries
+                    .into_iter()
+                    .map(|((block, slot), roles)| Entry { block, slot, roles })
+                    .collect();
+                appearance_count += entries.len() as u64;
+                let h = address_hash(&address);
+                let entries = if entries_len(&entries, first) > SPILL_INLINE_MAX {
+                    let file = spill_file(&entries);
+                    let spill_ref = file_reference(&file);
+                    add_file(&mut files, &mut seen, spill_ref, file);
+                    spilled += 1;
+                    Entries::Spilled {
+                        count: entries.len() as u64,
+                        spill_ref,
+                    }
+                } else {
+                    Entries::Inline(entries)
+                };
+                let rec = AddressRecord {
+                    fp: fingerprint(&h),
+                    entries,
+                };
+                let len = rec.encoded_len(first);
+                (h, address, rec, len)
+            })
+            .collect();
+
+        let total: usize = records.iter().map(|r| r.3).sum();
+        let bucket_count = match force_buckets {
+            Some(b) => b,
+            None => u32::try_from(total.div_ceil(BUCKET_TARGET).max(1))?,
+        };
+
+        // Records per bucket, ordered by (fingerprint, address).
+        records.sort_by(|a, b| {
+            (bucket_of(&a.0, bucket_count), fingerprint(&a.0), a.1).cmp(&(
+                bucket_of(&b.0, bucket_count),
+                fingerprint(&b.0),
+                b.1,
+            ))
+        });
+        let address_count = u32::try_from(records.len())?;
+        let mut grouped: Vec<Vec<AddressRecord>> = vec![Vec::new(); bucket_count as usize];
+        for (h, _, rec, _) in records {
+            grouped[bucket_of(&h, bucket_count) as usize].push(rec);
+        }
+
+        let mut buckets = Vec::with_capacity(grouped.len());
+        let mut paged = 0u32;
+        for (k, recs) in grouped.into_iter().enumerate() {
+            let inline = BucketRecord {
+                level,
+                index,
+                bucket: k as u32,
+                base: first,
+                body: BucketBody::Inline(recs),
+            };
+            let mut payload = inline.encode();
+            if payload.len() > PAGE_SIZE {
+                let BucketBody::Inline(recs) = inline.body else {
+                    unreachable!()
+                };
+                let file = bucket_pages_file(&recs, first);
+                let pages_ref = file_reference(&file);
+                let paged_bucket = BucketRecord {
+                    level,
+                    index,
+                    bucket: k as u32,
+                    base: first,
+                    body: BucketBody::Paged {
+                        count: recs.len() as u32,
+                        pages: file.len().div_ceil(PAGE_SIZE) as u32,
+                        pages_ref,
+                    },
+                };
+                add_file(&mut files, &mut seen, pages_ref, file);
+                payload = paged_bucket.encode();
+                paged += 1;
+            }
+            buckets.push(payload);
+        }
+
+        let leaves: Vec<B256> = buckets.iter().map(keccak256).collect();
+        let buckets_root = Tree::new(&leaves, depth_for(leaves.len())).root();
+
+        Ok(BuiltSlice {
+            record: SliceRecord {
+                level,
+                index,
+                first_block: first,
+                last_block_hash,
+                bucket_count,
+                addresses: address_count,
+                appearances: appearance_count,
+                buckets_root,
+                roles,
+            },
+            buckets,
+            files,
+            spilled,
+            paged,
+        })
+    }
+
     use crate::addr::layout::{
         UNIT_BLOCKS, decode_bucket_page, decode_spill_page, first_block, pages as split_pages,
     };
@@ -480,6 +530,156 @@ mod tests {
         let empty = build_slice((0, 0), 0, &[], B256::ZERO, 0).unwrap();
         assert_eq!(empty.record.bucket_count, 1);
         assert_eq!(empty.buckets.len(), 1);
+    }
+
+    /// Builds with the streaming builder, with a sort buffer of `buffer` bytes.
+    fn streamed(
+        slice: SliceId,
+        first_unit: u64,
+        apps: &[Appearance],
+        roles: u8,
+        buffer: usize,
+        force: Option<u32>,
+    ) -> BuiltSlice {
+        let mut b =
+            SliceBuilder::new(slice, first_unit, roles, &std::env::temp_dir(), buffer).unwrap();
+        for a in apps {
+            b.push(a).unwrap();
+        }
+        let (mut buckets, mut files) = (Vec::new(), Vec::new());
+        let built = b
+            .finish(B256::repeat_byte(3), force, &mut |out| {
+                match out {
+                    Output::File(r, f) => files.push((r, f)),
+                    Output::Bucket(_, p) => buckets.push(p),
+                }
+                Ok(())
+            })
+            .unwrap();
+        BuiltSlice {
+            record: built.record,
+            buckets,
+            files,
+            spilled: built.spilled,
+            paged: built.paged,
+        }
+    }
+
+    fn assert_same(a: &BuiltSlice, b: &BuiltSlice) {
+        assert_eq!(a.record, b.record);
+        assert_eq!(a.buckets, b.buckets);
+        let files = |x: &BuiltSlice| x.files.iter().cloned().collect::<BTreeMap<_, _>>();
+        assert_eq!(files(a), files(b));
+        assert_eq!(a.files.len(), b.files.len(), "a file listed twice");
+        assert_eq!((a.spilled, a.paged), (b.spilled, b.paged));
+    }
+
+    /// The streaming builder gives exactly what the in-memory one gave, whether everything
+    /// fits one buffer, or takes many runs and merges in rounds; also for a late start and a
+    /// forced paged bucket.
+    #[test]
+    fn streaming_build_matches_the_in_memory_one() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let slice = (4, 2); // units 32..48, blocks 2048..3071
+        let (first, last) = (held_first_block(4, 2, 0), last_block(4, 2));
+        let mut apps = Vec::new();
+        for _ in 0..3000 {
+            let r = next();
+            // Few addresses get many entries (they spill), most get one or two.
+            let address = if r % 7 == 0 {
+                Address::repeat_byte((r >> 8) as u8 % 3)
+            } else {
+                Address::left_padding_from(&(r >> 16).to_be_bytes())
+            };
+            apps.push(Appearance {
+                block: first + (r >> 24) % (last - first + 1),
+                slot: (r >> 40) as u32 % 50,
+                address,
+                roles: 1 << ((r >> 50) % 7),
+            });
+        }
+        let roles = 0x7f;
+        let reference =
+            reference_build(slice, 0, &apps, B256::repeat_byte(3), roles, None).unwrap();
+        assert!(reference.spilled > 0, "the data should spill");
+        for buffer in [1 << 20, 4096, ITEM_BYTES * 3] {
+            assert_same(&reference, &streamed(slice, 0, &apps, roles, buffer, None));
+        }
+        // A late start: the slice holds units 40..48.
+        let late: Vec<Appearance> = apps
+            .iter()
+            .filter(|a| a.block >= 40 * UNIT_BLOCKS)
+            .cloned()
+            .collect();
+        let reference =
+            reference_build(slice, 40, &late, B256::repeat_byte(3), roles, None).unwrap();
+        assert_same(
+            &reference,
+            &streamed(slice, 40, &late, roles, ITEM_BYTES * 5, None),
+        );
+        // Everything in one bucket: paged.
+        let reference =
+            reference_build(slice, 0, &apps, B256::repeat_byte(3), roles, Some(1)).unwrap();
+        assert!(reference.paged == 1);
+        assert_same(&reference, &streamed(slice, 0, &apps, roles, 4096, Some(1)));
+        // An empty slice.
+        let reference = reference_build(slice, 0, &[], B256::repeat_byte(3), roles, None).unwrap();
+        assert_same(&reference, &streamed(slice, 0, &[], roles, 4096, None));
+    }
+
+    /// Bytes of one sort item of the streaming builder.
+    const ITEM_BYTES: usize = 45;
+
+    /// More runs than one merge round takes (128 × 128): two rounds, then the last merge.
+    #[test]
+    fn streaming_build_over_two_merge_rounds() {
+        let slice = (6, 1); // blocks 4096..8191
+        let apps: Vec<Appearance> = (0..17_000u64)
+            .map(|i| Appearance {
+                block: 4096 + (i * 7919) % 4096,
+                slot: (i % 13) as u32,
+                address: Address::left_padding_from(&(i % 3001).to_be_bytes()),
+                roles: 1 << (i % 7),
+            })
+            .collect();
+        let reference = reference_build(slice, 0, &apps, B256::repeat_byte(3), 0x7f, None).unwrap();
+        assert_same(
+            &reference,
+            &streamed(slice, 0, &apps, 0x7f, ITEM_BYTES, None),
+        );
+    }
+
+    /// A build whose cancel flag is set stops with an error and leaves no runs behind.
+    #[test]
+    fn a_cancelled_build_stops_and_cleans_up() {
+        let parent = std::env::temp_dir().join(format!("addr-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let mut b = SliceBuilder::new((10, 0), 0, 0x7f, &parent, ITEM_BYTES * 2).unwrap();
+        for i in 0..200_000u64 {
+            b.push(&Appearance {
+                block: i % 65_536,
+                slot: 1,
+                address: Address::left_padding_from(&i.to_be_bytes()),
+                roles: 1,
+            })
+            .unwrap();
+        }
+        b.cancel_flag()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let err = b.finish(B256::ZERO, None, &mut |_| Ok(())).unwrap_err();
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+        assert_eq!(
+            std::fs::read_dir(&parent).unwrap().count(),
+            0,
+            "runs left behind"
+        );
+        std::fs::remove_dir(&parent).unwrap();
     }
 
     #[test]
