@@ -185,6 +185,15 @@ block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. The e
     creation (the trace has neither the nonce nor the salt), so it is exact only where no
     internal creation fails. `ethswarm trace-compare` lists where it and an index differ.
 
+  **Receipts before Byzantium.** An importer checks every block's receipts against the
+  header's `receiptsRoot`. A receipt before Byzantium (mainnet block 4,370,000) holds the
+  state root after its transaction instead of a status, and the root covers it. Erigon 3
+  answers such a receipt with a status and without that state root, so the check fails
+  from its answer alone. `--receipts-rpc <url>` reads those blocks' receipts from a node
+  that keeps the root, such as geth. Blocks, traces, the frame index and every later
+  receipt still come from `--rpc`, and both nodes must be on the same chain. Without the
+  option, the failure says to pass it.
+
   Traces cannot be verified without re-executing the block, so an importer that reads
   `trace_block` checks the answer and **rejects the block** (publishes nothing for
   it, and stops) unless:

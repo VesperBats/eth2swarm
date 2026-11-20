@@ -31,6 +31,13 @@ struct Cli {
     )]
     rpc: Url,
 
+    /// A node for the receipts of blocks before Byzantium (mainnet block 4,370,000), such as
+    /// geth: those receipts hold the state root after their transaction, which Erigon 3 does
+    /// not serve, so their root cannot be checked against the header from its answer.
+    /// Everything else still comes from --rpc, and these receipts are checked like any other.
+    #[arg(long, global = true, env = "ETH2SWARM_RECEIPTS_RPC")]
+    receipts_rpc: Option<Url>,
+
     /// Bee API endpoint (bee-factory: worker 1 holds the postage batch).
     #[arg(
         long,
@@ -382,6 +389,27 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let provider = ProviderBuilder::new().connect_http(cli.rpc.clone());
+    if let Some(url) = &cli.receipts_rpc {
+        let node = ProviderBuilder::new().connect_http(url.clone()).erased();
+        let (main_chain, receipts_chain) = tokio::try_join!(
+            async {
+                provider
+                    .get_chain_id()
+                    .await
+                    .context("querying --rpc's chain id")
+            },
+            async {
+                node.get_chain_id()
+                    .await
+                    .context("querying --receipts-rpc's chain id")
+            },
+        )?;
+        ensure!(
+            main_chain == receipts_chain,
+            "--rpc serves chain {main_chain}, --receipts-rpc chain {receipts_chain}"
+        );
+        addr::fetch::set_early_receipts(node, addr::fetch::byzantium_block(main_chain))?;
+    }
     let bee = Bee::new(cli.bee.clone())?;
 
     match cli.command {
