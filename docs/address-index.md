@@ -73,7 +73,7 @@ miner, reward author) and `txIndex + 1` for an appearance in a transaction.
 | `0x02` | `TO` | recipient, or the contract the transaction created |
 | `0x04` | `EMITTER` | address of a log the transaction emitted |
 | `0x08` | `TOPIC` | address in a log topic (ERC-20/721/1155 `from`/`to`, …) |
-| `0x10` | `WORD` | address-shaped 32-byte word in input data, init code, log data, or an internal call's input or output |
+| `0x10` | `WORD` | address-shaped 32-byte word in a transaction's input data or init code, in log data, or an EIP-7702 code address |
 | `0x20` | `TRACE` | address in a call frame, creation or self-destruct (requires traces) |
 | `0x40` | `BLOCK` | block-level: fee recipient, uncle miner, reward author, withdrawal recipient |
 | `0x80` | `AUTH` | authority of an EIP-7702 authorization |
@@ -85,18 +85,27 @@ are normative. They are implemented in `src/addr/detect.rs` and checked by
 `ethswarm appearances <block> [--traces]`.
 
 The rules are a **superset of TrueBlocks'** (`trueblocks-chifra`, `pkg/uniq`, at
-`ff9df4f`): the same sources (traces, receipts, withdrawals, miner) and the same word
-heuristic, plus log emitters, known token events regardless of value, and EIP-7702
-authorities. Every appearance TrueBlocks' scraper finds is found here too, which makes its
-published index a test oracle for this one: its transaction index `i` is slot `i + 1`
-here, and its block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. Two
-exceptions:
+`ff9df4f`) **with three exceptions** (below): the same sources (traces, receipts,
+withdrawals, miner) and the same word heuristic, plus log emitters, known token events
+regardless of value, and EIP-7702 authorities. Every other appearance TrueBlocks' scraper
+finds is found here too, which makes its published index a test oracle for this one once
+the exceptions are filtered out: its transaction index `i` is slot `i + 1` here, and its
+block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. The exceptions:
 
 - TrueBlocks records a reward to a precompile address under a sentinel address; here it is
   ignored like every other address up to `0x…ffff`.
 - TrueBlocks indexes the **genesis allocations** as block 0, from a per-chain `allocs.csv`.
   Genesis state is not in any block, so this detection does not see it; see *Open
   questions*.
+- TrueBlocks also scans the **input and output of internal calls** for address-shaped words.
+  Here traces add only the addresses of the call frames themselves (`TRACE`): that is the
+  set an archive node keeps an index of (Erigon 3's `tracesfrom` and `tracesto`, keyed by
+  transaction), so a full history with traces can be imported from it in days instead of
+  re-executing every block (owner decision, 2026-11-20). That the two sets match exactly is
+  proven by comparing them block by block before the index is used (part 12 of the importer
+  plan; *Open questions*, tracer edge cases). An address that occurs only inside internal call data (a
+  recipient a router passes on without calling it, an address a factory returns) is
+  therefore not indexed.
 
 - *Address-shaped* (TrueBlocks' "implicit address"): a 32-byte word whose first 12 bytes
   are zero, whose value is at least 2^104 (one of bytes 12–18 is non-zero, so an address
@@ -133,11 +142,10 @@ exceptions:
     the init code of a creation (as TrueBlocks does; init code mostly yields bytecode
     fragments that pass the heuristic, a known source of noise);
   - the words of every log's data at offset 0;
-  - the code address of every EIP-7702 authorization, whatever its value;
-  - with traces: the words of every trace's `action.input` at offset 4 and of its
-    `result.output` at offset 0. This finds addresses that only occur inside the
-    execution: recipients a multisig, router or bundler passes on, or an address a
-    factory returns.
+  - the code address of every EIP-7702 authorization, whatever its value.
+
+  Traces add no words: the input and output of internal calls are not scanned (see the
+  exceptions above).
 - `AUTH`: the authority of an entry in the authorization list of a type-4 transaction. An
   entry counts if `y_parity ∈ {0, 1}`, `0 < r < n`, `0 < s ≤ n/2` (`n` the secp256k1 group
   order) and `ecrecover(keccak256(0x05 ‖ rlp([chain_id, address, nonce])), y_parity, r, s)`
@@ -170,10 +178,11 @@ exceptions:
   is exactly how two importers would end up with different slices.
 
 A wallet that only wants transfers it took part in filters on `FROM | TO | TOPIC | TRACE |
-BLOCK | AUTH`. `WORD` keeps the index as complete as TrueBlocks' and gives spam filters
-something to work with. Without traces it was 1–10 % of all appearances (measured with the
-earlier, stricter heuristic); the share with traces and the TrueBlocks heuristic is still
-to be measured with `addr-stats` on a tracing node (#8).
+BLOCK | AUTH`. `WORD` keeps the index close to TrueBlocks' (all but the words inside internal
+calls) and gives spam filters something to work with. Without traces it was 1–10 % of all
+appearances (measured with the earlier, stricter heuristic); its share under the current
+heuristic, and the share traces add, are still to be measured with `addr-stats` on a
+tracing node (#8).
 
 The appearances of one address at one (block, slot) are merged into one entry whose role
 is the OR of all roles.
@@ -675,12 +684,11 @@ Oldest first is the same in the opposite order.
   - `BLOCK` (slot 0): the header itself (beneficiary) or the body (withdrawals, uncles),
     checked against the header's roots. A pre-merge reward `author` from a trace is the
     beneficiary of the block or an uncle, so the same evidence applies.
-  - `TRACE`, and a `WORD` found only in a trace's input or output: cannot be checked from
-    the block. Internal calls are not recorded in the transaction or the receipt; checking
-    one needs re-execution with the state, or an execution proof. A client trusts the
-    importer for these entries, or compares importers. A client cannot tell from the
-    entry whether a `WORD` came from a trace; if it finds the address in neither the
-    transaction nor the receipt, it treats the entry as trace-derived.
+  - `TRACE`: cannot be checked from the block. Internal calls are not recorded in the
+    transaction or the receipt; checking one needs re-execution with the state, or an
+    execution proof. A client trusts the importer for these entries, or compares
+    importers. Every other role, `WORD` included, comes from the transaction, the receipt
+    or the header.
 - **Checking one transaction is cheap only if the block store supports it.** Today's block
   store, like devp2p, delivers only whole bodies (164 KB on average at the tip), and the
   client recomputes `transactionsRoot` from all of them. To read one transaction, the block
@@ -717,8 +725,8 @@ Oldest first is the same in the opposite order.
 ## Measurements
 
 **These figures predate the current detection rules.** They were measured with the earlier
-rule set: the 2^128 word bound, no init code, no `topic0`, no traces. The current rules (the
-TrueBlocks superset) find more appearances, so the totals, sizes and costs below are lower
+rule set: the 2^128 word bound, no init code, no `topic0`, no traces. The current rules
+(TrueBlocks' heuristic and sources, with the exceptions above) find more appearances, so the totals, sizes and costs below are lower
 bounds until they are measured again with `addr-stats`, with traces once a tracing node is
 available.
 
@@ -854,13 +862,13 @@ receipts on top for log roles.
 - **Block store.** Receipts, transaction offsets and trie nodes (above); moving the header
   accumulator to a Merkle Mountain Range (the same doubling scheme) would remove the
   "extending the range changes the anchor" limitation.
-- **Tracer-dependent edge cases.** `TRACE` and trace `WORD`s are defined by an RPC
-  format, not by the EVM, and Parity-style tracers differ at the edges. For example, a
-  reverted frame's revert data may or may not be in `result.output`. A call to a precompile
-  may get a frame only at top level or with value, and `ecrecover`'s output is an
-  address-shaped word. Identical slices across importers need these cases written into the
-  rules, or the tracer named as part of them. To be settled when the detection is compared
-  against TrueBlocks on an Erigon node.
+- **Tracer-dependent edge cases.** `TRACE` is defined by an RPC format, not by the EVM, and
+  tracers differ at the edges: whether a call that fails before it executes (insufficient
+  balance, the depth limit) gets a frame, and frames of precompile calls (precompiles are
+  below `0x…ffff` and never indexed, so only the first matters). Identical slices across
+  importers need these cases written into the rules, or the tracer named as part of them.
+  To be settled by comparing Erigon's trace index with `trace_block` on the same blocks
+  (part 12 of the importer plan).
 - **Genesis allocations.** TrueBlocks indexes the prefunded addresses of the genesis
   state at block 0 (about 8,900 on mainnet). Adding them needs the allocation list as an
   input (it is not in any block), and a convention for its slots.

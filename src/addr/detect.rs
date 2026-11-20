@@ -26,9 +26,11 @@ pub mod role {
     pub const EMITTER: u8 = 0x04;
     /// Address in a log topic.
     pub const TOPIC: u8 = 0x08;
-    /// Address-shaped 32-byte word in input, init code, log data, or a trace's input or output.
+    /// Address-shaped 32-byte word in a transaction's input or init code, in log data, or an
+    /// EIP-7702 code address (traces add no words).
     pub const WORD: u8 = 0x10;
-    /// Address in an internal call frame, creation or self-destruct (from traces).
+    /// Address of a call frame (the top-level one included), creation or self-destruct (from
+    /// traces).
     pub const TRACE: u8 = 0x20;
     /// Block level: fee recipient / miner, uncle miner, reward author, withdrawal recipient.
     pub const BLOCK: u8 = 0x40;
@@ -140,7 +142,6 @@ pub struct Trace {
 pub struct TraceAction {
     pub from: Option<Address>,
     pub to: Option<Address>,
-    pub input: Option<Bytes>,
     /// Self-destructed contract.
     pub address: Option<Address>,
     /// Beneficiary of a self-destruct.
@@ -154,7 +155,6 @@ pub struct TraceAction {
 pub struct TraceResult {
     /// Created contract.
     pub address: Option<Address>,
-    pub output: Option<Bytes>,
 }
 
 /// Trace types detection understands. A block whose traces contain another type is
@@ -406,19 +406,14 @@ pub fn detect(block: &BlockData) -> Vec<Appearance> {
                 {
                     c.add(a, slot, TRACE);
                 }
-                if let Some(res) = &trace.result {
-                    if trace.kind == "create"
-                        && let Some(a) = res.address
-                    {
-                        c.add(a, slot, TRACE);
-                    }
-                    for a in words(res.output.as_ref().map_or(&[][..], |b| b.as_ref()), 0) {
-                        c.add(a, slot, WORD);
-                    }
+                if let Some(res) = &trace.result
+                    && trace.kind == "create"
+                    && let Some(a) = res.address
+                {
+                    c.add(a, slot, TRACE);
                 }
-                for a in words(act.input.as_ref().map_or(&[][..], |b| b.as_ref()), 4) {
-                    c.add(a, slot, WORD);
-                }
+                // The input and output of internal calls are not scanned for words: traces
+                // add only the frames' own addresses, the set an archive node indexes.
             }
             // Other types, or a transaction trace without a position: nothing. Callers run
             // [`check_traces`] first, which rejects both.
@@ -650,14 +645,15 @@ mod tests {
             find(&apps, x("4444444444444444444444444444444444444444"), 1),
             Some(TRACE)
         );
-        // Internal call input (after the selector) and output words.
+        // Words in an internal call's input and output are not indexed: traces add only the
+        // frames' own addresses.
         assert_eq!(
             find(&apps, x("5555555555555555555555555555555555555555"), 1),
-            Some(WORD)
+            None
         );
         assert_eq!(
             find(&apps, x("6666666666666666666666666666666666666666"), 1),
-            Some(WORD)
+            None
         );
         // Self-destruct beneficiary, internal creation, reward author.
         assert_eq!(
