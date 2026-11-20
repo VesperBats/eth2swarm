@@ -365,7 +365,8 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
       "$FAILED")
         # A reverted top-level creation: its target is TO, and with traces also TRACE.
         ENTRY=$($BIN --bee "$READ_BEE" addr-lookup "$A" --owner "$ACT_OWNER" \
-          --chain-id "$CHAIN_ID" --units "$ACT_UNITS" --since "$U1" --limit 1 | head -1)
+          --chain-id "$CHAIN_ID" --units "$ACT_UNITS" --since "$U1" --limit 1)
+        ENTRY=$(echo "$ENTRY" | head -1)
         echo "$ENTRY" | grep -qw to \
           || { echo "FAIL: the failed creation's target has no TO role: $OUT"; exit 1; }
         if [ ${#TRACE_FLAG[@]} -gt 0 ]; then

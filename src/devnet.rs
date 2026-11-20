@@ -150,6 +150,7 @@ pub async fn run(
     let authority_used = match provider.send_transaction(req).await {
         Ok(p) => {
             let r = p.get_receipt().await?;
+            nonce += 1;
             last_block = last_block.max(r.block_number.context("receipt without a block number")?);
             Some(authority.address())
         }
