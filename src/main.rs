@@ -81,7 +81,8 @@ enum Command {
         /// Chunks of 1024 headers fetched in parallel.
         #[arg(long, default_value_t = 4)]
         concurrency: usize,
-        /// After building, compare sampled entries with this node (another client).
+        /// After building, compare about 200 entries and the top with this node (another
+        /// client). Pins the top in place of --top-hash; a run with neither is refused.
         #[arg(long)]
         cross_check: Option<Url>,
     },
@@ -180,6 +181,7 @@ async fn main() -> Result<()> {
                 top_hash,
                 genesis: genesis_hash,
                 concurrency,
+                cross_check: cross_check.is_some(),
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&meta)?);

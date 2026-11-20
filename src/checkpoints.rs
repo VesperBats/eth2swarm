@@ -2,17 +2,21 @@
 //! block, for Myotis's deep-block verification (its `docs/ideas/deep-block-verification.md`,
 //! decision D1: a bundled table, owner's decision 2026-11-20).
 //!
-//! The node is asked for headers only, and nothing it says about a hash is used: every header
+//! The node is asked for headers only, and none of the hashes it reports is used: every header
 //! is RLP-encoded and hashed here, each one's `parentHash` must be the hash computed for the
-//! block below it, the walk must end at the network's genesis hash, and the top block's hash
-//! must be the one the caller pins (`--top-hash`, for example a beacon-attested finalized
-//! block), or else the node's finalized block, which is then recorded as such. So the table is
-//! as good as the chain of hashes, not as the node.
+//! block below it, and the walk must end at the network's genesis hash. That makes the table
+//! one chain, but not the canonical one: linking back to genesis authenticates nothing on its
+//! own (no proof of work or beacon check is done here), so a node could serve a made-up fork
+//! from block 1 on. What makes it the canonical chain is the top: its hash must come from
+//! another source than the node, `--top-hash` (for example a beacon-attested finalized block,
+//! as Myotis's light client gives it) or `--cross-check` (another client's hashes, at about 200
+//! entries and the top). A run with neither is refused.
 //!
 //! The work is done in chunks of 1024 blocks, fetched in parallel; each finished chunk's
 //! summary (its first block's parent hash, its first and last block's hashes) is appended to a
-//! work file, so a run that stops resumes where it was. Once every chunk is in, the chunks are
-//! linked to each other, and the table is written: entry `i` is the hash of block `i·1024`.
+//! work file, so a run that stops resumes where it was, with the same top. Once every chunk is
+//! in, the chunks are linked to each other, and the table is written: entry `i` is the hash of
+//! block `i·1024`.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -107,9 +111,13 @@ async fn fetch_range(
         by_number.insert(id, header);
     }
     ensure!(
-        by_number.len() as u64 == to - from + 1,
-        "headers {from}..={to}: {} answers",
-        by_number.len()
+        by_number.len() as u64 == to - from + 1
+            && by_number.keys().next() == Some(&from)
+            && by_number.keys().next_back() == Some(&to),
+        "asked for headers {from}..={to}, got {} answers for {:?}..={:?}",
+        by_number.len(),
+        by_number.keys().next(),
+        by_number.keys().next_back()
     );
     let mut hashes = Vec::with_capacity(by_number.len());
     let mut parent = B256::ZERO;
@@ -212,6 +220,9 @@ pub struct Options {
     /// The network's genesis hash (default: mainnet's, on chain 1).
     pub genesis: Option<B256>,
     pub concurrency: usize,
+    /// Whether a cross-check against another node follows (`--cross-check`), which pins the
+    /// top in place of `top_hash`.
+    pub cross_check: bool,
 }
 
 async fn rpc_call(
@@ -236,9 +247,7 @@ async fn rpc_call(
 }
 
 fn work_path(out: &Path) -> PathBuf {
-    let mut p = out.as_os_str().to_owned();
-    p.push(".work");
-    PathBuf::from(p)
+    suffixed(out, ".work")
 }
 
 /// Builds the table: walks every header from the top block down to genesis.
@@ -266,10 +275,23 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unknown".into());
-    let (top, top_hash, pinned) = match (opts.top, opts.top_hash) {
-        (Some(t), Some(h)) => (t, h, "the caller (--top-hash)".to_string()),
-        (Some(_), None) | (None, Some(_)) => bail!("--top and --top-hash go together"),
-        (None, None) => {
+    // The work file of an unfinished run: its tag names chain, genesis and top.
+    let work = work_path(&opts.out);
+    let saved = match std::fs::read(&work) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", work.display())),
+    };
+    let saved_top = saved
+        .as_deref()
+        .and_then(parse_tag)
+        .map(|t| (t.top, t.top_hash));
+    let (top, top_hash, pinned) = match (opts.top, opts.top_hash, saved_top) {
+        (Some(t), Some(h), _) => (t, h, "the caller (--top-hash)".to_string()),
+        (Some(_), None, _) | (None, Some(_), _) => bail!("--top and --top-hash go together"),
+        // Resuming without --top: the unfinished run's top (the finalized block moves).
+        (None, None, Some((t, h))) => (t, h, format!("an earlier run's top ({client})")),
+        (None, None, None) => {
             let f = rpc_call(
                 &http,
                 rpc,
@@ -286,43 +308,76 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
             )
         }
     };
+    ensure!(
+        opts.top_hash.is_some() || opts.cross_check,
+        "the top block's hash would rest on the node alone, which a walk to genesis cannot \
+         authenticate: pass --top-hash (a beacon-attested block) or --cross-check <another node>"
+    );
     let chunks = top / K + 1;
 
-    // Resume: the chunks a previous run finished, for this same top.
-    let work = work_path(&opts.out);
+    let tag = Tag {
+        chain_id,
+        genesis,
+        top,
+        top_hash,
+    };
     let mut done: BTreeMap<u64, Chunk> = BTreeMap::new();
-    let tag = format!("top {top} {top_hash}\n");
-    match std::fs::read(&work) {
-        Ok(bytes) if bytes.starts_with(tag.as_bytes()) => {
-            // A record cut short by a stop is left out (that chunk is fetched again).
-            for r in bytes[tag.len()..].as_chunks::<WORK_RECORD>().0 {
+    match saved {
+        Some(bytes) => {
+            let saved_tag = parse_tag(&bytes).with_context(|| {
+                format!(
+                    "{} has no tag line: remove it to start over",
+                    work.display()
+                )
+            })?;
+            ensure!(
+                saved_tag == tag,
+                "{} is the work of another run ({saved_tag:?}, this run {tag:?}): remove it to \
+                 start over, or pass its top",
+                work.display()
+            );
+            let head = tag.line().len();
+            let (records, cut) = bytes[head..].as_chunks::<WORK_RECORD>();
+            for r in records {
                 let (i, c) = Chunk::decode(r);
+                ensure!(
+                    i < chunks,
+                    "{}: a record for chunk {i}, beyond the {chunks} chunks of top {top}: \
+                     remove it to start over",
+                    work.display()
+                );
                 done.insert(i, c);
+            }
+            // A record a stop cut short is dropped, and the file cut back to whole records,
+            // so the records appended next stay aligned.
+            if !cut.is_empty() {
+                let f = std::fs::OpenOptions::new().write(true).open(&work)?;
+                f.set_len((head + records.len() * WORK_RECORD) as u64)?;
+                f.sync_all()?;
             }
             tracing::info!(done = done.len(), chunks, "resuming");
         }
-        Ok(_) => bail!(
-            "{} is the work of another run (another top block): remove it to start over",
-            work.display()
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(&work, tag.as_bytes())?;
-        }
-        Err(e) => return Err(e).with_context(|| format!("reading {}", work.display())),
+        None => std::fs::write(&work, tag.line())?,
     }
     let mut work_file = std::fs::OpenOptions::new().append(true).open(&work)?;
 
     // Newest first: the header encodings of the latest forks are checked within minutes, not
     // at the end of the run.
-    let todo: Vec<u64> = (0..chunks).rev().filter(|i| !done.contains_key(i)).collect();
+    let todo: Vec<u64> = (0..chunks)
+        .rev()
+        .filter(|i| !done.contains_key(i))
+        .collect();
     let started = Instant::now();
     let mut last_report = Instant::now();
     let (total, mut finished) = (todo.len() as u64, 0u64);
     let mut queue = todo.into_iter();
     let mut set = tokio::task::JoinSet::new();
     let concurrency = opts.concurrency.max(1);
+    let mut failed = None;
     loop {
-        while set.len() < concurrency {
+        // After a failure no new chunk starts, and the running ones are drained, so that what
+        // they finished is kept for the resume.
+        while failed.is_none() && set.len() < concurrency {
             let Some(i) = queue.next() else { break };
             let (http, rpc) = (http.clone(), opts.rpc.clone());
             set.spawn(async move { (i, fetch_chunk(&http, &rpc, i, top).await) });
@@ -331,10 +386,19 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
             break;
         };
         let (i, chunk) = joined.context("a chunk task panicked")?;
-        let chunk = chunk.with_context(|| format!("chunk {i} (blocks from {})", i * K))?;
-        work_file.write_all(&chunk.encode(i))?;
-        done.insert(i, chunk);
-        finished += 1;
+        match chunk {
+            Ok(chunk) => {
+                work_file.write_all(&chunk.encode(i))?;
+                done.insert(i, chunk);
+                finished += 1;
+            }
+            Err(e) => {
+                if failed.is_none() {
+                    failed = Some(e.context(format!("chunk {i} (blocks from {})", i * K)));
+                }
+                continue;
+            }
+        }
         if last_report.elapsed().as_secs() >= 30 || finished == total {
             last_report = Instant::now();
             work_file.flush()?;
@@ -350,18 +414,104 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
         }
     }
     work_file.sync_all()?;
+    if let Some(e) = failed {
+        return Err(e.context(format!(
+            "stopped; {} of {chunks} chunks are kept in {} for the next run",
+            done.len(),
+            work.display()
+        )));
+    }
 
-    // Link the chunks: every chunk's first parent is the last hash of the chunk below.
+    let table = link(&done, chunks, genesis, top, top_hash)?;
+    let tmp = suffixed(&opts.out, ".tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&table)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &opts.out)?;
+    let meta = TableMeta {
+        chain_id,
+        k: K,
+        entries: chunks,
+        last_entry_block: (chunks - 1) * K,
+        top_block: top,
+        top_hash,
+        top_pinned_by: pinned,
+        genesis_hash: genesis,
+        table_keccak256: keccak256(&table),
+        source_client: client,
+        generated_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    };
+    std::fs::write(
+        suffixed(&opts.out, ".json"),
+        serde_json::to_vec_pretty(&meta)?,
+    )?;
+    let _ = std::fs::remove_file(&work);
+    Ok(meta)
+}
+
+/// `path` with `suffix` appended to its name (not replacing an extension).
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(suffix);
+    PathBuf::from(p)
+}
+
+/// The first line of a work file: the run it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tag {
+    chain_id: u64,
+    genesis: B256,
+    top: u64,
+    top_hash: B256,
+}
+
+impl Tag {
+    fn line(&self) -> String {
+        format!(
+            "chain {} genesis {} top {} {}\n",
+            self.chain_id, self.genesis, self.top, self.top_hash
+        )
+    }
+}
+
+fn parse_tag(bytes: &[u8]) -> Option<Tag> {
+    let end = bytes.iter().position(|b| *b == b'\n')?;
+    let line = std::str::from_utf8(&bytes[..end]).ok()?;
+    let w: Vec<&str> = line.split(' ').collect();
+    match w.as_slice() {
+        ["chain", c, "genesis", g, "top", t, h] => Some(Tag {
+            chain_id: c.parse().ok()?,
+            genesis: g.parse().ok()?,
+            top: t.parse().ok()?,
+            top_hash: h.parse().ok()?,
+        }),
+        _ => None,
+    }
+}
+
+/// Links the chunks into one chain from `genesis` to `top_hash` and returns the table: every
+/// chunk's first parent is the last hash of the chunk below, block 0 is the genesis, and the
+/// top chunk's last block is the pinned top.
+fn link(
+    done: &BTreeMap<u64, Chunk>,
+    chunks: u64,
+    genesis: B256,
+    top: u64,
+    top_hash: B256,
+) -> Result<Vec<u8>> {
     ensure!(
-        done.len() as u64 == chunks,
+        done.len() as u64 == chunks && done.keys().next_back() == Some(&(chunks - 1)),
         "{} of {chunks} chunks",
         done.len()
     );
-    let first = &done[&0];
     ensure!(
-        first.first == genesis,
+        done[&0].first == genesis,
         "block 0 hashes to {}, the genesis hash is {genesis}",
-        first.first
+        done[&0].first
     );
     for i in 1..chunks {
         let (below, this) = (&done[&(i - 1)], &done[&i]);
@@ -380,50 +530,30 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
         "block {top} hashes to {}, the top is pinned to {top_hash}",
         last.last
     );
-
     let mut table = Vec::with_capacity(chunks as usize * 32);
     for i in 0..chunks {
         table.extend_from_slice(done[&i].first.as_slice());
     }
-    let tmp = opts.out.with_extension("tmp");
-    std::fs::write(&tmp, &table)?;
-    std::fs::rename(&tmp, &opts.out)?;
-    let meta = TableMeta {
-        chain_id,
-        k: K,
-        entries: chunks,
-        last_entry_block: (chunks - 1) * K,
-        top_block: top,
-        top_hash,
-        top_pinned_by: pinned,
-        genesis_hash: genesis,
-        table_keccak256: keccak256(&table),
-        source_client: client,
-        generated_unix: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs(),
-    };
-    let mut side = opts.out.as_os_str().to_owned();
-    side.push(".json");
-    std::fs::write(PathBuf::from(side), serde_json::to_vec_pretty(&meta)?)?;
-    let _ = std::fs::remove_file(&work);
-    Ok(meta)
+    Ok(table)
 }
 
-/// Compares `samples` table entries with another node's hashes (an independent client).
+/// Compares about `samples` table entries, and always the last, with another node's hashes
+/// (another client). Returns how many entries were compared.
 pub async fn cross_check(table: &Path, other_rpc: &str, samples: u64) -> Result<u64> {
     let bytes = std::fs::read(table)?;
     ensure!(
-        bytes.len() % 32 == 0,
+        !bytes.is_empty() && bytes.len() % 32 == 0,
         "{} is not a table of hashes",
         table.display()
     );
     let entries = bytes.len() as u64 / 32;
     let http = reqwest::Client::new();
     let step = (entries / samples.max(1)).max(1);
-    let mut checked = 0;
-    let mut i = 0;
-    while i < entries {
+    let mut picks: Vec<u64> = (0..entries).step_by(step as usize).collect();
+    if picks.last() != Some(&(entries - 1)) {
+        picks.push(entries - 1);
+    }
+    for &i in &picks {
         let n = i * K;
         let h = rpc_call(
             &http,
@@ -438,30 +568,76 @@ pub async fn cross_check(table: &Path, other_rpc: &str, samples: u64) -> Result<
             ours == theirs,
             "block {n}: table {ours}, {other_rpc} {theirs}"
         );
-        checked += 1;
-        i += step;
     }
-    // The last entry always.
-    let n = (entries - 1) * K;
-    let h = rpc_call(
-        &http,
-        other_rpc,
-        "eth_getBlockByNumber",
-        serde_json::json!([format!("{n:#x}"), false]),
-    )
-    .await?;
-    let theirs: B256 = h["hash"].as_str().context("no hash")?.parse()?;
-    let ours = B256::from_slice(&bytes[bytes.len() - 32..]);
-    ensure!(
-        ours == theirs,
-        "block {n}: table {ours}, {other_rpc} {theirs}"
-    );
-    Ok(checked + 1)
+    Ok(picks.len() as u64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chain(n: u64) -> BTreeMap<u64, Chunk> {
+        // Chunk i's blocks hash to i·3+1 (first) and i·3+2 (last); chunk i's parent is the last
+        // of chunk i−1.
+        let h = |x: u64| B256::left_padding_from(&x.to_be_bytes());
+        (0..n)
+            .map(|i| {
+                let parent = if i == 0 {
+                    B256::ZERO
+                } else {
+                    h((i - 1) * 3 + 2)
+                };
+                (
+                    i,
+                    Chunk {
+                        parent,
+                        first: h(i * 3 + 1),
+                        last: h(i * 3 + 2),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn linking_checks_genesis_every_link_and_the_top() {
+        let h = |x: u64| B256::left_padding_from(&x.to_be_bytes());
+        let (genesis, top) = (h(1), h(3 * 4 + 2));
+        let good = chain(5);
+        let table = link(&good, 5, genesis, 4100, top).unwrap();
+        assert_eq!(table.len(), 5 * 32);
+        assert_eq!(
+            &table[32..64],
+            h(4).as_slice(),
+            "entry 1 = chunk 1's first block"
+        );
+        // Another genesis, another top, a broken link, a missing chunk: refused.
+        assert!(link(&good, 5, h(9), 4100, top).is_err());
+        assert!(link(&good, 5, genesis, 4100, h(99)).is_err());
+        let mut broken = good.clone();
+        broken.get_mut(&3).unwrap().parent = h(77);
+        let e = link(&broken, 5, genesis, 4100, top)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("block 3072"), "{e}");
+        let mut missing = good.clone();
+        missing.remove(&2);
+        assert!(link(&missing, 5, genesis, 4100, top).is_err());
+    }
+
+    #[test]
+    fn work_file_tags() {
+        let t = Tag {
+            chain_id: 1,
+            genesis: MAINNET_GENESIS,
+            top: 26_457_537,
+            top_hash: B256::repeat_byte(7),
+        };
+        let mut bytes = t.line().into_bytes();
+        bytes.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(parse_tag(&bytes), Some(t));
+        assert_eq!(parse_tag(b"top 5 0x00\n"), None, "an old or foreign line");
+    }
 
     #[test]
     fn work_records_round_trip() {
