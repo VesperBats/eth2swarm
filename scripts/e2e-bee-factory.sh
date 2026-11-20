@@ -263,6 +263,17 @@ echo "$OUT" | grep -q -- "--from-start" || { echo "FAIL: unexpected refusal: $OU
 # origin).
 OUT=$(exp_upload --from-start) || { echo "FAIL: addr-upload --from-start"; echo "$OUT"; exit 1; }
 echo "$OUT" | grep -q ", 4 heads" || { echo "FAIL: --from-start did not send every head again: $OUT"; exit 1; }
+# `stamps` names the batch the export was uploaded with; `stamps plan` reads the export and
+# the node's real /chainstate (bee-factory's chain runs 1 s blocks).
+EXP_BATCH=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["batch"])' "$EXP_DIR/uploaded.json")
+OUT=$($BIN --bee "$UPLOAD_BEE" stamps --export "$EXP_DIR") || { echo "FAIL: stamps"; echo "$OUT"; exit 1; }
+echo "$OUT" | grep -A1 "^${EXP_BATCH}" | grep -q "used by the export $EXP_DIR" \
+  || { echo "FAIL: stamps does not name $EXP_BATCH for the export: $OUT"; exit 1; }
+OUT=$($BIN --bee "$UPLOAD_BEE" stamps plan "$EXP_DIR" --days 2 --block-secs 1 --label e2e) \
+  || { echo "FAIL: stamps plan"; echo "$OUT"; exit 1; }
+echo "$OUT" | grep -q "one batch for everything, depth 1[7-9]" && echo "$OUT" | grep -q "immutable: true" \
+  || { echo "FAIL: stamps plan priced no batch: $OUT"; exit 1; }
+echo "ok: stamps names the export's batch; stamps plan sizes and prices one"
 # Another key's export cannot be uploaded over this index: a second export under the same key
 # from genesis with another start is refused at its origin.
 DUP_STATE=$(mktemp -d); DUP_DIR=$(mktemp -d)/export
@@ -476,7 +487,8 @@ echo "== postage batches by lifetime: lower slices go to the batch that expires 
 # units (19,968 s: the long batch); units 5 and 6 write (0, 4) and (1, 2), which live 1 and
 # 2 units (the short one); heads and the origin go to the permanent batch.
 buy_batch() {
-  # Immutable by name, never by Bee's default (.claude/agent/postage.md, rules 3 and 5).
+  # Immutable by name, never by Bee's default (.claude/agent/postage.md: a purchase command
+  # names the immutable flag).
   curl -sf -X POST -H 'immutable: true' "$UPLOAD_BEE/stamps/$1/17" \
     | python3 -c 'import json, sys; print("0x" + json.load(sys.stdin)["batchID"])'
 }

@@ -123,7 +123,7 @@ impl Stamps {
             fell_back: Mutex::new(0),
         };
         // Every batch must be known and immutable: a mutable one loses chunks once a bucket
-        // is full (`.claude/agent/postage.md`, rule 5).
+        // is full (`.claude/agent/postage.md`, "Immutable batches only").
         stamps
             .bee
             .immutable_batch(&stamps.permanent, "the permanent batch (--batch)")
@@ -228,7 +228,7 @@ impl Stamps {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -250,7 +250,9 @@ mod tests {
 
     /// A local HTTP server answering its n-th connection with `bodies[n]` as JSON (`None`:
     /// a 404, `Some("500")`: a server error).
-    fn serve(bodies: Vec<Option<&'static str>>) -> alloy::transports::http::reqwest::Url {
+    pub(crate) fn serve(
+        bodies: Vec<Option<&'static str>>,
+    ) -> alloy::transports::http::reqwest::Url {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap())

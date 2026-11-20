@@ -105,7 +105,8 @@ enum StampsCommand {
         #[arg(long, default_value_t = 0.5)]
         max_fill: f64,
         /// Seconds per block of the chain the postage contract is on (Gnosis Chain: 5).
-        #[arg(long, default_value_t = stamps::DEFAULT_BLOCK_SECS)]
+        #[arg(long, default_value_t = stamps::DEFAULT_BLOCK_SECS,
+              value_parser = clap::value_parser!(u64).range(1..))]
         block_secs: u64,
         /// The label for the buy command (owner, chain and first block of the index).
         #[arg(long)]
@@ -223,7 +224,8 @@ enum Command {
         from_start: bool,
     },
     /// The Bee node's postage batches: depth, the fill of the fullest bucket against its
-    /// capacity, the immutable flag and the remaining lifetime (`.claude/agent/postage.md`).
+    /// capacity, the immutable flag and the remaining lifetime (docs/address-index.md,
+    /// "Lifetime").
     /// With `--export`, which batch each of those exports was uploaded with. `stamps plan`
     /// sizes and prices a new batch for an export. Nothing is bought, topped up or diluted:
     /// that is the owner's action.

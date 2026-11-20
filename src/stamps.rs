@@ -1,5 +1,6 @@
 //! `ethswarm stamps`: the Bee node's postage batches and what uses them, and `stamps plan`:
-//! the depth, lifetime and cost of a batch for an export (`.claude/agent/postage.md`).
+//! the depth, lifetime and cost of a batch for an export (`docs/address-index.md`,
+//! *Lifetime*; for agents, `.claude/agent/postage.md`).
 //! Nothing here buys, tops up or dilutes a batch: that is the owner's action, and `plan`
 //! prints the command for it.
 
@@ -72,7 +73,9 @@ pub async fn list(bee: &Bee, exports: &[PathBuf]) -> Result<()> {
     }
     for b in &batches {
         print_batch(b);
+        let mut named = false;
         for u in uses.iter().filter(|u| u.batch == Some(b.batch_id)) {
+            named = true;
             println!(
                 "    used by the export {} (owner {}, chain {})",
                 u.dir.display(),
@@ -80,13 +83,17 @@ pub async fn list(bee: &Bee, exports: &[PathBuf]) -> Result<()> {
                 u.chain_id
             );
         }
+        if !named {
+            println!(
+                "    use unknown: no given export names it (its label, or the work item's \
+                 records, may)"
+            );
+        }
     }
-    if !uses.is_empty() {
-        println!(
-            "(Only an export's permanent batch is recorded, in its uploaded.json: lower batches \
-             an upload used show no user here.)"
-        );
-    }
+    println!(
+        "(Only an export's permanent batch is recorded, in its uploaded.json: a lower batch an \
+         upload used shows as unknown here.)"
+    );
     for u in &uses {
         match u.batch {
             None => println!(
@@ -148,6 +155,36 @@ pub async fn plan(bee: &Bee, dir: &Path, opts: &PlanOptions) -> Result<()> {
         "--max-fill must be in (0, 1], not {}",
         opts.max_fill
     );
+    ensure!(opts.block_secs >= 1, "--block-secs must be at least 1");
+    // Everything that can refuse the run is checked before the export is read: hashing a
+    // large one takes a while.
+    let priced = match opts.days {
+        None => None,
+        Some(days) => {
+            ensure!(days >= 1, "--days must be at least 1");
+            let secs = days
+                .checked_mul(86_400)
+                .with_context(|| format!("--days {days} is too long"))?;
+            let state = bee
+                .chain_state()
+                .await
+                .context("reading the storage price from the Bee node (GET /chainstate)")?;
+            ensure!(
+                state.current_price > 0,
+                "the Bee node reports a storage price of 0"
+            );
+            let blocks = secs.div_ceil(opts.block_secs);
+            if let Some(min) = state.minimum_validity_blocks {
+                ensure!(
+                    blocks > min,
+                    "{days} days are {blocks} blocks of {} s; Bee refuses a balance of \
+                     {min} blocks or fewer (its 24 h minimum): pass more --days",
+                    opts.block_secs
+                );
+            }
+            Some((days, secs, state))
+        }
+    };
     let mut all = BucketLoad::default();
     let mut permanent = BucketLoad::default();
     let mut lower = BucketLoad::default();
@@ -220,23 +257,19 @@ pub async fn plan(bee: &Bee, dir: &Path, opts: &PlanOptions) -> Result<()> {
              once its fullest bucket is full."
         );
     }
-    let Some(days) = opts.days else {
+    let Some((days, secs, state)) = priced else {
         println!("Pass --days N for the cost of keeping it N days at the current price.");
         return Ok(());
     };
-    ensure!(days >= 1, "--days must be at least 1");
-    let secs = days
-        .checked_mul(86_400)
-        .with_context(|| format!("--days {days} is too long"))?;
-    let state = bee
-        .chain_state()
-        .await
-        .context("reading the storage price from the Bee node (GET /chainstate)")?;
-    ensure!(
-        state.current_price > 0,
-        "the Bee node reports a storage price of 0"
-    );
     let amount = amount_for(state.current_price, secs, opts.block_secs);
+    if let Some(min) = state.minimum_validity_blocks
+        && secs.div_ceil(opts.block_secs) <= min + min / 4
+    {
+        println!(
+            "Close to Bee's 24 h minimum ({min} blocks): a price rise before the purchase makes \
+             Bee refuse it. Add a day to be safe."
+        );
+    }
     println!(
         "{days} days at the current price ({} PLUR per chunk per block, block {}, {} s per \
          block): a balance of {amount} PLUR per chunk. The price moves; this is an estimate.",
@@ -260,6 +293,13 @@ pub async fn plan(bee: &Bee, dir: &Path, opts: &PlanOptions) -> Result<()> {
     }
     if opts.label.is_none() {
         println!("  (--label names the batch: owner, chain and first block of the index.)");
+    }
+    if lower.chunks() > 0 {
+        println!(
+            "Every line is priced for --days and named by --label. A lower batch needs only \
+             its slices' lifetime plus --grace-days, and a label of its own: run plan again \
+             with those for the lower line."
+        );
     }
     Ok(())
 }

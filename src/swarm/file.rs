@@ -22,13 +22,17 @@ const BRANCHES: usize = CHUNK_SIZE / 32;
 
 /// Root reference of `data` as Bee computes it for `POST /bytes`.
 pub fn file_reference(data: &[u8]) -> B256 {
+    file_tree(data, &mut |_, _, _| Ok(())).expect("no sink errors")
+}
+
+/// Every chunk Bee stores for `POST /bytes` of `data`, handed to `out` (leaves, then each
+/// intermediate chunk once complete); returns the root reference.
+pub fn file_tree(data: &[u8], out: &mut ChunkSink) -> Result<B256> {
     let mut tree = ChunkTree::default();
-    let mut none = |_: B256, _: u64, _: &[u8]| Ok(());
     for leaf in data.chunks(CHUNK_SIZE) {
-        tree.push_leaf(leaf, &mut none)
-            .expect("full leaves before the last");
+        tree.push_leaf(leaf, out)?;
     }
-    tree.finish(&mut none).expect("no sink errors")
+    tree.finish(out)
 }
 
 /// Where [`ChunkTree`] hands each chunk it makes: its address, span and payload.

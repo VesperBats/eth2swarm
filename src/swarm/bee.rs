@@ -76,6 +76,10 @@ impl BatchInfo {
 pub struct ChainState {
     pub block: u64,
     pub current_price: u128,
+    /// Blocks a new batch's balance must exceed: Bee refuses a purchase of that many
+    /// blocks or fewer ("insufficient amount for 24h minimum validity"). `None` if Bee
+    /// did not say.
+    pub minimum_validity_blocks: Option<u64>,
 }
 
 /// A number Bee sends as a JSON number or as a decimal string (its big integers).
@@ -154,6 +158,9 @@ impl Bee {
         Ok(ChainState {
             block: big_number(&v["block"], "chainstate block")? as u64,
             current_price: big_number(&v["currentPrice"], "chainstate currentPrice")?,
+            minimum_validity_blocks: big_number(&v["minimumValidityBlocks"], "")
+                .ok()
+                .map(|b| b as u64),
         })
     }
 
@@ -168,7 +175,7 @@ impl Bee {
     }
 
     /// Batch `id` of this node, refused unless Bee knows it and it is immutable
-    /// (`.claude/agent/postage.md`, rule 5). `what` names its use for the message.
+    /// (`.claude/agent/postage.md`, "Immutable batches only"). `what` names its use for the message.
     pub async fn immutable_batch(&self, id: &B256, what: &str) -> Result<BatchInfo> {
         let info = self
             .batch(id)
