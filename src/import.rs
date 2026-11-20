@@ -45,6 +45,7 @@ pub async fn run(
         Some(b) => b,
         None => bee.usable_batch().await?,
     };
+    bee.immutable_batch(&batch, "the batch (--batch)").await?;
     let owner = signer.address();
     info!(%chain_id, %owner, %batch, total, "importing");
 

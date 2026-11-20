@@ -3,4 +3,5 @@
 pub mod bee;
 pub mod bmt;
 pub mod file;
+pub mod postage;
 pub mod soc;

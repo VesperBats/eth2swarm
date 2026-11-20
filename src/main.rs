@@ -6,6 +6,7 @@ mod devnet;
 mod import;
 mod inspect;
 mod layout;
+mod stamps;
 mod swarm;
 
 use alloy::primitives::{Address, B256};
@@ -51,7 +52,7 @@ struct Cli {
 struct Stamping {
     /// Postage batch ID for the permanent records: heads, the origin, top-level slices, and
     /// everything without --lower-batch. Defaults to the batch of the earlier uploads of the
-    /// directory (addr-upload), else the Bee node's first usable batch; required with
+    /// directory (addr-upload), else the Bee node's first usable immutable batch; required with
     /// --lower-batch.
     #[arg(long)]
     batch: Option<B256>,
@@ -84,6 +85,32 @@ struct Source {
     /// publisher instead of verifying independently).
     #[arg(long, env = "ETH2SWARM_ANCHOR")]
     anchor: Option<B256>,
+}
+
+#[derive(Subcommand)]
+enum StampsCommand {
+    /// The postage batch an export needs: every chunk its upload stamps, counted per bucket
+    /// (a chunk address's first 16 bits), the smallest depth that holds the fullest bucket
+    /// with room to spare, and with `--days` the cost at the node's current price and the
+    /// command to buy it. With lower slices in the export, also the permanent batch's and a
+    /// lower batch's share.
+    Plan {
+        /// The export directory.
+        dir: std::path::PathBuf,
+        /// Price a lifetime of this many days (reads the price from the Bee node).
+        #[arg(long)]
+        days: Option<u64>,
+        /// The highest share of its capacity the fullest bucket may take (0 to 1): room for
+        /// what an index adds later, and a plan that is not exact to the chunk.
+        #[arg(long, default_value_t = 0.5)]
+        max_fill: f64,
+        /// Seconds per block of the chain the postage contract is on (Gnosis Chain: 5).
+        #[arg(long, default_value_t = stamps::DEFAULT_BLOCK_SECS)]
+        block_secs: u64,
+        /// The label for the buy command (owner, chain and first block of the index).
+        #[arg(long)]
+        label: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -194,6 +221,19 @@ enum Command {
         /// Upload everything again, ignoring the progress of earlier uploads.
         #[arg(long)]
         from_start: bool,
+    },
+    /// The Bee node's postage batches: depth, the fill of the fullest bucket against its
+    /// capacity, the immutable flag and the remaining lifetime (`.claude/agent/postage.md`).
+    /// With `--export`, which batch each of those exports was uploaded with. `stamps plan`
+    /// sizes and prices a new batch for an export. Nothing is bought, topped up or diluted:
+    /// that is the owner's action.
+    #[command(args_conflicts_with_subcommands = true)]
+    Stamps {
+        #[command(subcommand)]
+        plan: Option<StampsCommand>,
+        /// An export directory (`addr-import --out`) to name the upload batch of (repeatable).
+        #[arg(long = "export")]
+        exports: Vec<std::path::PathBuf>,
     },
     /// Look an address up in the published address index (newest first).
     AddrLookup {
@@ -317,7 +357,8 @@ enum Command {
         /// Number of epochs to import, starting at block 0.
         #[arg(long, default_value_t = 4)]
         epochs: u32,
-        /// Postage batch ID. Defaults to the Bee node's first usable batch.
+        /// Postage batch ID (immutable). Defaults to the Bee node's first usable immutable
+        /// batch.
         #[arg(long)]
         batch: Option<B256>,
     },
@@ -482,6 +523,33 @@ async fn main() -> Result<()> {
                 a.authority.map_or("none".to_string(), |x| x.to_string()),
                 a.failed_creation
             );
+        }
+        Command::Stamps {
+            plan: None,
+            exports,
+        } => stamps::list(&bee, &exports).await?,
+        Command::Stamps {
+            plan:
+                Some(StampsCommand::Plan {
+                    dir,
+                    days,
+                    max_fill,
+                    block_secs,
+                    label,
+                }),
+            ..
+        } => {
+            stamps::plan(
+                &bee,
+                &dir,
+                &stamps::PlanOptions {
+                    days,
+                    max_fill,
+                    block_secs,
+                    label,
+                },
+            )
+            .await?
         }
         Command::AddrUpload {
             dir,

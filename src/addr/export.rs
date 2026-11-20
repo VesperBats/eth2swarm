@@ -572,8 +572,8 @@ async fn upload_one(
 }
 
 /// How `addr-upload` stamps: the permanent batch (default: the one the earlier uploads of the
-/// directory used, else the node's first usable batch), the batches for lower slices, and the
-/// grace period they must outlive a slice by.
+/// directory used, else the node's first usable immutable batch), the batches for lower
+/// slices, and the grace period they must outlive a slice by.
 #[derive(Debug, Clone, Default)]
 pub struct Batches {
     pub permanent: Option<B256>,
@@ -581,6 +581,58 @@ pub struct Batches {
     pub grace_days: u64,
     /// Seconds per block of the chain.
     pub slot_secs: u64,
+}
+
+/// Every chunk an upload of the export in `dir` stamps, up to its committed length, as
+/// `(address, life)`: a SOC or head under its address, a large spill file's chunk under its
+/// address, and every chunk of a spill or pages file's tree (the chunks Bee stores for
+/// `POST /bytes`). `life` is the record's ([`Record::life`]). A record written twice (a merge
+/// a stopped run wrote again) is listed twice, as `addr-upload` sends it twice.
+pub fn for_each_chunk(dir: &Path, mut f: impl FnMut(&B256, Option<u64>)) -> Result<ExportMeta> {
+    let meta = ExportMeta::read(dir)?;
+    let committed = read_committed(dir)?.context("the export has no committed length")?;
+    let mut records = Records::open(dir, meta.format, 0, committed)?;
+    while let Some(rec) = records.next_record()? {
+        match rec.kind {
+            SOC | HEAD | CHUNK => f(&rec.key, rec.life),
+            FILE => {
+                let mut tree = crate::swarm::file::ChunkTree::default();
+                let mut out = |address: B256, _: u64, _: &[u8]| {
+                    f(&address, rec.life);
+                    Ok(())
+                };
+                for leaf in rec.data.chunks(crate::swarm::bmt::CHUNK_SIZE) {
+                    tree.push_leaf(leaf, &mut out)?;
+                }
+                let root = tree.finish(&mut out)?;
+                ensure!(
+                    root == rec.key,
+                    "the file record at {} has reference {}, its data {root}",
+                    rec.offset,
+                    rec.key
+                );
+            }
+            k => bail!("record of unknown kind {k} at {}", rec.offset),
+        }
+    }
+    Ok(meta)
+}
+
+/// The export's owner, chain and the batch its uploads used so far (`uploaded.json`), for
+/// `ethswarm stamps`.
+pub fn upload_batch(dir: &Path) -> Result<(ExportMeta, Option<B256>)> {
+    let meta = ExportMeta::read(dir)?;
+    let path = dir.join(PROGRESS_FILE);
+    let batch = match std::fs::read(&path) {
+        Ok(bytes) => {
+            serde_json::from_slice::<Progress>(&bytes)
+                .with_context(|| format!("reading {}", path.display()))?
+                .batch
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok((meta, batch))
 }
 
 /// Uploads the export in `dir` through `bee`, from where the last upload of this directory
