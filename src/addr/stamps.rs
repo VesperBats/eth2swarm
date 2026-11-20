@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use alloy::primitives::B256;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use tracing::warn;
 
 use super::layout::{L_MAX, UNIT_BLOCKS};
@@ -98,8 +98,8 @@ pub struct Stamps {
 impl Stamps {
     /// The stamping of a run: `permanent` for permanent records, `lower` for lower slices
     /// (`slot_secs`: the chain's seconds per block, mainnet [`SLOT_SECS`]). Refused if the
-    /// permanent batch is also a lower one, or Bee does not know a lower batch (a mistyped
-    /// id would otherwise send every lower slice to the permanent batch).
+    /// permanent batch is also a lower one, if Bee does not know a batch (a mistyped lower id
+    /// would otherwise send every lower slice to the permanent batch), or if one is mutable.
     pub async fn open(
         bee: Bee,
         permanent: B256,
@@ -122,13 +122,17 @@ impl Stamps {
             used: Mutex::new(BTreeMap::new()),
             fell_back: Mutex::new(0),
         };
+        // Every batch must be known and immutable: a mutable one loses chunks once a bucket
+        // is full (`.claude/agent/postage.md`, "Immutable batches only").
+        stamps
+            .bee
+            .immutable_batch(&stamps.permanent, "the permanent batch (--batch)")
+            .await?;
         for b in &stamps.lower {
             let info = stamps
                 .bee
-                .batch(b)
-                .await
-                .with_context(|| format!("reading lower batch {b}"))?
-                .with_context(|| format!("Bee knows no batch {b} (--lower-batch)"))?;
+                .immutable_batch(b, "lower batch (--lower-batch)")
+                .await?;
             if !info.usable {
                 warn!("lower batch {b} is not usable yet: left out until it is");
             }
@@ -224,7 +228,7 @@ impl Stamps {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -246,7 +250,9 @@ mod tests {
 
     /// A local HTTP server answering its n-th connection with `bodies[n]` as JSON (`None`:
     /// a 404, `Some("500")`: a server error).
-    fn serve(bodies: Vec<Option<&'static str>>) -> alloy::transports::http::reqwest::Url {
+    pub(crate) fn serve(
+        bodies: Vec<Option<&'static str>>,
+    ) -> alloy::transports::http::reqwest::Url {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap())
@@ -282,11 +288,13 @@ mod tests {
         );
         let ttl = |t: u64| -> Option<&'static str> {
             Some(Box::leak(
-                format!(r#"{{"usable":true,"batchTTL":{t}}}"#).into_boxed_str(),
+                format!(r#"{{"usable":true,"batchTTL":{t},"immutableFlag":true}}"#)
+                    .into_boxed_str(),
             ))
         };
         let bee = Bee::new(serve(vec![
-            // open: both known
+            // open: the permanent batch, then both lower ones known
+            ttl(1_000_000),
             ttl(1_000),
             ttl(100_000),
             // refresh 1
@@ -329,13 +337,36 @@ mod tests {
     #[tokio::test]
     async fn stamps_refuse_a_mixed_up_or_unknown_batch() {
         let (perm, a) = (B256::repeat_byte(9), B256::repeat_byte(1));
-        let bee = Bee::new(serve(vec![None])).unwrap().with_retries(1);
+        let ok = r#"{"usable":true,"batchTTL":1000,"immutableFlag":true}"#;
+        // The permanent batch is fine, the lower one unknown.
+        let bee = Bee::new(serve(vec![Some(ok), None]))
+            .unwrap()
+            .with_retries(1);
         let err = Stamps::open(bee.clone(), perm, vec![a], 7, 12)
             .await
             .err()
             .unwrap();
         assert!(format!("{err:#}").contains("knows no batch"), "{err:#}");
+        assert!(format!("{err:#}").contains("--lower-batch"), "{err:#}");
         assert!(Stamps::open(bee, perm, vec![perm], 7, 12).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stamps_refuse_a_mutable_batch() {
+        let (perm, a) = (B256::repeat_byte(9), B256::repeat_byte(1));
+        let ok = r#"{"usable":true,"batchTTL":1000,"immutableFlag":true}"#;
+        let mutable = r#"{"usable":true,"batchTTL":1000,"immutableFlag":false}"#;
+        let silent = r#"{"usable":true,"batchTTL":1000}"#;
+        for (answers, what) in [
+            (vec![Some(mutable)], "the permanent batch"),
+            (vec![Some(ok), Some(mutable)], "lower batch"),
+            (vec![Some(silent)], "unknown mutability"),
+        ] {
+            let bee = Bee::new(serve(answers)).unwrap().with_retries(1);
+            let err = Stamps::open(bee, perm, vec![a], 7, 12).await.err().unwrap();
+            let e = format!("{err:#}");
+            assert!(e.contains(what) && e.contains("immutable batch"), "{e}");
+        }
     }
 
     #[test]

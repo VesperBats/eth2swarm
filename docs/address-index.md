@@ -483,7 +483,26 @@ How the importer stamps (`addr-import` and `addr-upload`, `--batch` and `--lower
   The lifetime is counted from when the record was written, so an upload long after the
   export over-provisions rather than under-provisions.
 - A batch fills up as well as expiring: a lower batch must be deep enough for what it is
-  chosen for, or the upload fails when it is full.
+  chosen for, or the upload fails when it is full. A batch of depth `d` holds 2^(d−16)
+  chunks in each of its 65,536 buckets (a chunk address's first 16 bits), and it is full
+  when its fullest bucket is: the depth follows that bucket, not the total.
+- Every batch must be immutable: `addr-import`, `addr-upload` and `import` refuse a mutable
+  batch, and one whose mutability Bee does not report. A full bucket of a mutable batch
+  overwrites its oldest chunk, which loses write-once records without an error.
+- **Choosing and sizing batches** (`.claude/agent/postage.md` for agents working here):
+  - `ethswarm stamps [--export <dir>]...` lists the node's batches. For each it shows the
+    depth, the fullest bucket against capacity, whether it is immutable and usable, and the
+    remaining lifetime, plus which of the given exports was uploaded with it.
+  - `ethswarm stamps plan <dir> [--days N]` counts every chunk an export's upload stamps,
+    per bucket. It gives the smallest depth that keeps the fullest bucket at most
+    `--max-fill` full (default half), for one batch taking everything, and for the
+    permanent and lower records apart.
+  - With `--days`, `plan` also prices that lifetime at the node's current storage price,
+    and prints the command that buys such a batch (immutable, with a `--label`). Buying,
+    topping up and diluting stay the operator's action: no command here does them.
+  - Example: the mainnet month index of 2026-11-20 stamps 779,755 chunks with a fullest
+    bucket of 32. That is depth 21 exactly full and 22 half full; it was uploaded to a
+    depth-23 batch, which Bee then reported as 32/128.
 
 The cap is what keeps the history from being rewritten: without it, the whole history
 would be merged into one new top slice every time `N` reaches a power of two, briefly

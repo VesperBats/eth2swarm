@@ -572,8 +572,8 @@ async fn upload_one(
 }
 
 /// How `addr-upload` stamps: the permanent batch (default: the one the earlier uploads of the
-/// directory used, else the node's first usable batch), the batches for lower slices, and the
-/// grace period they must outlive a slice by.
+/// directory used, else the node's first usable immutable batch), the batches for lower
+/// slices, and the grace period they must outlive a slice by.
 #[derive(Debug, Clone, Default)]
 pub struct Batches {
     pub permanent: Option<B256>,
@@ -581,6 +581,53 @@ pub struct Batches {
     pub grace_days: u64,
     /// Seconds per block of the chain.
     pub slot_secs: u64,
+}
+
+/// Every chunk an upload of the export in `dir` stamps, up to its committed length, as
+/// `(address, life)`: a SOC or head under its address, a large spill file's chunk under its
+/// address, and every chunk of a spill or pages file's tree (the chunks Bee stores for
+/// `POST /bytes`). `life` is the record's ([`Record::life`]). A record written twice (a merge
+/// a stopped run wrote again) is listed twice, as `addr-upload` sends it twice.
+pub fn for_each_chunk(dir: &Path, mut f: impl FnMut(&B256, Option<u64>)) -> Result<ExportMeta> {
+    let meta = ExportMeta::read(dir)?;
+    let committed = read_committed(dir)?.context("the export has no committed length")?;
+    let mut records = Records::open(dir, meta.format, 0, committed)?;
+    while let Some(rec) = records.next_record()? {
+        match rec.kind {
+            SOC | HEAD | CHUNK => f(&rec.key, rec.life),
+            FILE => {
+                let root = crate::swarm::file::file_tree(&rec.data, &mut |address, _, _| {
+                    f(&address, rec.life);
+                    Ok(())
+                })?;
+                ensure!(
+                    root == rec.key,
+                    "the file record at {} has reference {}, its data {root}",
+                    rec.offset,
+                    rec.key
+                );
+            }
+            k => bail!("record of unknown kind {k} at {}", rec.offset),
+        }
+    }
+    Ok(meta)
+}
+
+/// The export's owner, chain and the batch its uploads used so far (`uploaded.json`), for
+/// `ethswarm stamps`.
+pub fn upload_batch(dir: &Path) -> Result<(ExportMeta, Option<B256>)> {
+    let meta = ExportMeta::read(dir)?;
+    let path = dir.join(PROGRESS_FILE);
+    let batch = match std::fs::read(&path) {
+        Ok(bytes) => {
+            serde_json::from_slice::<Progress>(&bytes)
+                .with_context(|| format!("reading {}", path.display()))?
+                .batch
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok((meta, batch))
 }
 
 /// Uploads the export in `dir` through `bee`, from where the last upload of this directory
@@ -618,6 +665,7 @@ pub async fn upload(
             bee.usable_batch().await?
         }
     };
+    let recorded_batch = progress.batch;
     if let Some(recorded) = progress.batch {
         ensure!(
             recorded == batch,
@@ -635,6 +683,27 @@ pub async fn upload(
             meta.format
         );
     }
+    // Resuming with a recorded batch that is refused now (gone, or not immutable): only
+    // --from-start with another batch goes on, so say that. Anything else (a lower batch, a
+    // node that cannot be asked) is left to Stamps::open, whose message names it.
+    if recorded_batch == Some(batch) {
+        match bee.batch(&batch).await {
+            // Only the node that bought a batch holds it: a 404 is another node as often as
+            // an expired batch, and the cheap remedy goes first.
+            Ok(None) => bail!(
+                "{} was uploaded with {batch} so far, and this Bee node does not hold it: if it \
+                 is another node's, pass that node with --bee; if it expired, upload everything \
+                 again with --from-start --batch <an immutable batch>",
+                dir.display()
+            ),
+            Ok(Some(info)) if info.immutable != Some(true) => bail!(
+                "{} was uploaded with {batch} so far, and it is not immutable: to go on, upload \
+                 everything again with --from-start --batch <an immutable batch>",
+                dir.display()
+            ),
+            _ => {}
+        }
+    }
     let stamps = std::sync::Arc::new(
         Stamps::open(
             bee.clone(),
@@ -643,7 +712,8 @@ pub async fn upload(
             batches.grace_days,
             batches.slot_secs,
         )
-        .await?,
+        .await
+        .with_context(|| format!("the batches for {}", dir.display()))?,
     );
     // The log must still hold the head the last upload ended with.
     if let Some(head) = progress.last_head {
@@ -789,6 +859,114 @@ mod tests {
             drop(log);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn every_stamped_chunk_is_listed() {
+        let dir = tmp("chunks");
+        let signer = PrivateKeySigner::random();
+        let meta = ExportMeta::new(1, signer.address());
+        // 5,000 bytes: two leaves and the chunk above them.
+        let file = vec![7u8; 5000];
+        let reference = file_reference(&file);
+        let soc = soc::sign(&signer, B256::repeat_byte(1), b"bucket".to_vec()).unwrap();
+        let head = soc::sign(&signer, B256::repeat_byte(2), b"head".to_vec()).unwrap();
+        let leaf = crate::swarm::file::chunk_wire(3, b"abc");
+        let leaf_addr = crate::swarm::bmt::cac_address(3, b"abc");
+
+        let mut log = ExportLog::open(&dir, &meta, None).unwrap();
+        log.append(FILE, &reference, Some(3), &file).unwrap();
+        log.append_soc(SOC, &meta.owner, Some(5), &soc).unwrap();
+        log.append(CHUNK, &leaf_addr, Some(5), &leaf).unwrap();
+        // Written twice, as a merge a stopped run wrote again.
+        log.append_soc(SOC, &meta.owner, Some(5), &soc).unwrap();
+        log.append_soc(HEAD, &meta.owner, None, &head).unwrap();
+        let end = log.checkpoint().unwrap();
+        log.commit(end).unwrap();
+        drop(log);
+
+        let mut seen = Vec::new();
+        let back = for_each_chunk(&dir, |a, life| seen.push((*a, life))).unwrap();
+        assert_eq!(back, meta);
+        let file_chunks: Vec<_> = seen.iter().take(3).collect();
+        assert_eq!(crate::swarm::file::file_chunks(file.len()), 3);
+        assert!(file_chunks.iter().all(|(_, life)| *life == Some(3)));
+        assert_eq!(file_chunks[2].0, reference, "the tree's root, last");
+        let soc_addr = soc_address(&B256::repeat_byte(1), &meta.owner);
+        assert_eq!(
+            seen[3..].to_vec(),
+            vec![
+                (soc_addr, Some(5)),
+                (leaf_addr, Some(5)),
+                (soc_addr, Some(5)),
+                (soc_address(&B256::repeat_byte(2), &meta.owner), None)
+            ],
+            "every SOC, chunk and head under its address, twice if written twice"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_hint_only_for_a_refused_recorded_batch() {
+        use crate::addr::stamps::tests::serve;
+        let dir = tmp("resume");
+        let signer = PrivateKeySigner::random();
+        let meta = ExportMeta::new(1, signer.address());
+        let mut log = ExportLog::open(&dir, &meta, None).unwrap();
+        let head = soc::sign(&signer, B256::repeat_byte(2), b"head".to_vec()).unwrap();
+        log.append_soc(HEAD, &meta.owner, None, &head).unwrap();
+        let end = log.checkpoint().unwrap();
+        log.commit(end).unwrap();
+        drop(log);
+        let (perm, lower) = (B256::repeat_byte(9), B256::repeat_byte(1));
+        Progress {
+            batch: Some(perm),
+            ..Default::default()
+        }
+        .save(&dir.join(PROGRESS_FILE))
+        .unwrap();
+        let ok = r#"{"usable":true,"batchTTL":1000,"immutableFlag":true}"#;
+        let mutable = r#"{"usable":true,"batchTTL":1000,"immutableFlag":false}"#;
+        let run = |answers: Vec<Option<&'static str>>, lower: Vec<B256>| {
+            let dir = dir.clone();
+            async move {
+                let bee = Bee::new(serve(answers)).unwrap().with_retries(1);
+                let batches = Batches {
+                    permanent: Some(perm),
+                    lower,
+                    grace_days: 7,
+                    slot_secs: 12,
+                };
+                format!(
+                    "{:#}",
+                    upload(&bee, batches, &dir, 1, false).await.err().unwrap()
+                )
+            }
+        };
+        // The recorded batch is gone, or mutable: only --from-start goes on.
+        // The recorded batch is not on this node (another node's, or expired): --bee first,
+        // then --from-start. Mutable: only --from-start goes on.
+        let e = run(vec![None], vec![]).await;
+        assert!(
+            e.contains("pass that node with --bee") && e.contains("--from-start"),
+            "{e}"
+        );
+        let e = run(vec![Some(mutable)], vec![]).await;
+        assert!(
+            e.contains("not immutable") && e.contains("--from-start"),
+            "{e}"
+        );
+        // The recorded batch is fine, a lower batch is gone: no --from-start, the lower
+        // batch named.
+        let e = run(vec![Some(ok), Some(ok), None], vec![lower]).await;
+        assert!(
+            !e.contains("--from-start") && e.contains("--lower-batch"),
+            "{e}"
+        );
+        // The node cannot be asked: no --from-start either.
+        let e = run(vec![Some("500")], vec![]).await;
+        assert!(!e.contains("--from-start"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

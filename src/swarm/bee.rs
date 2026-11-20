@@ -33,26 +33,70 @@ struct Reference {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Stamp {
-    #[serde(rename = "batchID")]
-    batch_id: B256,
-    usable: bool,
-}
-
-#[derive(Deserialize)]
 struct Stamps {
-    stamps: Vec<Stamp>,
+    stamps: Vec<BatchInfo>,
 }
 
-/// What Bee says about one postage batch.
+/// What Bee says about one postage batch of this node (`GET /stamps`, `/stamps/{id}`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchInfo {
+    #[serde(rename = "batchID", default)]
+    pub batch_id: B256,
     pub usable: bool,
     /// Seconds until the batch expires at the current price (`-1`: unknown).
     #[serde(rename = "batchTTL")]
     pub ttl: i64,
+    /// Immutable: a full bucket refuses the next chunk. A mutable batch overwrites the
+    /// bucket's oldest chunk instead, which for write-once SOCs is silent data loss.
+    /// `None` when Bee did not say (counted as not immutable).
+    #[serde(rename = "immutableFlag", default)]
+    pub immutable: Option<bool>,
+    /// 2^depth chunks in 2^bucket_depth buckets.
+    #[serde(default)]
+    pub depth: u8,
+    #[serde(default)]
+    pub bucket_depth: u8,
+    /// Chunks in the fullest bucket.
+    #[serde(default)]
+    pub utilization: u64,
+    #[serde(default)]
+    pub label: String,
+    /// The batch still exists on chain (Bee's `exists`; `true` when Bee did not say).
+    #[serde(default = "yes")]
+    pub exists: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl BatchInfo {
+    /// Chunks one bucket holds.
+    pub fn bucket_capacity(&self) -> u64 {
+        1u64 << self.depth.saturating_sub(self.bucket_depth).min(63)
+    }
+}
+
+/// What `GET /chainstate` says: the storage price, in PLUR per chunk per block.
+#[derive(Debug, Clone)]
+pub struct ChainState {
+    pub block: u64,
+    pub current_price: u128,
+    /// Blocks a new batch's balance must exceed: Bee refuses a purchase of that many
+    /// blocks or fewer ("insufficient amount for 24h minimum validity"). `None` if Bee
+    /// did not say.
+    pub minimum_validity_blocks: Option<u64>,
+}
+
+/// A number Bee sends as a JSON number or as a decimal string (its big integers).
+fn big_number(v: &serde_json::Value, what: &str) -> Result<u128> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64().map(u128::from),
+        serde_json::Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+    .with_context(|| format!("{what}: not a non-negative integer: {v}"))
 }
 
 impl Bee {
@@ -82,14 +126,19 @@ impl Bee {
         self
     }
 
+    /// The API base URL, ending in `/`.
+    pub fn base_url(&self) -> &Url {
+        &self.base
+    }
+
     fn url(&self, path: &str) -> Result<Url> {
         self.base
             .join(path)
             .with_context(|| format!("building Bee URL for {path}"))
     }
 
-    /// First usable postage batch owned by this node.
-    pub async fn usable_batch(&self) -> Result<B256> {
+    /// The postage batches of this node (`GET /stamps`).
+    pub async fn stamps(&self) -> Result<Vec<BatchInfo>> {
         let stamps: Stamps = self
             .http
             .get(self.url("stamps")?)
@@ -99,12 +148,58 @@ impl Bee {
             .json()
             .await
             .context("parsing /stamps")?;
-        stamps
-            .stamps
+        Ok(stamps.stamps)
+    }
+
+    /// The storage price and the block it is read at (`GET /chainstate`).
+    pub async fn chain_state(&self) -> Result<ChainState> {
+        let v: serde_json::Value = self
+            .http
+            .get(self.url("chainstate")?)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .context("parsing /chainstate")?;
+        Ok(ChainState {
+            block: big_number(&v["block"], "chainstate block")? as u64,
+            current_price: big_number(&v["currentPrice"], "chainstate currentPrice")?,
+            minimum_validity_blocks: big_number(&v["minimumValidityBlocks"], "")
+                .ok()
+                .map(|b| b as u64),
+        })
+    }
+
+    /// First usable immutable postage batch owned by this node.
+    pub async fn usable_batch(&self) -> Result<B256> {
+        self.stamps()
+            .await?
             .into_iter()
-            .find(|s| s.usable)
+            .find(|s| s.usable && s.immutable == Some(true))
             .map(|s| s.batch_id)
-            .context("Bee node has no usable postage batch (pass --batch)")
+            .context("Bee node has no usable immutable postage batch (pass --batch)")
+    }
+
+    /// Batch `id` of this node, refused unless Bee knows it and it is immutable
+    /// (`.claude/agent/postage.md`, "Immutable batches only"). `what` names its use for the message.
+    pub async fn immutable_batch(&self, id: &B256, what: &str) -> Result<BatchInfo> {
+        let info = self
+            .batch(id)
+            .await
+            .with_context(|| format!("reading {what} {id}"))?
+            .with_context(|| format!("Bee knows no batch {id} ({what})"))?;
+        anyhow::ensure!(
+            info.immutable == Some(true),
+            "{what} {id} is {}: a mutable batch whose bucket is full overwrites its oldest \
+             chunk, which loses write-once data without a word. Use an immutable batch",
+            if info.immutable.is_none() {
+                "of unknown mutability (Bee did not say)"
+            } else {
+                "mutable"
+            }
+        );
+        Ok(info)
     }
 
     /// A postage batch of this node: whether it is usable and how long it lives; `None` if
