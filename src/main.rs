@@ -843,9 +843,15 @@ where
             first_block(level, index)
         );
     }
-    for index in windows {
+    // Progress on stderr every 30 s: the window's and the whole run's (stdout is the tables).
+    let per_window = last_block(level, 0) - first_block(level, 0) + 1;
+    let count = windows.len();
+    let now = std::time::Instant::now;
+    let mut run = addr::stats::Progress::new(per_window * count as u64, now());
+    for (k, index) in windows.into_iter().enumerate() {
         let (first, last) = (first_block(level, index), last_block(level, index));
-        eprintln!("fetching blocks {first}..={last}");
+        eprintln!("window {}/{count}: fetching blocks {first}..={last}", k + 1);
+        let mut window = addr::stats::Progress::new(per_window, now());
         let mut apps = Vec::new();
         let mut txs = 0u64;
         addr::fetch::fetch_appearances(
@@ -856,10 +862,22 @@ where
             |b| {
                 apps.extend(b.appearances);
                 txs += b.txs as u64;
+                let t = now();
+                if let Some(line) = window.block(t) {
+                    eprintln!("  window {}/{count}: {line}", k + 1);
+                    // The run's line goes with the window's, on the same 30 s.
+                    eprintln!("  whole run: {}", run.line(t));
+                }
+                run.block(t);
                 Ok(())
             },
         )
         .await?;
+        eprintln!(
+            "window {}/{count} done; whole run: {}",
+            k + 1,
+            run.line(now())
+        );
         let w = addr::stats::window_stats((level, index), &apps, txs, roles)?;
         println!("{}", addr::stats::render(&w));
     }
