@@ -22,7 +22,9 @@ use std::collections::BTreeMap;
 
 use alloy::primitives::B256;
 
-use super::detect::{Appearance, BlockData, LogData, Trace, TxData, check_traces, detect, role};
+use super::detect::{
+    Appearance, BlockData, LogData, Trace, TxData, check_traces, detect, detect_with_frames, role,
+};
 use super::layout::{first_block, last_block};
 use super::slice::{BuiltSlice, SliceId, build_slice};
 use crate::chain::fetch_verified_block;
@@ -180,6 +182,55 @@ async fn fetch_with_retry<P: Provider>(
     }
 }
 
+/// Where `TRACE` comes from: nowhere, `trace_block` (Erigon, Reth, Anvil), or an archive
+/// node's frame index (`super::trace_index`, the exact source under rule (A)).
+#[derive(Debug, Clone, Default)]
+pub enum Traces {
+    #[default]
+    Off,
+    Rpc,
+    Index(std::sync::Arc<super::trace_index::TraceIndex>),
+}
+
+impl Traces {
+    /// From the `--traces` flag (`trace_block` or nothing).
+    pub fn rpc(on: bool) -> Self {
+        if on { Self::Rpc } else { Self::Off }
+    }
+
+    /// Whether `TRACE` is detected at all.
+    pub fn detects(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// [`detect`] for a fetched block, `TRACE` from `traces`: an index's entry for the block must
+/// name the same block (hash) with the same number of transactions.
+fn detect_block(data: &BlockData, traces: &Traces) -> Result<Vec<Appearance>> {
+    match traces {
+        Traces::Index(index) => {
+            // A binary search of preads over a file that can be GBs: off the async workers.
+            let entry = tokio::task::block_in_place(|| index.block(data.number))?;
+            ensure!(
+                entry.hash == data.hash,
+                "block {}: the trace index has hash {}, the node {} (another chain or a reorg)",
+                data.number,
+                entry.hash,
+                data.hash
+            );
+            ensure!(
+                entry.tx_count as usize == data.txs.len(),
+                "block {}: the trace index counts {} transactions, the block has {}",
+                data.number,
+                entry.tx_count,
+                data.txs.len()
+            );
+            Ok(detect_with_frames(data, Some(&entry.frames)))
+        }
+        _ => Ok(detect(data)),
+    }
+}
+
 /// The appearances of one block, with the hashes that link it to its neighbours.
 #[derive(Debug, Clone)]
 pub struct BlockAppearances {
@@ -199,7 +250,7 @@ pub struct BlockAppearances {
 pub async fn fetch_appearances<P>(
     provider: &P,
     blocks: std::ops::RangeInclusive<u64>,
-    traces: bool,
+    traces: &Traces,
     concurrency: usize,
     mut sink: impl FnMut(BlockAppearances) -> Result<()>,
 ) -> Result<()>
@@ -220,16 +271,17 @@ where
             && next_spawn <= end
             && next_spawn - next_emit < 2 * concurrency as u64
         {
-            let (p, n) = (provider.clone(), next_spawn);
+            let (p, n, t) = (provider.clone(), next_spawn, traces.clone());
             set.spawn(async move {
-                let data = fetch_with_retry(&p, n, traces).await?;
+                let data = fetch_with_retry(&p, n, matches!(t, Traces::Rpc)).await?;
+                let appearances = detect_block(&data, &t)?;
                 anyhow::Ok(BlockAppearances {
                     number: n,
                     hash: data.hash,
                     parent_hash: data.parent_hash,
                     timestamp: data.timestamp,
                     txs: data.txs.len(),
-                    appearances: detect(&data),
+                    appearances,
                 })
             });
             next_spawn += 1;
@@ -264,7 +316,7 @@ where
 pub async fn fetch_slice<P>(
     provider: &P,
     slice: SliceId,
-    traces: bool,
+    traces: &Traces,
     concurrency: usize,
 ) -> Result<BuiltSlice>
 where
@@ -279,11 +331,46 @@ where
         Ok(())
     })
     .await?;
-    build_slice(slice, 0, &apps, last_hash, role::mask(traces))
+    build_slice(slice, 0, &apps, last_hash, role::mask(traces.detects()))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_index_must_name_the_fetched_block() {
+        use super::super::trace_index::{TraceIndex, tests::write};
+        let dir = std::env::temp_dir().join(format!("a1tr-fetch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hash = B256::repeat_byte(5);
+        let inner = alloy::primitives::Address::repeat_byte(0x44);
+        write(&dir, 1, 7, 7, &[(hash, 1)], &[(7, 0, inner)]);
+        let traces = Traces::Index(std::sync::Arc::new(TraceIndex::open(&dir, 1).unwrap()));
+        let data = BlockData {
+            number: 7,
+            hash,
+            txs: vec![TxData::default()],
+            ..Default::default()
+        };
+        let apps = super::detect_block(&data, &traces).unwrap();
+        assert!(
+            apps.iter()
+                .any(|a| a.address == inner && a.roles == role::TRACE)
+        );
+        // Another hash, another transaction count: refused.
+        let other = BlockData {
+            hash: B256::repeat_byte(6),
+            ..data.clone()
+        };
+        assert!(super::detect_block(&other, &traces).is_err());
+        let more = BlockData {
+            txs: vec![TxData::default(), TxData::default()],
+            ..data
+        };
+        assert!(super::detect_block(&more, &traces).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

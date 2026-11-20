@@ -25,7 +25,7 @@ use tracing::info;
 use super::build::{Output, STREAM_FILE, SliceBuilder};
 use super::detect::role;
 use super::export::{self, ExportLog, ExportMeta};
-use super::fetch::fetch_appearances;
+use super::fetch::{Traces, fetch_appearances};
 use super::io::{join_one, write_atomic};
 use super::layout::{
     HeadRecord, L_MAX, MAX_UNITS, UNIT_BLOCKS, bucket_id, first_block, head_id, held_first_block,
@@ -33,6 +33,7 @@ use super::layout::{
 };
 use super::slice::{SliceId, cover, held, held_level, new_slice, resolve_after, units};
 use super::stamps::{self, Stamps};
+use super::trace_index::TraceIndex;
 use crate::swarm::{bee::Bee, soc};
 
 /// Name of the state file in the state directory.
@@ -144,6 +145,20 @@ pub struct State {
     /// the start falls into depends on the start, and its identifiers do not.
     #[serde(default)]
     pub backfilling: bool,
+    /// Where the index's `TRACE` comes from ([`trace_source`]), fixed by the first run: slices
+    /// from different sources (or from `trace_block` under the earlier `TRACE` rule, which
+    /// left out failed creations) must not be mixed in one index.
+    #[serde(default)]
+    pub trace_source: Option<String>,
+}
+
+/// The name a state records for a `TRACE` source: `None` without traces.
+fn trace_source(traces: &Traces) -> Option<String> {
+    match traces {
+        Traces::Off => None,
+        Traces::Rpc => Some("trace_block".into()),
+        Traces::Index(_) => Some("index".into()),
+    }
 }
 
 impl State {
@@ -256,6 +271,8 @@ pub struct ImportOptions {
     /// (default: from genesis). A later run must state the same unit or nothing.
     pub from_block: Option<u64>,
     pub traces: bool,
+    /// `TRACE` from an archive node's frame index (A1TR files) instead of `trace_block`.
+    pub trace_index: Option<PathBuf>,
     /// The permanent batch: top-level slices, heads, the origin (and everything without
     /// `lower_batches`).
     pub batch: Option<B256>,
@@ -303,7 +320,7 @@ struct Ctx<P> {
     chain_id: u64,
     /// The first unit the index covers.
     first_unit: u64,
-    traces: bool,
+    traces: Traces,
     max_level: u8,
     concurrency: usize,
     /// Where slices keep their sort runs while they are built.
@@ -363,7 +380,7 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
         let mut builder = SliceBuilder::new(
             slice,
             self.first_unit,
-            role::mask(self.traces),
+            role::mask(self.traces.detects()),
             &self.sort_dir,
             self.sort_buffer,
         )?
@@ -378,7 +395,7 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
         fetch_appearances(
             &self.provider,
             first..=last,
-            self.traces,
+            &self.traces,
             self.concurrency,
             |b| {
                 first_parent.get_or_insert(b.parent_hash);
@@ -764,7 +781,15 @@ where
     };
     let (complete, finalized) = finalized_units(provider).await?;
     let mut target = target_now(complete, finalized)?;
-    let roles = role::mask(opts.traces);
+    ensure!(
+        !(opts.traces && opts.trace_index.is_some()),
+        "--traces and --trace-index are two sources of TRACE: pass one"
+    );
+    let traces = match &opts.trace_index {
+        Some(d) => Traces::Index(std::sync::Arc::new(TraceIndex::open(d, chain_id)?)),
+        None => Traces::rpc(opts.traces),
+    };
+    let roles = role::mask(traces.detects());
     let existing = State::load(dir)?;
     ensure!(
         existing.is_some() || opts.init,
@@ -786,6 +811,21 @@ where
                 s.owner,
                 s.roles,
                 signer.address()
+            );
+            // A state from before the source was recorded, with TRACE: `trace_block` under the
+            // earlier rule.
+            let had = s.trace_source.clone().or_else(|| {
+                (s.roles & role::TRACE != 0).then(|| "trace_block (the earlier TRACE rule)".into())
+            });
+            ensure!(
+                had == trace_source(&traces),
+                "the index in {} takes TRACE from {}; this run from {}: one index keeps one \
+                 source (and one TRACE rule)",
+                dir.display(),
+                had.as_deref().unwrap_or("nowhere (no traces)"),
+                trace_source(&traces)
+                    .as_deref()
+                    .unwrap_or("nowhere (no traces)")
             );
             ensure!(
                 requested.is_none_or(|u| u == s.first_unit),
@@ -872,7 +912,7 @@ where
         signer: signer.clone(),
         chain_id,
         first_unit,
-        traces: opts.traces,
+        traces,
         max_level: opts.max_level,
         concurrency: opts.concurrency,
         sort_dir,
@@ -1073,6 +1113,7 @@ async fn backfill<P: Provider + Clone + 'static>(
         prepared: None,
         export_len: None,
         backfilling: true,
+        trace_source: trace_source(&ctx.traces),
     };
     ctx.save(&mut state, dir)?;
     let (mut parent, mut last) = (None, None);
@@ -1233,6 +1274,7 @@ mod tests {
             }),
             export_len: None,
             backfilling: false,
+            trace_source: None,
         };
         s.save(&dir).unwrap();
         assert_eq!(State::load(&dir).unwrap(), Some(s.clone()));

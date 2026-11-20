@@ -11,6 +11,7 @@ pub mod lookup;
 pub mod slice;
 pub mod stamps;
 pub mod stats;
+pub mod trace_index;
 #[cfg(test)]
 mod vectors;
 pub mod verify;
