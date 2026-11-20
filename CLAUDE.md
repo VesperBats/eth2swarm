@@ -22,7 +22,7 @@ against. Do not move them out of `.claude/`, and not into `.claude/rules/`
 | plan, resume or continue multi-PR work: a part, a merge, the final PR         | `.claude/agent/multi-pr-plans.md`    |
 | write a PR description, answer review comments, or handle a fork PR           | `.claude/agent/pull-requests.md`     |
 | work on, or come across, a security issue that is not public yet             | `.claude/agent/security-fixes.md`    |
-| upload to a Bee node other than the local bee-factory, or buy, top up or dilute a postage batch | `.claude/agent/postage.md` |
+| upload to, or buy, top up or dilute a postage batch on, any Bee node other than the local bee-factory | `.claude/agent/postage.md` |
 
 ## Workflow — the mandatory steps for EVERY work item
 
@@ -60,16 +60,19 @@ publishes the advisory; no tag goes on a `main` whose checks are red.
 
 ## Postage batches — ask before using one, never buy one
 
-Full text: `.claude/agent/postage.md` (owner's request, 2026-11-20). For an upload
-to any Bee node other than the local bee-factory dev chain:
-- **Ask the owner which batch to use** before the first upload of a work item.
-  Show the candidates with their depth, fill, lifetime and current use, and pass
-  the answer as `--batch`, never a node's "first usable batch".
-- **A new batch is proposed, never bought.** Propose its depth (from
-  `ethswarm stamps plan`), its lifetime and why, its cost and its label: one
-  immutable batch per index.
-- **Never buy, top up or dilute a batch yourself**, on any node: give the owner
-  the command. Record every batch ID with the index it carries.
+Full text: `.claude/agent/postage.md` (owner's request, 2026-11-20). On every
+node and chain except the local bee-factory dev chain:
+- **Ask the owner which batches to use**, before the first upload of an index in
+  a work item. Show the candidates with their depth, fill, lifetime and current
+  use. Pass the answer as `--batch` and `--lower-batch`, never leaving it out:
+  today's tools then fall back to a node's "first usable batch".
+- **A new batch is proposed, never bought.** Propose its depth (`ethswarm stamps
+  plan` once it exists, until then ⌈log₂(chunks)⌉ + 2), its lifetime and why,
+  its cost and its label. Immutable, and serving one index only.
+- **Never buy, top up or dilute a batch yourself**: give the owner the command.
+  Record every batch ID an index uses in the work item's PR or issue.
+- **An answer covers what it names**: those batches for that index in that work
+  item, in this conversation, never inferred from an earlier one.
 
 Mutable batches are refused everywhere, bee-factory included.
 
