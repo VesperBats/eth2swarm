@@ -63,18 +63,22 @@ enum Command {
     /// The hash of every 1024th block from genesis up to a finalized block (Myotis's
     /// checkpoint table, its docs/ideas/deep-block-verification.md): every header is hashed
     /// here and linked by parentHash down to the genesis hash; the node's hashes are never
-    /// used. Writes <out> (32 bytes per entry, entry i = block i·1024) and <out>.json, and
-    /// resumes from <out>.work after a stop.
+    /// used. Writes <out> (32 bytes per entry, entry i = block i·1024) and <out>.json. A full
+    /// build resumes from <out>.work after a stop; --extend walks only the blocks above an
+    /// existing table.
     CheckpointTable {
         /// The table file to write.
         #[arg(long)]
         out: std::path::PathBuf,
         /// Extend this existing table (with its <table>.json) instead of walking from genesis:
-        /// only the blocks above its top are walked, its old top must hash to the recorded top,
-        /// and its entries are kept. --out may name the same file.
+        /// the walk starts at its last entry, which it must reproduce, passes through its
+        /// recorded top, and goes up to the new top; its entries are kept and the new ones
+        /// appended. --out must be another file; the old pair is never changed. For weeks of
+        /// blocks (it keeps them in memory and does not resume): a full build resumes.
         #[arg(long, conflicts_with = "genesis_hash")]
         extend: Option<std::path::PathBuf>,
-        /// The block to walk down from (default: the node's finalized block).
+        /// The table's new top: the block a full build walks down from, or an extension walks
+        /// up to (default: the node's finalized block).
         #[arg(long, requires = "top_hash")]
         top: Option<u64>,
         /// The top block's hash, from a source you trust (a beacon-attested finalized block).

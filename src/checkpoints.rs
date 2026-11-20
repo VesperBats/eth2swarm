@@ -230,12 +230,17 @@ pub struct TableMeta {
     pub extended_from: Option<Extended>,
 }
 
-/// The table an extension started from.
+/// The table an extension started from: its top, how that was pinned and by which node, its
+/// keccak256, and what it was extended from in turn.
 #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Extended {
     pub top_block: u64,
     pub top_hash: B256,
+    pub top_pinned_by: String,
+    pub source_client: String,
     pub table_keccak256: B256,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extended_from: Option<Box<Extended>>,
 }
 
 /// Options of a run.
@@ -509,10 +514,10 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
 /// Options of an extension.
 pub struct ExtendOptions {
     pub rpc: String,
-    /// The table to extend, with its sidecar `<from>.json`.
+    /// The table to extend, with its sidecar `<from>.json`. It is never changed.
     pub from: PathBuf,
-    /// Where the extended table goes (may be `from` itself: written to a temporary file and
-    /// renamed).
+    /// Where the extended table and its sidecar go: another file than `from`, so that a stop
+    /// between writing the two never leaves a table without its sidecar and no old pair.
     pub out: PathBuf,
     /// The new top and its hash (default: the node's finalized block, then `cross_check` is
     /// required).
@@ -535,6 +540,11 @@ pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let rpc = opts.rpc.as_str();
+    ensure!(
+        !same_file(&opts.from, &opts.out),
+        "--out must be another file than --extend: the old table and its sidecar stay as they \
+         are until the new pair is complete"
+    );
     let old_table =
         std::fs::read(&opts.from).with_context(|| format!("reading {}", opts.from.display()))?;
     let side = suffixed(&opts.from, ".json");
@@ -597,8 +607,12 @@ pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
         old.top_block
     );
 
-    // Spans of SPAN blocks from the old top up, in parallel; each one's hashes computed here.
-    let starts: Vec<u64> = (old.top_block..=top).step_by(SPAN as usize).collect();
+    // Spans of SPAN blocks up from the old table's last entry (at most K − 1 below its top), in
+    // parallel, each one's hashes computed here: the walk must reproduce that entry and pass
+    // through the recorded top, so one old entry is checked against the chain again.
+    let base = old.last_entry_block;
+    let old_last_entry = B256::from_slice(&old_table[old_table.len() - 32..]);
+    let starts: Vec<u64> = (base..=top).step_by(SPAN as usize).collect();
     let mut spans: BTreeMap<u64, (B256, Vec<B256>)> = BTreeMap::new();
     let mut set = tokio::task::JoinSet::new();
     let mut queue = starts.iter().copied();
@@ -615,14 +629,21 @@ pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
         let (from, span) = joined.context("a span task panicked")?;
         spans.insert(from, span.with_context(|| format!("blocks from {from}"))?);
     }
-    let hashes = link_extension(&spans, old.top_block, old.top_hash, top, top_hash)?;
-    let table = extended_table(
-        &old_table,
-        old.last_entry_block,
-        old.top_block,
-        top,
-        &hashes,
+    let hashes = link_extension(&spans, base, top, top_hash)?;
+    ensure!(
+        hashes[0] == old_last_entry,
+        "block {base} hashes to {} here, the table's last entry is {old_last_entry}",
+        hashes[0]
     );
+    ensure!(
+        hashes[(old.top_block - base) as usize] == old.top_hash,
+        "block {} hashes to {} here, the table's top is {}: the chain the table ends on is not \
+         this node's",
+        old.top_block,
+        hashes[(old.top_block - base) as usize],
+        old.top_hash
+    );
+    let table = extended_table(&old_table, base, top, &hashes);
 
     let mut pinned = match pin {
         Pin::Caller => "the caller (--top-hash)".to_string(),
@@ -637,13 +658,6 @@ pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
         );
     }
     let entries = table.len() as u64 / 32;
-    let tmp = suffixed(&opts.out, ".tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&table)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &opts.out)?;
     let meta = TableMeta {
         chain_id,
         k: K,
@@ -661,24 +675,53 @@ pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
         extended_from: Some(Extended {
             top_block: old.top_block,
             top_hash: old.top_hash,
+            top_pinned_by: old.top_pinned_by.clone(),
+            source_client: old.source_client.clone(),
             table_keccak256: old.table_keccak256,
+            extended_from: old.extended_from.clone().map(Box::new),
         }),
     };
-    std::fs::write(
-        suffixed(&opts.out, ".json"),
-        serde_json::to_vec_pretty(&meta)?,
-    )?;
+    // Both files written and synced under temporary names, then renamed: --out is not the old
+    // table, so a stop in between never costs the old pair.
+    let (tmp, tmp_side) = (
+        suffixed(&opts.out, ".tmp"),
+        suffixed(&opts.out, ".json.tmp"),
+    );
+    for (path, bytes) in [
+        (&tmp, table.clone()),
+        (&tmp_side, serde_json::to_vec_pretty(&meta)?),
+    ] {
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &opts.out)?;
+    std::fs::rename(&tmp_side, suffixed(&opts.out, ".json"))?;
     Ok(meta)
+}
+
+/// Whether two paths name the same file (an existing one, compared by canonical path).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// The old table must be what its sidecar says.
 fn check_old_table(table: &[u8], meta: &TableMeta) -> Result<()> {
     ensure!(meta.k == K, "the table has k = {}, this build {K}", meta.k);
+    ensure!(meta.entries > 0, "the sidecar says the table is empty");
     ensure!(
-        table.len() as u64 == meta.entries * 32 && meta.entries > 0,
+        meta.entries.checked_mul(32) == Some(table.len() as u64),
         "the table has {} bytes, its sidecar {} entries",
         table.len(),
         meta.entries
+    );
+    ensure!(
+        meta.chain_id != 1 || meta.genesis_hash == MAINNET_GENESIS,
+        "a chain-1 table whose genesis is {}, not mainnet's",
+        meta.genesis_hash
     );
     ensure!(
         keccak256(table) == meta.table_keccak256,
@@ -687,9 +730,12 @@ fn check_old_table(table: &[u8], meta: &TableMeta) -> Result<()> {
         meta.table_keccak256
     );
     ensure!(
-        meta.last_entry_block == (meta.entries - 1) * K
+        (meta.entries - 1).checked_mul(K) == Some(meta.last_entry_block)
             && meta.top_block >= meta.last_entry_block
-            && meta.top_block < meta.last_entry_block + K,
+            && meta
+                .last_entry_block
+                .checked_add(K)
+                .is_some_and(|next| meta.top_block < next),
         "the sidecar's last entry {} and top {} do not fit {} entries",
         meta.last_entry_block,
         meta.top_block,
@@ -702,17 +748,16 @@ fn check_old_table(table: &[u8], meta: &TableMeta) -> Result<()> {
     Ok(())
 }
 
-/// Links the spans of an extension into one chain from the old top to the new top: the first
-/// span's first block must hash to `old_hash` (the old top, hashed here), each span's first
-/// parent is the last hash of the span below, and the last hash is `top_hash`. Returns the
-/// hashes of blocks `old_top..=top`.
+/// Links the spans of an extension into one chain from block `base` to the new top: each span's
+/// first parent is the last hash of the span below, and the last hash is `top_hash`. Returns
+/// the hashes of blocks `base..=top`.
 fn link_extension(
     spans: &BTreeMap<u64, (B256, Vec<B256>)>,
-    old_top: u64,
-    old_hash: B256,
+    base: u64,
     top: u64,
     top_hash: B256,
 ) -> Result<Vec<B256>> {
+    let old_top = base;
     let mut all: Vec<B256> = Vec::with_capacity((top - old_top + 1) as usize);
     for (from, (parent, hashes)) in spans {
         ensure!(
@@ -736,12 +781,6 @@ fn link_extension(
         top - old_top + 1
     );
     ensure!(
-        all[0] == old_hash,
-        "block {old_top} hashes to {} here, the table's top is {old_hash}: the chain the table \
-         ends on is not this node's",
-        all[0]
-    );
-    ensure!(
         *all.last().unwrap() == top_hash,
         "block {top} hashes to {}, the top is pinned to {top_hash}",
         all.last().unwrap()
@@ -750,18 +789,12 @@ fn link_extension(
 }
 
 /// The old table with the entries of the new multiples of K up to `top` appended (`hashes` are
-/// blocks `old_top..=top`).
-fn extended_table(
-    old_table: &[u8],
-    old_last_entry: u64,
-    old_top: u64,
-    top: u64,
-    hashes: &[B256],
-) -> Vec<u8> {
+/// blocks `base..=top`, `base` the old table's last entry).
+fn extended_table(old_table: &[u8], base: u64, top: u64, hashes: &[B256]) -> Vec<u8> {
     let mut table = old_table.to_vec();
-    let mut b = old_last_entry + K;
+    let mut b = base + K;
     while b <= top {
-        table.extend_from_slice(hashes[(b - old_top) as usize].as_slice());
+        table.extend_from_slice(hashes[(b - base) as usize].as_slice());
         b += K;
     }
     table
@@ -1068,12 +1101,12 @@ mod tests {
     }
 
     #[test]
-    fn an_extension_links_from_the_old_top_and_appends_new_entries() {
+    fn an_extension_links_from_the_last_entry_and_appends_new_entries() {
         let h = |x: u64| B256::left_padding_from(&x.to_be_bytes());
-        // Old top 2100 (entries at 0, 1024, 2048); new top 5000. Block n hashes to h(n + 1).
-        let (old_top, top) = (2100u64, 5000u64);
+        // Old last entry 2048, old top 2100; new top 5000. Block n hashes to h(n + 1).
+        let (base, top) = (2048u64, 5000u64);
         let mut spans = BTreeMap::new();
-        let mut from = old_top;
+        let mut from = base;
         while from <= top {
             let to = (from + SPAN - 1).min(top);
             spans.insert(
@@ -1082,25 +1115,30 @@ mod tests {
             );
             from = to + 1;
         }
-        let hashes = link_extension(&spans, old_top, h(old_top + 1), top, h(top + 1)).unwrap();
-        assert_eq!(hashes.len() as u64, top - old_top + 1);
+        let hashes = link_extension(&spans, base, top, h(top + 1)).unwrap();
+        assert_eq!(hashes.len() as u64, top - base + 1);
+        assert_eq!(hashes[0], h(2049), "the old last entry, reproduced");
+        assert_eq!(
+            hashes[(2100 - base) as usize],
+            h(2101),
+            "the old top, passed through"
+        );
         let old: Vec<u8> = [h(1), h(1025), h(2049)].iter().flat_map(|x| x.0).collect();
-        let t = extended_table(&old, 2048, old_top, top, &hashes);
+        let t = extended_table(&old, base, top, &hashes);
         // 3072 and 4096 appended; the old entries unchanged.
         assert_eq!(t.len(), 5 * 32);
         assert_eq!(&t[..96], &old[..]);
         assert_eq!(&t[96..128], h(3073).as_slice());
         assert_eq!(&t[128..], h(4097).as_slice());
-        // Another old top hash (another chain), another new top, a broken link: refused.
-        assert!(link_extension(&spans, old_top, h(9), top, h(top + 1)).is_err());
-        assert!(link_extension(&spans, old_top, h(old_top + 1), top, h(9)).is_err());
+        // Another new top, a broken link, a missing span: refused.
+        assert!(link_extension(&spans, base, top, h(9)).is_err());
         let mut broken = spans.clone();
         let second = *broken.keys().nth(1).unwrap();
         broken.get_mut(&second).unwrap().0 = h(77);
-        assert!(link_extension(&broken, old_top, h(old_top + 1), top, h(top + 1)).is_err());
+        assert!(link_extension(&broken, base, top, h(top + 1)).is_err());
         let mut missing = spans.clone();
         missing.remove(&second);
-        assert!(link_extension(&missing, old_top, h(old_top + 1), top, h(top + 1)).is_err());
+        assert!(link_extension(&missing, base, top, h(top + 1)).is_err());
     }
 
     #[test]
@@ -1109,11 +1147,11 @@ mod tests {
             .iter()
             .flat_map(|x| x.0)
             .collect();
-        let meta = |entries, top, keccak| TableMeta {
+        let meta = |entries: u64, top, keccak| TableMeta {
             chain_id: 1,
             k: K,
             entries,
-            last_entry_block: (entries - 1) * K,
+            last_entry_block: entries.saturating_sub(1).saturating_mul(K),
             top_block: top,
             top_hash: B256::ZERO,
             top_pinned_by: String::new(),
@@ -1134,6 +1172,72 @@ mod tests {
             check_old_table(&table, &meta(2, 3000, k)).is_err(),
             "top past the next entry"
         );
+        assert!(
+            check_old_table(&table, &meta(2, 1000, k)).is_err(),
+            "top below the last entry"
+        );
+        assert!(
+            check_old_table(&table, &meta(0, 0, k)).is_err(),
+            "no entries"
+        );
+        assert!(
+            check_old_table(&table, &meta(u64::MAX / 32 + 1, 0, k)).is_err(),
+            "overflow"
+        );
+        let other_k = TableMeta {
+            k: 512,
+            ..meta(2, 1500, k)
+        };
+        assert!(check_old_table(&table, &other_k).is_err(), "another k");
+        let other_genesis = TableMeta {
+            genesis_hash: B256::repeat_byte(9),
+            ..meta(2, 1500, k)
+        };
+        assert!(
+            check_old_table(&table, &other_genesis).is_err(),
+            "not mainnet's genesis"
+        );
+        let mut wrong_first = table.clone();
+        wrong_first[0] ^= 1;
+        let wk = keccak256(&wrong_first);
+        assert!(
+            check_old_table(&wrong_first, &meta(2, 1500, wk)).is_err(),
+            "first entry"
+        );
+    }
+
+    #[test]
+    fn sidecars_keep_their_history() {
+        let ext = Extended {
+            top_block: 1,
+            top_hash: B256::repeat_byte(1),
+            top_pinned_by: "a".into(),
+            source_client: "b".into(),
+            table_keccak256: B256::repeat_byte(2),
+            extended_from: Some(Box::new(Extended {
+                top_block: 0,
+                top_hash: B256::ZERO,
+                top_pinned_by: "c".into(),
+                source_client: "d".into(),
+                table_keccak256: B256::ZERO,
+                extended_from: None,
+            })),
+        };
+        let json = serde_json::to_string(&ext).unwrap();
+        assert_eq!(serde_json::from_str::<Extended>(&json).unwrap(), ext);
+        // A sidecar of a full build has no extended_from, and reads back without it.
+        let full = r#"{"chain_id":1,"k":1024,"entries":1,"last_entry_block":0,"top_block":5,
+            "top_hash":"0x0000000000000000000000000000000000000000000000000000000000000000",
+            "top_pinned_by":"x","genesis_hash":"0x0000000000000000000000000000000000000000000000000000000000000000",
+            "table_keccak256":"0x0000000000000000000000000000000000000000000000000000000000000000",
+            "source_client":"y","generated_unix":0}"#;
+        assert!(
+            serde_json::from_str::<TableMeta>(full)
+                .unwrap()
+                .extended_from
+                .is_none()
+        );
+        assert!(same_file(Path::new("/tmp"), Path::new("/tmp/")));
     }
 
     #[test]
