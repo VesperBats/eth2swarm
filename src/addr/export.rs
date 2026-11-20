@@ -687,17 +687,21 @@ pub async fn upload(
     // --from-start with another batch goes on, so say that. Anything else (a lower batch, a
     // node that cannot be asked) is left to Stamps::open, whose message names it.
     if recorded_batch == Some(batch) {
-        let refused = match bee.batch(&batch).await {
-            Ok(None) => Some("Bee does not know it (any more)"),
-            Ok(Some(info)) if info.immutable != Some(true) => Some("it is not immutable"),
-            _ => None,
-        };
-        if let Some(why) = refused {
-            bail!(
-                "{} was uploaded with {batch} so far, and {why}: to go on, upload everything \
+        match bee.batch(&batch).await {
+            // Only the node that bought a batch holds it: a 404 is another node as often as
+            // an expired batch, and the cheap remedy goes first.
+            Ok(None) => bail!(
+                "{} was uploaded with {batch} so far, and this Bee node does not hold it: if it \
+                 is another node's, pass that node with --bee; if it expired, upload everything \
                  again with --from-start --batch <an immutable batch>",
                 dir.display()
-            );
+            ),
+            Ok(Some(info)) if info.immutable != Some(true) => bail!(
+                "{} was uploaded with {batch} so far, and it is not immutable: to go on, upload \
+                 everything again with --from-start --batch <an immutable batch>",
+                dir.display()
+            ),
+            _ => {}
         }
     }
     let stamps = std::sync::Arc::new(
@@ -940,10 +944,18 @@ mod tests {
             }
         };
         // The recorded batch is gone, or mutable: only --from-start goes on.
-        for answer in [None, Some(mutable)] {
-            let e = run(vec![answer], vec![]).await;
-            assert!(e.contains("--from-start"), "{e}");
-        }
+        // The recorded batch is not on this node (another node's, or expired): --bee first,
+        // then --from-start. Mutable: only --from-start goes on.
+        let e = run(vec![None], vec![]).await;
+        assert!(
+            e.contains("pass that node with --bee") && e.contains("--from-start"),
+            "{e}"
+        );
+        let e = run(vec![Some(mutable)], vec![]).await;
+        assert!(
+            e.contains("not immutable") && e.contains("--from-start"),
+            "{e}"
+        );
         // The recorded batch is fine, a lower batch is gone: no --from-start, the lower
         // batch named.
         let e = run(vec![Some(ok), Some(ok), None], vec![lower]).await;

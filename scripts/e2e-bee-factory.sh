@@ -58,6 +58,12 @@ done
 CHAIN_ID=$(printf '%s\n' "$TIP_OUT" | awk '/Chain ID:/ {print $3}')
 [[ "$CHAIN_ID" =~ ^[0-9]+$ ]] || { echo "FAIL: no chain ID in: $TIP_OUT"; exit 1; }
 
+# The script stamps uploads and buys batches on $UPLOAD_BEE: only bee-factory is exempt from
+# the postage rule, and only a node whose GET /wallet reports chainID 1337 is bee-factory
+# (.claude/agent/postage.md). A port says nothing: on the nuc the defaults are mainnet's.
+UPLOAD_CHAIN=$(curl -sf "$UPLOAD_BEE/wallet" | python3 -c 'import json, sys; print(json.load(sys.stdin)["chainID"])') || UPLOAD_CHAIN="no answer"
+[ "$UPLOAD_CHAIN" = 1337 ] || { echo "FAIL: $UPLOAD_BEE is not bee-factory (GET /wallet chainID: $UPLOAD_CHAIN); point UPLOAD_BEE at a bee-factory node"; exit 1; }
+
 echo "== import $EPOCHS epochs × $EPOCH_SIZE blocks via $UPLOAD_BEE"
 OUT=$($BIN --bee "$UPLOAD_BEE" import --key "$KEY" --epoch-size "$EPOCH_SIZE" --epochs "$EPOCHS")
 echo "$OUT"

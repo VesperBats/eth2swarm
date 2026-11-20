@@ -131,7 +131,11 @@ fn print_batch(b: &BatchInfo) {
         b.batch_id,
         b.depth,
         fill(b.utilization, b.bucket_capacity()),
-        if b.usable { "usable" } else { "not usable yet" },
+        match (b.exists, b.usable) {
+            (false, _) => "gone from the chain",
+            (true, true) => "usable",
+            (true, false) => "not usable yet",
+        },
         ttl(b.ttl),
     );
 }
@@ -253,8 +257,8 @@ pub async fn plan(bee: &Bee, dir: &Path, opts: &PlanOptions) -> Result<()> {
         println!(
             "A lower slice that no --lower-batch outlives, or whose batch is not usable yet, \
              goes to the permanent batch. Size --batch like the first line unless the lower \
-             batches surely cover every lower slice, or an immutable --batch refuses chunks \
-             once its fullest bucket is full."
+             batches surely cover every lower slice; otherwise an immutable --batch refuses \
+             chunks once its fullest bucket is full."
         );
     }
     let Some((days, secs, state)) = priced else {

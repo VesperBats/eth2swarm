@@ -62,6 +62,13 @@ pub struct BatchInfo {
     pub utilization: u64,
     #[serde(default)]
     pub label: String,
+    /// The batch still exists on chain (Bee's `exists`; `true` when Bee did not say).
+    #[serde(default = "yes")]
+    pub exists: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl BatchInfo {
