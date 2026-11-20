@@ -158,6 +158,22 @@ fn check_ids<V>(from: u64, to: u64, by_number: &BTreeMap<u64, V>) -> Result<()> 
 /// One chunk: its blocks in batches, linked to each other.
 async fn fetch_chunk(http: &reqwest::Client, rpc: &str, index: u64, top: u64) -> Result<Chunk> {
     let (from, to) = (index * K, (index * K + K - 1).min(top));
+    let (parent, all) = fetch_span(http, rpc, from, to).await?;
+    Ok(Chunk {
+        parent,
+        first: all[0],
+        last: *all.last().unwrap(),
+    })
+}
+
+/// The hashes of blocks `from..=to`, computed here, in batches retried three times and linked
+/// to each other; with the `parentHash` of block `from`.
+async fn fetch_span(
+    http: &reqwest::Client,
+    rpc: &str,
+    from: u64,
+    to: u64,
+) -> Result<(B256, Vec<B256>)> {
     let mut parent = None;
     let mut all: Vec<B256> = Vec::with_capacity((to - from + 1) as usize);
     let mut at = from;
@@ -186,15 +202,11 @@ async fn fetch_chunk(http: &reqwest::Client, rpc: &str, index: u64, top: u64) ->
         all.extend(hashes);
         at = end + 1;
     }
-    Ok(Chunk {
-        parent: parent.expect("a chunk has a block"),
-        first: all[0],
-        last: *all.last().unwrap(),
-    })
+    Ok((parent.expect("a span has a block"), all))
 }
 
 /// What the table's sidecar records.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 pub struct TableMeta {
     pub chain_id: u64,
     /// Blocks per entry.
@@ -212,6 +224,18 @@ pub struct TableMeta {
     /// `web3_clientVersion` of the node the headers came from (they are checked, not trusted).
     pub source_client: String,
     pub generated_unix: u64,
+    /// For an extended table: the table it extended (its top and keccak256), whose entries it
+    /// keeps unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extended_from: Option<Extended>,
+}
+
+/// The table an extension started from.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Extended {
+    pub top_block: u64,
+    pub top_hash: B256,
+    pub table_keccak256: B256,
 }
 
 /// Options of a run.
@@ -472,6 +496,7 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
         generated_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs(),
+        extended_from: None,
     };
     std::fs::write(
         suffixed(&opts.out, ".json"),
@@ -479,6 +504,267 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
     )?;
     let _ = std::fs::remove_file(&work);
     Ok(meta)
+}
+
+/// Options of an extension.
+pub struct ExtendOptions {
+    pub rpc: String,
+    /// The table to extend, with its sidecar `<from>.json`.
+    pub from: PathBuf,
+    /// Where the extended table goes (may be `from` itself: written to a temporary file and
+    /// renamed).
+    pub out: PathBuf,
+    /// The new top and its hash (default: the node's finalized block, then `cross_check` is
+    /// required).
+    pub top: Option<u64>,
+    pub top_hash: Option<B256>,
+    pub concurrency: usize,
+    pub cross_check: Option<String>,
+}
+
+/// Blocks per span an extension fetches in parallel.
+const SPAN: u64 = K;
+
+/// Extends an existing table up to a new top: only the blocks above the old top are walked.
+/// The old table must match its sidecar (keccak256, size, chain, genesis); the old top block
+/// must hash, here, to the old top hash; every block above it links to the one below; the new
+/// top is pinned as in [`build`]. The old entries are kept unchanged, the new ones appended.
+pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
+    let http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+    let rpc = opts.rpc.as_str();
+    let old_table =
+        std::fs::read(&opts.from).with_context(|| format!("reading {}", opts.from.display()))?;
+    let side = suffixed(&opts.from, ".json");
+    let old: TableMeta = serde_json::from_slice(
+        &std::fs::read(&side).with_context(|| format!("reading {}", side.display()))?,
+    )
+    .with_context(|| format!("parsing {}", side.display()))?;
+    check_old_table(&old_table, &old)?;
+
+    let chain_id = u64::from_str_radix(
+        rpc_call(&http, rpc, "eth_chainId", serde_json::json!([]))
+            .await?
+            .as_str()
+            .context("eth_chainId")?
+            .trim_start_matches("0x"),
+        16,
+    )?;
+    ensure!(
+        chain_id == old.chain_id,
+        "--rpc serves chain {chain_id}, the table is for chain {}",
+        old.chain_id
+    );
+    let client = rpc_call(&http, rpc, "web3_clientVersion", serde_json::json!([]))
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into());
+    let (top, top_hash, pin) = match (opts.top, opts.top_hash) {
+        (Some(t), Some(h)) => (t, h, Pin::Caller),
+        (Some(_), None) | (None, Some(_)) => bail!("--top and --top-hash go together"),
+        (None, None) => {
+            let f = rpc_call(
+                &http,
+                rpc,
+                "eth_getHeaderByNumber",
+                serde_json::json!(["finalized"]),
+            )
+            .await?;
+            let header: alloy::rpc::types::Header = serde_json::from_value(f)?;
+            (
+                header.inner.number,
+                keccak256(alloy::rlp::encode(&header.inner)),
+                Pin::Finalized,
+            )
+        }
+    };
+    ensure!(
+        pin == Pin::Caller || opts.cross_check.is_some(),
+        "the new top's hash would rest on the node alone: pass --top-hash or --cross-check"
+    );
+    if let Some(other) = &opts.cross_check {
+        ensure!(
+            other.trim_end_matches('/') != rpc.trim_end_matches('/'),
+            "--cross-check must name another node than --rpc"
+        );
+    }
+    ensure!(
+        top > old.top_block,
+        "the new top {top} is not above the table's top {}",
+        old.top_block
+    );
+
+    // Spans of SPAN blocks from the old top up, in parallel; each one's hashes computed here.
+    let starts: Vec<u64> = (old.top_block..=top).step_by(SPAN as usize).collect();
+    let mut spans: BTreeMap<u64, (B256, Vec<B256>)> = BTreeMap::new();
+    let mut set = tokio::task::JoinSet::new();
+    let mut queue = starts.iter().copied();
+    loop {
+        while set.len() < opts.concurrency.max(1) {
+            let Some(from) = queue.next() else { break };
+            let (http, rpc) = (http.clone(), opts.rpc.clone());
+            let to = (from + SPAN - 1).min(top);
+            set.spawn(async move { (from, fetch_span(&http, &rpc, from, to).await) });
+        }
+        let Some(joined) = set.join_next().await else {
+            break;
+        };
+        let (from, span) = joined.context("a span task panicked")?;
+        spans.insert(from, span.with_context(|| format!("blocks from {from}"))?);
+    }
+    let hashes = link_extension(&spans, old.top_block, old.top_hash, top, top_hash)?;
+    let table = extended_table(
+        &old_table,
+        old.last_entry_block,
+        old.top_block,
+        top,
+        &hashes,
+    );
+
+    let mut pinned = match pin {
+        Pin::Caller => "the caller (--top-hash)".to_string(),
+        Pin::Finalized => format!("the finalized block of the source node ({client})"),
+    };
+    if let Some(other) = &opts.cross_check {
+        let (n, other_client) = cross_check(&http, other, &table, top, top_hash, 200)
+            .await
+            .with_context(|| format!("cross-check against {other}; nothing is written"))?;
+        pinned = format!(
+            "{pinned}, cross-checked against {other_client}: {n} entries and the top block equal"
+        );
+    }
+    let entries = table.len() as u64 / 32;
+    let tmp = suffixed(&opts.out, ".tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&table)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &opts.out)?;
+    let meta = TableMeta {
+        chain_id,
+        k: K,
+        entries,
+        last_entry_block: (entries - 1) * K,
+        top_block: top,
+        top_hash,
+        top_pinned_by: pinned,
+        genesis_hash: old.genesis_hash,
+        table_keccak256: keccak256(&table),
+        source_client: client,
+        generated_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+        extended_from: Some(Extended {
+            top_block: old.top_block,
+            top_hash: old.top_hash,
+            table_keccak256: old.table_keccak256,
+        }),
+    };
+    std::fs::write(
+        suffixed(&opts.out, ".json"),
+        serde_json::to_vec_pretty(&meta)?,
+    )?;
+    Ok(meta)
+}
+
+/// The old table must be what its sidecar says.
+fn check_old_table(table: &[u8], meta: &TableMeta) -> Result<()> {
+    ensure!(meta.k == K, "the table has k = {}, this build {K}", meta.k);
+    ensure!(
+        table.len() as u64 == meta.entries * 32 && meta.entries > 0,
+        "the table has {} bytes, its sidecar {} entries",
+        table.len(),
+        meta.entries
+    );
+    ensure!(
+        keccak256(table) == meta.table_keccak256,
+        "the table's keccak256 is {}, its sidecar says {}",
+        keccak256(table),
+        meta.table_keccak256
+    );
+    ensure!(
+        meta.last_entry_block == (meta.entries - 1) * K
+            && meta.top_block >= meta.last_entry_block
+            && meta.top_block < meta.last_entry_block + K,
+        "the sidecar's last entry {} and top {} do not fit {} entries",
+        meta.last_entry_block,
+        meta.top_block,
+        meta.entries
+    );
+    ensure!(
+        B256::from_slice(&table[..32]) == meta.genesis_hash,
+        "the table's first entry is not its genesis hash"
+    );
+    Ok(())
+}
+
+/// Links the spans of an extension into one chain from the old top to the new top: the first
+/// span's first block must hash to `old_hash` (the old top, hashed here), each span's first
+/// parent is the last hash of the span below, and the last hash is `top_hash`. Returns the
+/// hashes of blocks `old_top..=top`.
+fn link_extension(
+    spans: &BTreeMap<u64, (B256, Vec<B256>)>,
+    old_top: u64,
+    old_hash: B256,
+    top: u64,
+    top_hash: B256,
+) -> Result<Vec<B256>> {
+    let mut all: Vec<B256> = Vec::with_capacity((top - old_top + 1) as usize);
+    for (from, (parent, hashes)) in spans {
+        ensure!(
+            *from == old_top + all.len() as u64,
+            "a span from {from}, expected one from {}",
+            old_top + all.len() as u64
+        );
+        if let Some(below) = all.last() {
+            ensure!(
+                parent == below,
+                "block {from}: parentHash {parent} is not block {}'s hash {below}",
+                from - 1
+            );
+        }
+        all.extend(hashes);
+    }
+    ensure!(
+        all.len() as u64 == top - old_top + 1,
+        "{} of {} blocks",
+        all.len(),
+        top - old_top + 1
+    );
+    ensure!(
+        all[0] == old_hash,
+        "block {old_top} hashes to {} here, the table's top is {old_hash}: the chain the table \
+         ends on is not this node's",
+        all[0]
+    );
+    ensure!(
+        *all.last().unwrap() == top_hash,
+        "block {top} hashes to {}, the top is pinned to {top_hash}",
+        all.last().unwrap()
+    );
+    Ok(all)
+}
+
+/// The old table with the entries of the new multiples of K up to `top` appended (`hashes` are
+/// blocks `old_top..=top`).
+fn extended_table(
+    old_table: &[u8],
+    old_last_entry: u64,
+    old_top: u64,
+    top: u64,
+    hashes: &[B256],
+) -> Vec<u8> {
+    let mut table = old_table.to_vec();
+    let mut b = old_last_entry + K;
+    while b <= top {
+        table.extend_from_slice(hashes[(b - old_top) as usize].as_slice());
+        b += K;
+    }
+    table
 }
 
 /// `path` with `suffix` appended to its name (not replacing an extension).
@@ -778,6 +1064,75 @@ mod tests {
         assert!(
             check_ids(100, 199, &gap).is_err(),
             "one swapped for another"
+        );
+    }
+
+    #[test]
+    fn an_extension_links_from_the_old_top_and_appends_new_entries() {
+        let h = |x: u64| B256::left_padding_from(&x.to_be_bytes());
+        // Old top 2100 (entries at 0, 1024, 2048); new top 5000. Block n hashes to h(n + 1).
+        let (old_top, top) = (2100u64, 5000u64);
+        let mut spans = BTreeMap::new();
+        let mut from = old_top;
+        while from <= top {
+            let to = (from + SPAN - 1).min(top);
+            spans.insert(
+                from,
+                (h(from), (from..=to).map(|n| h(n + 1)).collect::<Vec<_>>()),
+            );
+            from = to + 1;
+        }
+        let hashes = link_extension(&spans, old_top, h(old_top + 1), top, h(top + 1)).unwrap();
+        assert_eq!(hashes.len() as u64, top - old_top + 1);
+        let old: Vec<u8> = [h(1), h(1025), h(2049)].iter().flat_map(|x| x.0).collect();
+        let t = extended_table(&old, 2048, old_top, top, &hashes);
+        // 3072 and 4096 appended; the old entries unchanged.
+        assert_eq!(t.len(), 5 * 32);
+        assert_eq!(&t[..96], &old[..]);
+        assert_eq!(&t[96..128], h(3073).as_slice());
+        assert_eq!(&t[128..], h(4097).as_slice());
+        // Another old top hash (another chain), another new top, a broken link: refused.
+        assert!(link_extension(&spans, old_top, h(9), top, h(top + 1)).is_err());
+        assert!(link_extension(&spans, old_top, h(old_top + 1), top, h(9)).is_err());
+        let mut broken = spans.clone();
+        let second = *broken.keys().nth(1).unwrap();
+        broken.get_mut(&second).unwrap().0 = h(77);
+        assert!(link_extension(&broken, old_top, h(old_top + 1), top, h(top + 1)).is_err());
+        let mut missing = spans.clone();
+        missing.remove(&second);
+        assert!(link_extension(&missing, old_top, h(old_top + 1), top, h(top + 1)).is_err());
+    }
+
+    #[test]
+    fn the_old_table_must_match_its_sidecar() {
+        let table: Vec<u8> = [MAINNET_GENESIS, B256::repeat_byte(2)]
+            .iter()
+            .flat_map(|x| x.0)
+            .collect();
+        let meta = |entries, top, keccak| TableMeta {
+            chain_id: 1,
+            k: K,
+            entries,
+            last_entry_block: (entries - 1) * K,
+            top_block: top,
+            top_hash: B256::ZERO,
+            top_pinned_by: String::new(),
+            genesis_hash: MAINNET_GENESIS,
+            table_keccak256: keccak,
+            source_client: String::new(),
+            generated_unix: 0,
+            extended_from: None,
+        };
+        let k = keccak256(&table);
+        assert!(check_old_table(&table, &meta(2, 1500, k)).is_ok());
+        assert!(
+            check_old_table(&table, &meta(2, 1500, B256::ZERO)).is_err(),
+            "keccak"
+        );
+        assert!(check_old_table(&table, &meta(3, 2100, k)).is_err(), "size");
+        assert!(
+            check_old_table(&table, &meta(2, 3000, k)).is_err(),
+            "top past the next entry"
         );
     }
 

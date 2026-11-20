@@ -69,6 +69,11 @@ enum Command {
         /// The table file to write.
         #[arg(long)]
         out: std::path::PathBuf,
+        /// Extend this existing table (with its <table>.json) instead of walking from genesis:
+        /// only the blocks above its top are walked, its old top must hash to the recorded top,
+        /// and its entries are kept. --out may name the same file.
+        #[arg(long, conflicts_with = "genesis_hash")]
+        extend: Option<std::path::PathBuf>,
         /// The block to walk down from (default: the node's finalized block).
         #[arg(long, requires = "top_hash")]
         top: Option<u64>,
@@ -169,6 +174,28 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::CheckpointTable {
             out,
+            extend: Some(from),
+            top,
+            top_hash,
+            concurrency,
+            cross_check,
+            ..
+        } => {
+            let meta = checkpoints::extend(&checkpoints::ExtendOptions {
+                rpc: cli.rpc.to_string(),
+                from,
+                out,
+                top,
+                top_hash,
+                concurrency,
+                cross_check: cross_check.as_ref().map(|u| u.to_string()),
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&meta)?);
+        }
+        Command::CheckpointTable {
+            out,
+            extend: None,
             top,
             top_hash,
             genesis_hash,
