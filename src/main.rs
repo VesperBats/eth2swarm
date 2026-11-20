@@ -81,8 +81,9 @@ enum Command {
         /// Chunks of 1024 headers fetched in parallel.
         #[arg(long, default_value_t = 4)]
         concurrency: usize,
-        /// After building, compare about 200 entries and the top with this node (another
-        /// client). Pins the top in place of --top-hash; a run with neither is refused.
+        /// Before anything is written, compare about 200 entries, the last one and the top
+        /// block with this node (another client than --rpc). Pins the top in place of
+        /// --top-hash; a run with neither is refused, and a mismatch writes nothing.
         #[arg(long)]
         cross_check: Option<Url>,
     },
@@ -181,14 +182,10 @@ async fn main() -> Result<()> {
                 top_hash,
                 genesis: genesis_hash,
                 concurrency,
-                cross_check: cross_check.is_some(),
+                cross_check: cross_check.as_ref().map(|u| u.to_string()),
             })
             .await?;
             println!("{}", serde_json::to_string_pretty(&meta)?);
-            if let Some(other) = cross_check {
-                let n = checkpoints::cross_check(&out, other.as_str(), 200).await?;
-                println!("Cross-checked {n} entries against {other}: all equal.");
-            }
         }
         Command::Tip => {
             let chain_id = provider.get_chain_id().await.context("querying chain id")?;

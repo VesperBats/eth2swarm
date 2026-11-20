@@ -110,15 +110,7 @@ async fn fetch_range(
             .with_context(|| format!("header {id}: {}", a["result"]))?;
         by_number.insert(id, header);
     }
-    ensure!(
-        by_number.len() as u64 == to - from + 1
-            && by_number.keys().next() == Some(&from)
-            && by_number.keys().next_back() == Some(&to),
-        "asked for headers {from}..={to}, got {} answers for {:?}..={:?}",
-        by_number.len(),
-        by_number.keys().next(),
-        by_number.keys().next_back()
-    );
+    check_ids(from, to, &by_number)?;
     let mut hashes = Vec::with_capacity(by_number.len());
     let mut parent = B256::ZERO;
     for (n, header) in &by_number {
@@ -147,6 +139,20 @@ async fn fetch_range(
         hashes.push(hash);
     }
     Ok((parent, hashes))
+}
+
+/// The answers to a batch must be for exactly the blocks `from..=to`, one each.
+fn check_ids<V>(from: u64, to: u64, by_number: &BTreeMap<u64, V>) -> Result<()> {
+    ensure!(
+        by_number.len() as u64 == to - from + 1
+            && by_number.keys().next() == Some(&from)
+            && by_number.keys().next_back() == Some(&to),
+        "asked for headers {from}..={to}, got {} answers for {:?}..={:?}",
+        by_number.len(),
+        by_number.keys().next(),
+        by_number.keys().next_back()
+    );
+    Ok(())
 }
 
 /// One chunk: its blocks in batches, linked to each other.
@@ -220,9 +226,9 @@ pub struct Options {
     /// The network's genesis hash (default: mainnet's, on chain 1).
     pub genesis: Option<B256>,
     pub concurrency: usize,
-    /// Whether a cross-check against another node follows (`--cross-check`), which pins the
-    /// top in place of `top_hash`.
-    pub cross_check: bool,
+    /// Another node (another client) to compare about 200 entries, the last one and the top
+    /// block with, before anything is written: it pins the top in place of `top_hash`.
+    pub cross_check: Option<String>,
 }
 
 async fn rpc_call(
@@ -244,6 +250,27 @@ async fn rpc_call(
         bail!("{method}: {e}");
     }
     Ok(v["result"].clone())
+}
+
+/// [`rpc_call`], tried three times with growing pauses.
+async fn rpc_retry(
+    http: &reqwest::Client,
+    rpc: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let mut attempt = 0;
+    loop {
+        match rpc_call(http, rpc, method, params.clone()).await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < 3 => {
+                attempt += 1;
+                tracing::warn!("{rpc} {method}, attempt {attempt}: {e:#}");
+                tokio::time::sleep(std::time::Duration::from_secs(1 << attempt)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn work_path(out: &Path) -> PathBuf {
@@ -282,15 +309,13 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("reading {}", work.display())),
     };
-    let saved_top = saved
-        .as_deref()
-        .and_then(parse_tag)
-        .map(|t| (t.top, t.top_hash));
-    let (top, top_hash, pinned) = match (opts.top, opts.top_hash, saved_top) {
-        (Some(t), Some(h), _) => (t, h, "the caller (--top-hash)".to_string()),
+    let saved_tag = saved.as_deref().and_then(parse_tag);
+    let (top, top_hash, pin) = match (opts.top, opts.top_hash, saved_tag) {
+        (Some(t), Some(h), _) => (t, h, Pin::Caller),
         (Some(_), None, _) | (None, Some(_), _) => bail!("--top and --top-hash go together"),
-        // Resuming without --top: the unfinished run's top (the finalized block moves).
-        (None, None, Some((t, h))) => (t, h, format!("an earlier run's top ({client})")),
+        // Resuming without --top: the unfinished run's top (the finalized block moves), and
+        // what pinned it then.
+        (None, None, Some(t)) => (t.top, t.top_hash, t.pin),
         (None, None, None) => {
             let f = rpc_call(
                 &http,
@@ -301,18 +326,22 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
             .await?;
             let header: alloy::rpc::types::Header = serde_json::from_value(f)?;
             let hash = keccak256(alloy::rlp::encode(&header.inner));
-            (
-                header.inner.number,
-                hash,
-                format!("the node's finalized block ({client})"),
-            )
+            (header.inner.number, hash, Pin::Finalized)
         }
     };
+    // A top the caller pinned (now or in the run being resumed) or a cross-check: the node's
+    // word alone pins nothing.
     ensure!(
-        opts.top_hash.is_some() || opts.cross_check,
+        pin == Pin::Caller || opts.cross_check.is_some(),
         "the top block's hash would rest on the node alone, which a walk to genesis cannot \
          authenticate: pass --top-hash (a beacon-attested block) or --cross-check <another node>"
     );
+    if let Some(other) = &opts.cross_check {
+        ensure!(
+            other.trim_end_matches('/') != rpc.trim_end_matches('/'),
+            "--cross-check must name another node than --rpc"
+        );
+    }
     let chunks = top / K + 1;
 
     let tag = Tag {
@@ -320,39 +349,19 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
         genesis,
         top,
         top_hash,
+        pin,
     };
     let mut done: BTreeMap<u64, Chunk> = BTreeMap::new();
     match saved {
         Some(bytes) => {
-            let saved_tag = parse_tag(&bytes).with_context(|| {
-                format!(
-                    "{} has no tag line: remove it to start over",
-                    work.display()
-                )
-            })?;
-            ensure!(
-                saved_tag == tag,
-                "{} is the work of another run ({saved_tag:?}, this run {tag:?}): remove it to \
-                 start over, or pass its top",
-                work.display()
-            );
-            let head = tag.line().len();
-            let (records, cut) = bytes[head..].as_chunks::<WORK_RECORD>();
-            for r in records {
-                let (i, c) = Chunk::decode(r);
-                ensure!(
-                    i < chunks,
-                    "{}: a record for chunk {i}, beyond the {chunks} chunks of top {top}: \
-                     remove it to start over",
-                    work.display()
-                );
-                done.insert(i, c);
-            }
+            let (loaded, keep) = load_work(&bytes, &tag, chunks)
+                .with_context(|| format!("{}: remove it to start over", work.display()))?;
+            done = loaded;
             // A record a stop cut short is dropped, and the file cut back to whole records,
             // so the records appended next stay aligned.
-            if !cut.is_empty() {
+            if keep < bytes.len() as u64 {
                 let f = std::fs::OpenOptions::new().write(true).open(&work)?;
-                f.set_len((head + records.len() * WORK_RECORD) as u64)?;
+                f.set_len(keep)?;
                 f.sync_all()?;
             }
             tracing::info!(done = done.len(), chunks, "resuming");
@@ -423,6 +432,25 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
     }
 
     let table = link(&done, chunks, genesis, top, top_hash)?;
+    // The cross-check comes before anything is written: a table it does not confirm is never
+    // on disk, and the work file stays for the next attempt.
+    let mut pinned = match pin {
+        Pin::Caller => "the caller (--top-hash)".to_string(),
+        Pin::Finalized => format!("the finalized block of the source node ({client})"),
+    };
+    if let Some(other) = &opts.cross_check {
+        let (n, other_client) = cross_check(&http, other, &table, top, top_hash, 200)
+            .await
+            .with_context(|| {
+                format!(
+                    "cross-check against {other}; nothing is written, and {} keeps the walk",
+                    work.display()
+                )
+            })?;
+        pinned = format!(
+            "{pinned}, cross-checked against {other_client}: {n} entries and the top block equal"
+        );
+    }
     let tmp = suffixed(&opts.out, ".tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
@@ -460,6 +488,14 @@ fn suffixed(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// What pinned a run's top: the caller (`--top-hash`), or the source node's finalized block
+/// (then only a cross-check makes it count).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pin {
+    Caller,
+    Finalized,
+}
+
 /// The first line of a work file: the run it belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Tag {
@@ -467,13 +503,21 @@ struct Tag {
     genesis: B256,
     top: u64,
     top_hash: B256,
+    pin: Pin,
 }
 
 impl Tag {
     fn line(&self) -> String {
         format!(
-            "chain {} genesis {} top {} {}\n",
-            self.chain_id, self.genesis, self.top, self.top_hash
+            "chain {} genesis {} top {} {} pin {}\n",
+            self.chain_id,
+            self.genesis,
+            self.top,
+            self.top_hash,
+            match self.pin {
+                Pin::Caller => "caller",
+                Pin::Finalized => "finalized",
+            }
         )
     }
 }
@@ -483,14 +527,43 @@ fn parse_tag(bytes: &[u8]) -> Option<Tag> {
     let line = std::str::from_utf8(&bytes[..end]).ok()?;
     let w: Vec<&str> = line.split(' ').collect();
     match w.as_slice() {
-        ["chain", c, "genesis", g, "top", t, h] => Some(Tag {
+        ["chain", c, "genesis", g, "top", t, h, "pin", p] => Some(Tag {
             chain_id: c.parse().ok()?,
             genesis: g.parse().ok()?,
             top: t.parse().ok()?,
             top_hash: h.parse().ok()?,
+            pin: match *p {
+                "caller" => Pin::Caller,
+                "finalized" => Pin::Finalized,
+                _ => return None,
+            },
         }),
         _ => None,
     }
+}
+
+/// The chunks a work file holds for the run `tag` with `chunks` chunks, and the length to keep
+/// (whole records; a record a stop cut short is dropped). Another run's file, or a record
+/// beyond `chunks`, is refused.
+fn load_work(bytes: &[u8], tag: &Tag, chunks: u64) -> Result<(BTreeMap<u64, Chunk>, u64)> {
+    let saved = parse_tag(bytes).context("no tag line")?;
+    ensure!(
+        saved == *tag,
+        "the work of another run ({saved:?}, this run {tag:?}); or pass its top"
+    );
+    let head = tag.line().len();
+    let (records, _cut) = bytes[head..].as_chunks::<WORK_RECORD>();
+    let mut done = BTreeMap::new();
+    for r in records {
+        let (i, c) = Chunk::decode(r);
+        ensure!(
+            i < chunks,
+            "a record for chunk {i}, beyond the {chunks} chunks of top {}",
+            tag.top
+        );
+        done.insert(i, c);
+    }
+    Ok((done, (head + records.len() * WORK_RECORD) as u64))
 }
 
 /// Links the chunks into one chain from `genesis` to `top_hash` and returns the table: every
@@ -537,39 +610,58 @@ fn link(
     Ok(table)
 }
 
-/// Compares about `samples` table entries, and always the last, with another node's hashes
-/// (another client). Returns how many entries were compared.
-pub async fn cross_check(table: &Path, other_rpc: &str, samples: u64) -> Result<u64> {
-    let bytes = std::fs::read(table)?;
+/// Compares about `samples` entries of `table`, the last one, and the top block `top` with
+/// another node's hashes (another client), each call retried. Returns how many blocks were
+/// compared and the other node's client.
+async fn cross_check(
+    http: &reqwest::Client,
+    other: &str,
+    table: &[u8],
+    top: u64,
+    top_hash: B256,
+    samples: u64,
+) -> Result<(u64, String)> {
     ensure!(
-        !bytes.is_empty() && bytes.len() % 32 == 0,
-        "{} is not a table of hashes",
-        table.display()
+        !table.is_empty() && table.len().is_multiple_of(32),
+        "not a table of hashes"
     );
-    let entries = bytes.len() as u64 / 32;
-    let http = reqwest::Client::new();
+    let entries = table.len() as u64 / 32;
     let step = (entries / samples.max(1)).max(1);
-    let mut picks: Vec<u64> = (0..entries).step_by(step as usize).collect();
-    if picks.last() != Some(&(entries - 1)) {
-        picks.push(entries - 1);
-    }
-    for &i in &picks {
-        let n = i * K;
-        let h = rpc_call(
-            &http,
-            other_rpc,
+    let mut picks: Vec<(u64, B256)> = (0..entries)
+        .step_by(step as usize)
+        .chain(std::iter::once(entries - 1))
+        .map(|i| {
+            (
+                i * K,
+                B256::from_slice(&table[i as usize * 32..i as usize * 32 + 32]),
+            )
+        })
+        .collect();
+    picks.dedup();
+    picks.push((top, top_hash));
+    for (n, ours) in &picks {
+        let h = rpc_retry(
+            http,
+            other,
             "eth_getBlockByNumber",
             serde_json::json!([format!("{n:#x}"), false]),
         )
         .await?;
-        let theirs: B256 = h["hash"].as_str().context("no hash")?.parse()?;
-        let ours = B256::from_slice(&bytes[i as usize * 32..i as usize * 32 + 32]);
+        let theirs: B256 = h["hash"]
+            .as_str()
+            .with_context(|| format!("{other} has no block {n} (not synced that far?)"))?
+            .parse()?;
         ensure!(
-            ours == theirs,
-            "block {n}: table {ours}, {other_rpc} {theirs}"
+            *ours == theirs,
+            "block {n}: the walk gives {ours}, {other} {theirs}"
         );
     }
-    Ok(picks.len() as u64)
+    let client = rpc_retry(http, other, "web3_clientVersion", serde_json::json!([]))
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| other.to_string());
+    Ok((picks.len() as u64, client))
 }
 
 #[cfg(test)]
@@ -625,18 +717,68 @@ mod tests {
         assert!(link(&missing, 5, genesis, 4100, top).is_err());
     }
 
-    #[test]
-    fn work_file_tags() {
-        let t = Tag {
+    fn tag() -> Tag {
+        Tag {
             chain_id: 1,
             genesis: MAINNET_GENESIS,
             top: 26_457_537,
             top_hash: B256::repeat_byte(7),
-        };
+            pin: Pin::Finalized,
+        }
+    }
+
+    #[test]
+    fn work_file_tags() {
+        let t = tag();
         let mut bytes = t.line().into_bytes();
         bytes.extend_from_slice(&[1, 2, 3]);
         assert_eq!(parse_tag(&bytes), Some(t));
+        let caller = Tag {
+            pin: Pin::Caller,
+            ..t
+        };
+        assert_eq!(parse_tag(caller.line().as_bytes()), Some(caller));
         assert_eq!(parse_tag(b"top 5 0x00\n"), None, "an old or foreign line");
+    }
+
+    #[test]
+    fn work_files_resume_whole_records_only() {
+        let t = tag();
+        let c = |x: u8| Chunk {
+            parent: B256::repeat_byte(x),
+            first: B256::repeat_byte(x + 1),
+            last: B256::repeat_byte(x + 2),
+        };
+        let mut bytes = t.line().into_bytes();
+        bytes.extend_from_slice(&c(1).encode(5));
+        bytes.extend_from_slice(&c(4).encode(9));
+        let whole = bytes.len() as u64;
+        // Half a record a stop left: dropped, the length to keep is the whole records.
+        bytes.extend_from_slice(&c(7).encode(11)[..50]);
+        let (done, keep) = load_work(&bytes, &t, 20).unwrap();
+        assert_eq!(keep, whole);
+        assert_eq!(done.len(), 2);
+        assert_eq!(done[&9], c(4));
+        // A record beyond the run's chunks, another run's tag, no tag: refused.
+        assert!(load_work(&bytes, &t, 9).is_err());
+        let other = Tag { top: 5, ..t };
+        assert!(load_work(&bytes, &other, 20).is_err());
+        assert!(load_work(&[0u8; 200], &t, 20).is_err());
+    }
+
+    #[test]
+    fn a_batch_answers_exactly_its_blocks() {
+        let ids = |r: std::ops::RangeInclusive<u64>| r.map(|n| (n, ())).collect::<BTreeMap<_, _>>();
+        assert!(check_ids(100, 199, &ids(100..=199)).is_ok());
+        assert!(check_ids(100, 199, &ids(101..=200)).is_err(), "shifted");
+        assert!(check_ids(100, 199, &ids(100..=198)).is_err(), "one missing");
+        let mut gap = ids(100..=199);
+        gap.remove(&150);
+        gap.insert(250, ());
+        assert!(
+            check_ids(100, 199, &gap).is_err(),
+            "one swapped for another"
+        );
     }
 
     #[test]
