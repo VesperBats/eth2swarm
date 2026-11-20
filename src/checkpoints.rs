@@ -530,13 +530,6 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
         &format!("nothing is written, and {} keeps the walk", work.display()),
     )
     .await?;
-    let tmp = suffixed(&opts.out, ".tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&table)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &opts.out)?;
     let meta = TableMeta {
         chain_id,
         k: K,
@@ -553,12 +546,38 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
             .as_secs(),
         extended_from: Vec::new(),
     };
-    std::fs::write(
-        suffixed(&opts.out, ".json"),
-        serde_json::to_vec_pretty(&meta)?,
-    )?;
-    let _ = std::fs::remove_file(&work);
+    write_pair(&opts.out, &table, &meta)?;
+    // Only now that both files are on disk: the walk is no longer needed. A work file left
+    // behind would make the next run without --top resume this one's top.
+    if let Err(e) = std::fs::remove_file(&work) {
+        tracing::warn!(
+            "{}: {e}; remove it by hand, or the next run without --top resumes this top",
+            work.display()
+        );
+    }
     Ok(meta)
+}
+
+/// Writes a table and its sidecar: both under temporary names, synced, then renamed, and the
+/// directory synced, so that a crash never leaves a table whose sidecar is empty or missing.
+fn write_pair(out: &Path, table: &[u8], meta: &TableMeta) -> Result<()> {
+    let [_, side, tmp, tmp_side] = out_paths(out);
+    for (path, bytes) in [
+        (&tmp, table.to_vec()),
+        (&tmp_side, serde_json::to_vec_pretty(meta)?),
+    ] {
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, out)?;
+    std::fs::rename(&tmp_side, &side)?;
+    let dir = match out.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 /// Options of an extension.
@@ -697,19 +716,8 @@ pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
             history
         },
     };
-    // Both files written and synced under temporary names, then renamed: no path here is one
-    // of the old pair, so a stop in between never costs it.
-    let [_, _, tmp, tmp_side] = out_paths(&opts.out);
-    for (path, bytes) in [
-        (&tmp, table.clone()),
-        (&tmp_side, serde_json::to_vec_pretty(&meta)?),
-    ] {
-        let mut f = std::fs::File::create(path)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &opts.out)?;
-    std::fs::rename(&tmp_side, suffixed(&opts.out, ".json"))?;
+    // No path write_pair touches is one of the old pair, so a stop in between never costs it.
+    write_pair(&opts.out, &table, &meta)?;
     Ok(meta)
 }
 
@@ -1349,6 +1357,42 @@ mod tests {
             "--extend t.tmp --out t would truncate the old table"
         );
         assert!(same_file(Path::new("/tmp"), Path::new("/tmp/")));
+    }
+
+    #[test]
+    fn a_table_and_its_sidecar_are_written_as_a_pair() {
+        let dir = std::env::temp_dir().join(format!("ckpt-pair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("t.hashes");
+        let table = MAINNET_GENESIS.0.to_vec();
+        let meta = TableMeta {
+            chain_id: 1,
+            k: K,
+            entries: 1,
+            last_entry_block: 0,
+            top_block: 5,
+            top_hash: B256::ZERO,
+            top_pinned_by: "x".into(),
+            genesis_hash: MAINNET_GENESIS,
+            table_keccak256: keccak256(&table),
+            source_client: "y".into(),
+            generated_unix: 0,
+            extended_from: Vec::new(),
+        };
+        write_pair(&out, &table, &meta).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), table);
+        let back: TableMeta =
+            serde_json::from_slice(&std::fs::read(suffixed(&out, ".json")).unwrap()).unwrap();
+        assert_eq!(back.table_keccak256, meta.table_keccak256);
+        // No temporary file is left behind.
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["t.hashes", "t.hashes.json"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
