@@ -390,25 +390,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let provider = ProviderBuilder::new().connect_http(cli.rpc.clone());
     if let Some(url) = &cli.receipts_rpc {
-        let node = ProviderBuilder::new().connect_http(url.clone()).erased();
-        let (main_chain, receipts_chain) = tokio::try_join!(
-            async {
-                provider
-                    .get_chain_id()
-                    .await
-                    .context("querying --rpc's chain id")
-            },
-            async {
-                node.get_chain_id()
-                    .await
-                    .context("querying --receipts-rpc's chain id")
-            },
-        )?;
-        ensure!(
-            main_chain == receipts_chain,
-            "--rpc serves chain {main_chain}, --receipts-rpc chain {receipts_chain}"
-        );
-        addr::fetch::set_early_receipts(node, addr::fetch::byzantium_block(main_chain))?;
+        addr::fetch::set_receipts_rpc(url.clone())?;
     }
     let bee = Bee::new(cli.bee.clone())?;
 

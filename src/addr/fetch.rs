@@ -41,24 +41,69 @@ fn sender(tx: &TxEnvelope) -> Result<Address> {
 /// its transaction instead of a status, and the header's receipts root covers that root.
 pub const MAINNET_BYZANTIUM: u64 = 4_370_000;
 
-/// Where receipts of the blocks before Byzantium come from (`--receipts-rpc`), and up to
-/// which block: process-wide, like `--rpc`, set once at start.
+/// The `--receipts-rpc` node, connected on first use, with the block before which it is
+/// asked: Byzantium on the chain `--rpc` serves.
 struct EarlyReceipts {
     node: alloy::providers::DynProvider,
     before: u64,
 }
 
-static EARLY_RECEIPTS: std::sync::OnceLock<EarlyReceipts> = std::sync::OnceLock::new();
+/// `--receipts-rpc`, process-wide like `--rpc`: set once at start, connected only when a
+/// block is first fetched, so commands that read no blocks never contact it.
+static EARLY_URL: std::sync::OnceLock<alloy::transports::http::reqwest::Url> =
+    std::sync::OnceLock::new();
+static EARLY: tokio::sync::OnceCell<Option<EarlyReceipts>> = tokio::sync::OnceCell::const_new();
 
-/// Reads the receipts of blocks before `before` from `node` instead of the main RPC. Erigon 3
+/// Reads the receipts of the blocks before Byzantium from `url` instead of `--rpc`. Erigon 3
 /// answers those receipts with a status and without the state root they hold, so their root
 /// cannot be checked against the header from its answer; geth keeps it. Everything else
-/// (blocks, traces, later receipts) still comes from the main RPC, and the receipts from
-/// `node` are checked against the header like any others.
-pub fn set_early_receipts(node: alloy::providers::DynProvider, before: u64) -> Result<()> {
-    EARLY_RECEIPTS
-        .set(EarlyReceipts { node, before })
-        .map_err(|_| anyhow::anyhow!("the receipts node is set already"))
+/// (blocks, traces, later receipts) still comes from `--rpc`, and the receipts from `url` are
+/// checked against the header like any others.
+pub fn set_receipts_rpc(url: alloy::transports::http::reqwest::Url) -> Result<()> {
+    EARLY_URL
+        .set(url)
+        .map_err(|_| anyhow::anyhow!("--receipts-rpc is set already"))
+}
+
+/// The early-receipts node, if `--receipts-rpc` is set: on first use, checks that it serves
+/// the chain `provider` does, and warns when that chain has no blocks before Byzantium.
+async fn early_receipts(provider: &impl Provider) -> Result<Option<&'static EarlyReceipts>> {
+    let Some(url) = EARLY_URL.get() else {
+        return Ok(None);
+    };
+    let early = EARLY
+        .get_or_try_init(|| async {
+            let node = alloy::providers::ProviderBuilder::new()
+                .connect_http(url.clone())
+                .erased();
+            let (main_chain, early_chain) = tokio::try_join!(
+                async {
+                    provider
+                        .get_chain_id()
+                        .await
+                        .context("querying --rpc's chain id")
+                },
+                async {
+                    node.get_chain_id()
+                        .await
+                        .context("querying --receipts-rpc's chain id")
+                },
+            )?;
+            ensure!(
+                main_chain == early_chain,
+                "--rpc serves chain {main_chain}, --receipts-rpc chain {early_chain}"
+            );
+            let before = byzantium_block(main_chain);
+            if before == 0 {
+                tracing::warn!(
+                    "--receipts-rpc has no effect on chain {main_chain}: every receipt there \
+                     holds a status"
+                );
+            }
+            anyhow::Ok(Some(EarlyReceipts { node, before }))
+        })
+        .await?;
+    Ok(early.as_ref())
 }
 
 /// The block before which the chain's receipts hold state roots: Byzantium on mainnet, none
@@ -67,9 +112,35 @@ pub fn byzantium_block(chain_id: u64) -> u64 {
     if chain_id == 1 { MAINNET_BYZANTIUM } else { 0 }
 }
 
+/// Whether block `number`'s receipts come from the early node (which serves blocks before
+/// `before`).
+fn from_early_node(number: u64, before: u64) -> bool {
+    number < before
+}
+
+/// Whether receipts that do not match the header's root look like a node that dropped the
+/// state roots of a chain's pre-Byzantium receipts: the block is before Byzantium
+/// (`byzantium`, of the chain), a receipt has a status, and they did not come from
+/// `--receipts-rpc` already.
+fn dropped_state_roots<R: alloy::consensus::TxReceipt>(
+    number: u64,
+    byzantium: u64,
+    receipts: &[R],
+    from_early: bool,
+) -> bool {
+    !from_early
+        && number < byzantium
+        && receipts.iter().any(|r| {
+            !matches!(
+                r.status_or_post_state(),
+                alloy::consensus::Eip658Value::PostState(_)
+            )
+        })
+}
+
 /// Fetch block `number` with its receipts and uncles, and its `trace_block` traces if
 /// `traces` is set (Erigon, Reth, Anvil; not geth). Receipts of a block before Byzantium come
-/// from the `--receipts-rpc` node when one is set ([`set_early_receipts`]).
+/// from the `--receipts-rpc` node when one is set ([`set_receipts_rpc`]).
 pub async fn fetch_block_data(
     provider: &impl Provider,
     number: u64,
@@ -77,7 +148,14 @@ pub async fn fetch_block_data(
 ) -> Result<BlockData> {
     let block = fetch_verified_block(provider, number).await?;
     let hash = block.hash;
-    let early = EARLY_RECEIPTS.get().filter(|e| number < e.before);
+    let early = early_receipts(provider)
+        .await?
+        .filter(|e| from_early_node(number, e.before));
+    let source = if early.is_some() {
+        " from --receipts-rpc"
+    } else {
+        ""
+    };
 
     let receipts_fut = async {
         let receipts = match early {
@@ -85,17 +163,13 @@ pub async fn fetch_block_data(
             None => provider.get_block_receipts(BlockId::hash(hash)).await,
         };
         receipts
+            .with_context(|| format!("querying receipts of block {number}{source}"))?
             .with_context(|| {
                 format!(
-                    "querying receipts of block {number}{}",
-                    if early.is_some() {
-                        " from --receipts-rpc"
-                    } else {
-                        ""
-                    }
+                    "no receipts for block {number}{source} (does the node keep that block's \
+                     history?)"
                 )
-            })?
-            .with_context(|| format!("no receipts for block {number}"))
+            })
     };
     let traces_fut = async {
         if !traces {
@@ -122,15 +196,13 @@ pub async fn fetch_block_data(
         .collect();
     let receipts_root = calculate_receipt_root(&consensus_receipts);
     if receipts_root != block.header.receipts_root {
-        // A node that drops pre-Byzantium state roots answers with a status instead.
-        use alloy::consensus::TxReceipt as _;
-        let status_only = consensus_receipts.iter().any(|r| {
-            !matches!(
-                r.status_or_post_state(),
-                alloy::consensus::Eip658Value::PostState(_)
-            )
-        });
-        let hint = if number < MAINNET_BYZANTIUM && status_only && early.is_none() {
+        // A node that drops pre-Byzantium state roots answers with a status instead. The
+        // chain is asked only here, on the failure.
+        let byzantium = match provider.get_chain_id().await {
+            Ok(chain) => byzantium_block(chain),
+            Err(_) => 0,
+        };
+        let hint = if dropped_state_roots(number, byzantium, &consensus_receipts, early.is_some()) {
             ". The node answered receipts from before Byzantium with a status instead of the \
              state root they hold (Erigon 3 does): pass --receipts-rpc <a node that keeps it, \
              such as geth>"
@@ -462,6 +534,35 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn early_receipts_and_the_hint() {
+        use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+        let receipt = |status: Eip658Value| {
+            ReceiptEnvelope::Legacy(ReceiptWithBloom::from(Receipt::<alloy::primitives::Log> {
+                status,
+                cumulative_gas_used: 21_000,
+                logs: vec![],
+            }))
+        };
+        // The last block before Byzantium is the early node's, Byzantium's first is not.
+        assert!(from_early_node(MAINNET_BYZANTIUM - 1, MAINNET_BYZANTIUM));
+        assert!(!from_early_node(MAINNET_BYZANTIUM, MAINNET_BYZANTIUM));
+        assert!(!from_early_node(0, 0), "a chain without such blocks");
+        let roots = [receipt(Eip658Value::PostState(B256::repeat_byte(1)))];
+        let status = [receipt(Eip658Value::Eip658(true))];
+        let mixed = [roots[0].clone(), status[0].clone()];
+        let b = MAINNET_BYZANTIUM;
+        // A status before Byzantium, from --rpc: the hint.
+        assert!(dropped_state_roots(999_425, b, &status, false));
+        assert!(dropped_state_roots(999_425, b, &mixed, false));
+        // State roots (another fault), from --receipts-rpc already, after Byzantium, or a
+        // chain without pre-Byzantium blocks: none.
+        assert!(!dropped_state_roots(999_425, b, &roots, false));
+        assert!(!dropped_state_roots(999_425, b, &status, true));
+        assert!(!dropped_state_roots(b, b, &status, false));
+        assert!(!dropped_state_roots(5, 0, &status, false));
+    }
 
     #[test]
     fn byzantium_only_on_mainnet() {
