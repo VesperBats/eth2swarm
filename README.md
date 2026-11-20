@@ -11,6 +11,9 @@ Importer of Ethereum blocks into Ethereum Swarm.
   verify any block from a single trust anchor — see
   [docs/soc-block-store.md](docs/soc-block-store.md) (`import`, `get`, `verify-epoch`,
   `header-stats`).
+- Checkpoint table for Myotis: `checkpoint-table`, the hash of every 1024th block from genesis
+  up to a finalized block, every header hashed and linked here, the top pinned by
+  `--top-hash` or by another node (`--cross-check`).
 - Address → transaction index (design, not implemented): a mobile-friendly index on Swarm
   from an address to the transactions it appears in — see
   [docs/address-index.md](docs/address-index.md).
