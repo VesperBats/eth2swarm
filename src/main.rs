@@ -63,13 +63,22 @@ enum Command {
     /// The hash of every 1024th block from genesis up to a finalized block (Myotis's
     /// checkpoint table, its docs/ideas/deep-block-verification.md): every header is hashed
     /// here and linked by parentHash down to the genesis hash; the node's hashes are never
-    /// used. Writes <out> (32 bytes per entry, entry i = block i·1024) and <out>.json, and
-    /// resumes from <out>.work after a stop.
+    /// used. Writes <out> (32 bytes per entry, entry i = block i·1024) and <out>.json. A full
+    /// build resumes from <out>.work after a stop; --extend continues an existing table from
+    /// its last entry up to a new top.
     CheckpointTable {
         /// The table file to write.
         #[arg(long)]
         out: std::path::PathBuf,
-        /// The block to walk down from (default: the node's finalized block).
+        /// Extend this existing table (with its <table>.json) instead of walking from genesis:
+        /// the walk starts at its last entry, which it must reproduce, passes through its
+        /// recorded top, and goes up to the new top; its entries are kept and the new ones
+        /// appended. --out must be another file; the old pair is never changed. For weeks of
+        /// blocks (it keeps them in memory and does not resume): a full build resumes.
+        #[arg(long, conflicts_with = "genesis_hash")]
+        extend: Option<std::path::PathBuf>,
+        /// The table's new top: the block a full build walks down from, or an extension walks
+        /// up to (default: the node's finalized block).
         #[arg(long, requires = "top_hash")]
         top: Option<u64>,
         /// The top block's hash, from a source you trust (a beacon-attested finalized block).
@@ -169,6 +178,28 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::CheckpointTable {
             out,
+            extend: Some(from),
+            top,
+            top_hash,
+            concurrency,
+            cross_check,
+            ..
+        } => {
+            let meta = checkpoints::extend(&checkpoints::ExtendOptions {
+                rpc: cli.rpc.to_string(),
+                from,
+                out,
+                top,
+                top_hash,
+                concurrency,
+                cross_check: cross_check.as_ref().map(|u| u.to_string()),
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&meta)?);
+        }
+        Command::CheckpointTable {
+            out,
+            extend: None,
             top,
             top_hash,
             genesis_hash,
