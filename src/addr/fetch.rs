@@ -13,7 +13,7 @@ use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::network::ReceiptResponse as _;
 use alloy::providers::Provider;
 use alloy::transports::{RpcError, TransportError};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use alloy::consensus::TxEnvelope;
 use alloy::primitives::Address;
@@ -37,22 +37,194 @@ fn sender(tx: &TxEnvelope) -> Result<Address> {
     Ok(tx.recover_signer_unchecked()?)
 }
 
+/// First mainnet block of Byzantium (EIP-658). A receipt before it holds the state root after
+/// its transaction instead of a status, and the header's receipts root covers that root.
+pub const MAINNET_BYZANTIUM: u64 = 4_370_000;
+
+/// The `--receipts-rpc` node, with the block before which it is asked: Byzantium on the
+/// chain `--rpc` serves.
+pub(crate) struct EarlyReceipts {
+    node: alloy::providers::DynProvider,
+    before: u64,
+}
+
+/// `--receipts-rpc`, process-wide like `--rpc`: set once at start, set up by the first fetch
+/// (`prepare_early_receipts`). One `--rpc` per process: the setup checks the node against the
+/// first provider that fetches, and serves every later fetch from the same chain.
+static EARLY_URL: std::sync::OnceLock<alloy::transports::http::reqwest::Url> =
+    std::sync::OnceLock::new();
+/// `None`: the chain has no blocks before Byzantium, so the node is never asked.
+static EARLY: tokio::sync::OnceCell<Option<EarlyReceipts>> = tokio::sync::OnceCell::const_new();
+
+/// How long connecting to the `--receipts-rpc` node may take, and how often its setup is tried
+/// before the run stops: a host that does not answer costs this much once, not per block.
+const EARLY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const EARLY_SETUP_ATTEMPTS: u32 = 3;
+
+/// Reads the receipts of the blocks before Byzantium from `url` instead of `--rpc`. Erigon 3
+/// answers those receipts with a status and without the state root they hold, so their root
+/// cannot be checked against the header from its answer; geth keeps it. Everything else
+/// (blocks, traces, later receipts) still comes from `--rpc`, and the receipts from `url` are
+/// checked against the header like any others.
+pub fn set_receipts_rpc(url: alloy::transports::http::reqwest::Url) -> Result<()> {
+    EARLY_URL
+        .set(url)
+        .map_err(|_| anyhow::anyhow!("--receipts-rpc is set already"))
+}
+
+/// Sets up `--receipts-rpc` once, when the first block before mainnet's Byzantium is to be
+/// fetched (later blocks never need it, on any chain): asks `--rpc`'s chain, and on a
+/// chain without blocks before Byzantium warns and never contacts the node. Otherwise connects
+/// (with a connect timeout) and checks that the node serves the same chain, a few attempts in
+/// all. Later calls return the result.
+pub async fn prepare_early_receipts(
+    provider: &impl Provider,
+) -> Result<Option<&'static EarlyReceipts>> {
+    let Some(url) = EARLY_URL.get() else {
+        return Ok(None);
+    };
+    let early = EARLY
+        .get_or_try_init(|| async {
+            let main_chain = provider
+                .get_chain_id()
+                .await
+                .context("querying --rpc's chain id")?;
+            let before = byzantium_block(main_chain);
+            if before == 0 {
+                tracing::warn!(
+                    "--receipts-rpc has no effect on chain {main_chain}: every receipt there \
+                     holds a status. The node is not contacted"
+                );
+                return Ok(None);
+            }
+            let client = alloy::transports::http::reqwest::Client::builder()
+                .connect_timeout(EARLY_CONNECT_TIMEOUT)
+                .build()
+                .context("building the --receipts-rpc client")?;
+            let node = alloy::providers::ProviderBuilder::new()
+                .connect_client(alloy::rpc::client::RpcClient::new(
+                    alloy::transports::http::Http::with_client(client, url.clone()),
+                    false,
+                ))
+                .erased();
+            let mut attempt = 1;
+            let early_chain = loop {
+                match node.get_chain_id().await {
+                    Ok(chain) => break chain,
+                    Err(e) if attempt < EARLY_SETUP_ATTEMPTS => {
+                        tracing::warn!(
+                            "--receipts-rpc {url}, attempt {attempt}/{EARLY_SETUP_ATTEMPTS}: \
+                             {e:#}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 1)))
+                            .await;
+                        attempt += 1;
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e))
+                            .with_context(|| format!("querying --receipts-rpc {url}'s chain id"));
+                    }
+                }
+            };
+            ensure!(
+                main_chain == early_chain,
+                "--rpc serves chain {main_chain}, --receipts-rpc chain {early_chain}"
+            );
+            anyhow::Ok(Some(EarlyReceipts { node, before }))
+        })
+        .await?;
+    Ok(early.as_ref())
+}
+
+/// The block before which the chain's receipts hold state roots: Byzantium on mainnet, none
+/// elsewhere (the other chains this tool reads started after it).
+pub fn byzantium_block(chain_id: u64) -> u64 {
+    if chain_id == 1 { MAINNET_BYZANTIUM } else { 0 }
+}
+
+/// Whether block `number`'s receipts come from the early node (which serves blocks before
+/// `before`).
+fn from_early_node(number: u64, before: u64) -> bool {
+    number < before
+}
+
+/// What to add to a receipts-root mismatch of block `number` (`byzantium`: the chain's): when
+/// a receipt before Byzantium came with a status, the node dropped the state roots. From
+/// `--rpc` that calls for `--receipts-rpc`; from the `--receipts-rpc` node, for another node.
+/// Nothing otherwise: another fault.
+fn root_hint<R: alloy::consensus::TxReceipt>(
+    number: u64,
+    byzantium: u64,
+    receipts: &[R],
+    from_early: bool,
+) -> &'static str {
+    let status = receipts.iter().any(|r| {
+        !matches!(
+            r.status_or_post_state(),
+            alloy::consensus::Eip658Value::PostState(_)
+        )
+    });
+    match (number < byzantium && status, from_early) {
+        (false, _) => "",
+        (true, false) => {
+            ". The node answered receipts from before Byzantium with a status instead of the \
+             state root they hold (Erigon 3 does): pass --receipts-rpc <a node that keeps it, \
+             such as geth>"
+        }
+        (true, true) => {
+            ". The --receipts-rpc node answered with a status as well: it has to be a node \
+             that keeps the state root of receipts before Byzantium, such as geth"
+        }
+    }
+}
+
 /// Fetch block `number` with its receipts and uncles, and its `trace_block` traces if
-/// `traces` is set (Erigon, Reth, Anvil; not geth).
+/// `traces` is set (Erigon, Reth, Anvil; not geth). Receipts of a block before Byzantium come
+/// from the `--receipts-rpc` node when one is set ([`set_receipts_rpc`]).
 pub async fn fetch_block_data(
     provider: &impl Provider,
     number: u64,
     traces: bool,
 ) -> Result<BlockData> {
+    // No chain this tool knows has receipts with state roots from mainnet's Byzantium on, so a
+    // later block never needs (or contacts) the --receipts-rpc node.
+    let early = if number < MAINNET_BYZANTIUM {
+        prepare_early_receipts(provider).await?
+    } else {
+        None
+    };
+    fetch_block_data_with(provider, early, number, traces).await
+}
+
+/// [`fetch_block_data`] with the early-receipts node given (tests drive it with mocks).
+async fn fetch_block_data_with(
+    provider: &impl Provider,
+    early: Option<&EarlyReceipts>,
+    number: u64,
+    traces: bool,
+) -> Result<BlockData> {
     let block = fetch_verified_block(provider, number).await?;
     let hash = block.hash;
+    let early = early.filter(|e| from_early_node(number, e.before));
+    let source = if early.is_some() {
+        " from --receipts-rpc"
+    } else {
+        ""
+    };
 
     let receipts_fut = async {
-        provider
-            .get_block_receipts(BlockId::hash(hash))
-            .await
-            .with_context(|| format!("querying receipts of block {number}"))?
-            .with_context(|| format!("no receipts for block {number}"))
+        let receipts = match early {
+            Some(e) => e.node.get_block_receipts(BlockId::hash(hash)).await,
+            None => provider.get_block_receipts(BlockId::hash(hash)).await,
+        };
+        receipts
+            .with_context(|| format!("querying receipts of block {number}{source}"))?
+            .with_context(|| {
+                format!(
+                    "no receipts for block {number}{source} (does the node keep that block's \
+                     history?)"
+                )
+            })
     };
     let traces_fut = async {
         if !traces {
@@ -78,11 +250,23 @@ pub async fn fetch_block_data(
         .map(|r| r.inner.clone().into_primitives_receipt())
         .collect();
     let receipts_root = calculate_receipt_root(&consensus_receipts);
-    ensure!(
-        receipts_root == block.header.receipts_root,
-        "block {number}: receipts root {receipts_root} != header {}",
-        block.header.receipts_root
-    );
+    if receipts_root != block.header.receipts_root {
+        // The chain's Byzantium block: the early node's, else asked of --rpc, only here on
+        // the failure.
+        let byzantium = match early {
+            Some(e) => e.before,
+            None => provider
+                .get_chain_id()
+                .await
+                .map(byzantium_block)
+                .unwrap_or(0),
+        };
+        let hint = root_hint(number, byzantium, &consensus_receipts, early.is_some());
+        bail!(
+            "block {number}: receipts root {receipts_root}{source} != header {}{hint}",
+            block.header.receipts_root
+        );
+    }
 
     let tx_data = txs
         .iter()
@@ -265,6 +449,12 @@ where
     if next_spawn > end {
         return Ok(());
     }
+    // Set up --receipts-rpc once, before the tasks, when the range has a block that may need
+    // it: its connect timeout and attempts then apply once, not under every block's retries.
+    // A range after Byzantium never contacts it.
+    if next_spawn < MAINNET_BYZANTIUM {
+        prepare_early_receipts(provider).await?;
+    }
     let mut next_emit = next_spawn;
     let mut waiting: BTreeMap<u64, BlockAppearances> = BTreeMap::new();
     let mut prev_hash: Option<B256> = None;
@@ -403,6 +593,117 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn early_receipts_and_the_hint() {
+        use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+        let receipt = |status: Eip658Value| {
+            ReceiptEnvelope::Legacy(ReceiptWithBloom::from(Receipt::<alloy::primitives::Log> {
+                status,
+                cumulative_gas_used: 21_000,
+                logs: vec![],
+            }))
+        };
+        // The last block before Byzantium is the early node's, Byzantium's first is not.
+        assert!(from_early_node(MAINNET_BYZANTIUM - 1, MAINNET_BYZANTIUM));
+        assert!(!from_early_node(MAINNET_BYZANTIUM, MAINNET_BYZANTIUM));
+        assert!(!from_early_node(0, 0), "a chain without such blocks");
+        let roots = [receipt(Eip658Value::PostState(B256::repeat_byte(1)))];
+        let status = [receipt(Eip658Value::Eip658(true))];
+        let mixed = [roots[0].clone(), status[0].clone()];
+        let b = MAINNET_BYZANTIUM;
+        // A status before Byzantium: from --rpc, pass --receipts-rpc; from that node, another.
+        assert!(root_hint(999_425, b, &status, false).contains("pass --receipts-rpc"));
+        assert!(root_hint(999_425, b, &mixed, false).contains("pass --receipts-rpc"));
+        assert!(root_hint(999_425, b, &status, true).contains("answered with a status as well"));
+        // State roots (another fault), after Byzantium, or a chain without such blocks: none.
+        assert_eq!(root_hint(999_425, b, &roots, false), "");
+        assert_eq!(root_hint(b, b, &status, false), "");
+        assert_eq!(root_hint(5, 0, &status, true), "");
+    }
+
+    /// Block 999,425 of mainnet (one transaction), as nuc's Erigon serves it, with its
+    /// receipts from that Erigon (a status, no state root) and from zbox's geth (the root).
+    fn fixture(name: &str) -> serde_json::Value {
+        let path = format!(
+            "{}/testdata/early-receipts/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn mocked(responses: &[serde_json::Value]) -> alloy::providers::DynProvider {
+        let asserter = alloy::transports::mock::Asserter::new();
+        for r in responses {
+            asserter.push_success(r);
+        }
+        alloy::providers::ProviderBuilder::new()
+            .connect_mocked_client(asserter)
+            .erased()
+    }
+
+    #[tokio::test]
+    async fn receipts_before_byzantium_come_from_the_early_node() {
+        let block = fixture("block-999425.json");
+        let (erigon, geth) = (
+            fixture("receipts-999425-erigon.json"),
+            fixture("receipts-999425-geth.json"),
+        );
+        let early = |answer: &serde_json::Value| EarlyReceipts {
+            node: mocked(std::slice::from_ref(answer)),
+            before: MAINNET_BYZANTIUM,
+        };
+        // --rpc gives the block, the early node geth's receipts: verified.
+        let main = mocked(std::slice::from_ref(&block));
+        let data = fetch_block_data_with(&main, Some(&early(&geth)), 999_425, false)
+            .await
+            .unwrap();
+        assert_eq!((data.number, data.txs.len()), (999_425, 1));
+        // From --rpc alone (Erigon's receipts, then the chain asked on the failure): the hint.
+        let main = mocked(&[block.clone(), erigon.clone(), serde_json::json!("0x1")]);
+        let e = format!(
+            "{:#}",
+            fetch_block_data_with(&main, None, 999_425, false)
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            e.contains("pass --receipts-rpc") && !e.contains("from --receipts-rpc"),
+            "{e}"
+        );
+        // The early node drops the roots too: named, and told to be another node.
+        let main = mocked(std::slice::from_ref(&block));
+        let e = format!(
+            "{:#}",
+            fetch_block_data_with(&main, Some(&early(&erigon)), 999_425, false)
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            e.contains("from --receipts-rpc") && e.contains("answered with a status as well"),
+            "{e}"
+        );
+        // At or after the boundary the early node is not asked: --rpc's receipts are used.
+        let unasked = EarlyReceipts {
+            node: mocked(&[]),
+            before: 999_425,
+        };
+        let main = mocked(&[block, geth]);
+        assert!(
+            fetch_block_data_with(&main, Some(&unasked), 999_425, false)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn byzantium_only_on_mainnet() {
+        assert_eq!(byzantium_block(1), 4_370_000);
+        // Sepolia, Gnosis, the dev chains: receipts with a status from their first block.
+        for chain in [11_155_111, 100, 1337, 31_337] {
+            assert_eq!(byzantium_block(chain), 0, "chain {chain}");
+        }
+    }
 
     #[test]
     fn only_transport_failures_are_retried() {

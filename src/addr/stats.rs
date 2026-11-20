@@ -127,6 +127,65 @@ pub fn window_stats(
     Ok(out)
 }
 
+/// Progress of an `addr-stats` run, for a line every [`Progress::EVERY`]: blocks done of the
+/// total, the rate since the start, and the time left at that rate.
+pub struct Progress {
+    total: u64,
+    done: u64,
+    started: std::time::Instant,
+    last: std::time::Instant,
+}
+
+impl Progress {
+    /// How often a line is written.
+    pub const EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+    pub fn new(total: u64, now: std::time::Instant) -> Self {
+        Self {
+            total,
+            done: 0,
+            started: now,
+            last: now,
+        }
+    }
+
+    /// Counts one block without reporting (a line is asked for with [`Self::line`]).
+    pub fn count(&mut self) {
+        self.done += 1;
+    }
+
+    /// Counts one block; a line when [`Self::EVERY`] has passed since the last one.
+    pub fn block(&mut self, now: std::time::Instant) -> Option<String> {
+        self.done += 1;
+        (now.duration_since(self.last) >= Self::EVERY).then(|| {
+            self.last = now;
+            self.line(now)
+        })
+    }
+
+    /// Where the run is: blocks done, the rate, the time left.
+    pub fn line(&self, now: std::time::Instant) -> String {
+        let secs = now.duration_since(self.started).as_secs_f64();
+        let rate = if secs > 0.0 {
+            self.done as f64 / secs
+        } else {
+            0.0
+        };
+        let left = if rate > 0.0 {
+            let s = (self.total.saturating_sub(self.done) as f64 / rate).round() as u64;
+            format!("about {}h{:02}m left", s / 3600, s % 3600 / 60)
+        } else {
+            "time left unknown".into()
+        };
+        format!(
+            "{}/{} blocks ({:.1} %), {rate:.2} blocks/s, {left}",
+            self.done,
+            self.total,
+            self.done as f64 * 100.0 / self.total.max(1) as f64
+        )
+    }
+}
+
 /// The window as a Markdown table, one row per level, averages per slice.
 pub fn render(w: &WindowStats) -> String {
     let blocks = w.last_block - w.first_block + 1;
@@ -200,6 +259,24 @@ mod tests {
             });
         }
         v
+    }
+
+    #[test]
+    fn progress_lines() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut p = Progress::new(1_000, t0);
+        assert_eq!(p.block(t0 + Duration::from_secs(1)), None, "not yet");
+        // 2 blocks in 40 s: 0.05 blocks/s, 998 left take 19,960 s (5h32m40s).
+        assert_eq!(
+            p.block(t0 + Duration::from_secs(40)).unwrap(),
+            "2/1000 blocks (0.2 %), 0.05 blocks/s, about 5h32m left"
+        );
+        assert_eq!(p.block(t0 + Duration::from_secs(41)), None, "30 s apart");
+        assert_eq!(
+            Progress::new(10, t0).line(t0),
+            "0/10 blocks (0.0 %), 0.00 blocks/s, time left unknown"
+        );
     }
 
     #[test]
