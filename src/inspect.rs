@@ -1572,6 +1572,70 @@ mod tests {
     }
 
     #[test]
+    fn help_lists_match_the_callouts() {
+        // Each picture's numbered list explains its callouts by position: the list after
+        // `src="help/<name>.webp"` has exactly as many items as the shot has marks, numbered
+        // 1..n (scripts/inspector-help-shots.json).
+        let spec: Value =
+            serde_json::from_str(include_str!("../scripts/inspector-help-shots.json")).unwrap();
+        let shots = spec.as_array().unwrap();
+        let shot_files: std::collections::BTreeSet<String> = shots
+            .iter()
+            .map(|s| format!("{}.webp", s["name"].as_str().unwrap()))
+            .collect();
+        let served: std::collections::BTreeSet<String> =
+            HELP_IMAGES.iter().map(|(n, _)| n.to_string()).collect();
+        assert_eq!(shot_files, served, "one shot per help image");
+        assert_eq!(shots.len(), served.len(), "a shot listed twice");
+        for shot in shots {
+            let name = shot["name"].as_str().unwrap();
+            let file = format!("{name}.webp");
+            assert!(
+                HELP_IMAGES.iter().any(|(n, _)| *n == file),
+                "{file} is not served"
+            );
+            let marks = shot["marks"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name}: no marks"));
+            for (i, m) in marks.iter().enumerate() {
+                assert_eq!(
+                    m[0].as_u64(),
+                    Some(i as u64 + 1),
+                    "{name}: marks out of order"
+                );
+            }
+            let at = HELP
+                .find(&format!("src=\"help/{file}\""))
+                .unwrap_or_else(|| panic!("{file} is not on the page"));
+            // The picture's own section: up to the next picture or heading.
+            let section = &HELP[at + 1..];
+            let end = ["<figure", "<h2", "<h3"]
+                .iter()
+                .filter_map(|t| section.find(t))
+                .min()
+                .unwrap_or(section.len());
+            let section = &section[..end];
+            let start = section
+                .find("<ol class=\"callouts\">")
+                .unwrap_or_else(|| panic!("{name}: no callout list under the picture"));
+            let list = &section[start + 1..];
+            let list = &list[..list.find("</ol>").unwrap()];
+            // Callout items are plain list items: no nested lists, an item is `<li>` or
+            // `<li ` with attributes.
+            assert!(
+                !list.contains("<ol") && !list.contains("<ul"),
+                "{name}: a nested list in the callouts"
+            );
+            let items = list.matches("<li>").count() + list.matches("<li ").count();
+            assert_eq!(
+                items,
+                marks.len(),
+                "{name}: the list does not have one item per callout"
+            );
+        }
+    }
+
+    #[test]
     fn help_page_anchors_exist() {
         // Every in-page link (`href="#x"`) has its target (`id="x"`).
         for link in HELP.split("href=\"#").skip(1) {

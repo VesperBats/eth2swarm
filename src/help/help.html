@@ -122,7 +122,7 @@ get it:</p>
   <li><b>An export directory</b> (<code>addr-import --out &lt;dir&gt;</code>): its
     <code>addr1-export.json</code> holds <code>owner</code> and <code>chain_id</code>.</li>
   <li><b>The importer's key</b>: <code>cast wallet address --private-key $ETH2SWARM_KEY</code>.
-    <code>addr-upload</code> and <code>addr-verify</code> also print the owner.</li>
+    <code>addr-import</code> and <code>addr-upload</code> also print the owner.</li>
   <li><b>Any one of its SOCs</b>: open it in the <a href="#soc">SOC tab</a> by
     <em>SOC address</em>; the <a class="g" href="#g-recovered-signer">recovered signer</a> is the
     owner.</li>
@@ -202,9 +202,10 @@ record ──holds──▶ entries: (block, slot, roles), or a reference to a s
     has in the blocks looked at.</li>
   <li><b>blocks looked at</b>: the block range the lookup read (with <em>Since unit</em>, only
     the newer part).</li>
-  <li><b>slices / files read</b>: how many slices were read, and how many
-    <a class="g" href="#g-spill-file">spill files</a>. 0 files means every record was inline in
-    its bucket.</li>
+  <li><b>slices / files read</b>: how many slices were read, and how many files besides the
+    buckets: <a class="g" href="#g-spill-file">spill files</a>, and the pages file of a
+    <a class="g" href="#g-paged">paged</a> bucket. 0 files means every bucket and every record
+    was inline.</li>
   <li><b>roles the index detects</b>: which <a class="g" href="#g-roles">roles</a> the importer
     looked for. Without <code>trace</code>, addresses that only occur inside internal calls (a
     multisig paying out, a router forwarding) are missing.</li>
@@ -278,6 +279,10 @@ the bucket of USDT's token contract in a level-6 slice.</p>
     mostly <code>emitter</code>: they emit a Transfer log in every transaction that moves the
     token.</li>
 </ol>
+<p>Below the reference, a <b>read</b> row says how the file was read: <em>whole</em> for a file
+of up to 256 MB, every entry checked against the count; <em>newest pages only</em> for a larger
+one (a token contract in a top-level slice), read from its last page backwards only as far as the
+view shows, so the count is the bucket record's and is not checked against the file.</p>
 
 <h3 id="addr-examples">Example addresses</h3>
 <p>Don't know an address with entries? <b>Show example addresses</b> counts well-known ones
@@ -449,8 +454,10 @@ record holds its reference (body ref); the body is checked against the header's 
 <dt id="g-bucket">Bucket</dt>
 <dd>One SOC of a slice, holding the <a href="#g-record">records</a> of the addresses whose hash
 falls into it: about 2.8 KB, about 120–180 addresses. A lookup reads one bucket per slice. That
-the bucket also holds other addresses' records gives some privacy: the node serving it does not
-learn which address was looked up.</dd>
+the bucket also holds other addresses' records gives some privacy: a node that serves one bucket
+sees only that one of its addresses was asked for. The node a lookup goes through sees every
+bucket of the lookup and can narrow the address down much further
+(<code>docs/address-index.md</code>, <em>Design constraints</em>).</dd>
 
 <dt id="g-bucket-count">Bucket count (B)</dt>
 <dd>How many buckets a slice has, chosen so a bucket averages 2,816 bytes. An address goes into
@@ -520,8 +527,12 @@ origin's units + <em>n</em>.</dd>
 proofs.</dd>
 
 <dt id="g-identifier">Identifier</dt>
-<dd>32 bytes that, with the owner, give a SOC its address. eth2swarm makes every identifier the
-keccak256 of an <a href="#g-identifier-string">identifier string</a>.</dd>
+<dd>32 bytes that, with the owner, give a SOC its address. eth2swarm makes an identifier the
+keccak256 of an <a href="#g-identifier-string">identifier string</a>, with one exception: a
+<a href="#g-head-update">head update</a>'s is keccak256(topic ‖ n), where the topic is the
+keccak256 of <code>eth:&lt;chain&gt;:addr1:head</code> (Bee's sequence-feed scheme), so a head
+update cannot be opened by identifier string in the SOC tab, only by identifier or SOC
+address.</dd>
 
 <dt id="g-identifier-string">Identifier string</dt>
 <dd>The readable name of a SOC, e.g. <code>eth:1:0x…:hdr:97</code> (block 97),
@@ -627,7 +638,8 @@ of the whole file.</dd>
 <dt id="g-spill-file">Spill file</dt>
 <dd>A separate Swarm file holding the entries of one address in one slice, when they take more
 than 256 bytes. Busy addresses (token contracts, routers, builders) are spilled; the bucket keeps
-only the count and the reference.</dd>
+only the count and the reference. Page <i>p</i> of the file is its <i>p</i>-th 4096-byte chunk,
+so a file above 256 MB is read page by page rather than whole.</dd>
 
 <dt id="g-tx">tx</dt>
 <dd>The transaction index within a block, counted from 0 as block explorers do. See

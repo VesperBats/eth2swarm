@@ -24,6 +24,11 @@ mkdirSync(outDir, { recursive: true });
 const chrome = spawn('chromium', ['--headless=new', `--remote-debugging-port=${PORT}`,
   `--user-data-dir=${profile}`, '--no-first-run', '--hide-scrollbars', 'about:blank'],
   { stdio: 'ignore' });
+// However the run ends (an error before the loop too), the browser goes with it: a stale one
+// would keep port 9333 and the profile locked for the next run.
+const killChrome = () => { try { chrome.kill(); } catch { /* already gone */ } };
+process.on('exit', killChrome);
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { killChrome(); process.exit(130); });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 let target;
@@ -37,7 +42,13 @@ for (let i = 0; i < 60 && !target; i++) {
 if (!target) { console.error('no page target'); chrome.kill(); process.exit(1); }
 
 const ws = new WebSocket(target.webSocketDebuggerUrl);
-await new Promise(r => ws.addEventListener('open', r, { once: true }));
+await new Promise((resolve, reject) => {
+  const timer = setTimeout(() => reject(new Error('the DevTools WebSocket did not open in 15 s')), 15000);
+  ws.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
+  for (const ev of ['error', 'close']) {
+    ws.addEventListener(ev, () => { clearTimeout(timer); reject(new Error(`the DevTools WebSocket failed (${ev})`)); }, { once: true });
+  }
+});
 let id = 0; const waiting = new Map();
 ws.addEventListener('message', ev => {
   const m = JSON.parse(ev.data);
@@ -91,6 +102,10 @@ window.__mark = (n, sel, text, nth, side) => {
   return 'ok';
 };`;
 
+// Shots not retaken, and callouts not placed: any of them makes the run fail, since the help
+// page explains each picture's numbers by position (an old picture, or one with a number
+// missing, would no longer match its list).
+const incomplete = [];
 try {
 for (const s of shots) {
   await send('Page.navigate', { url: `${s.base || base}/${s.hash ? '#' + s.hash : ''}` });
@@ -106,14 +121,17 @@ for (const s of shots) {
       return !!o && o.innerHTML.length > 0 && !o.querySelector('.spinner');` : 'return true;'}
     })()`);
   }
-  if (!ready) { console.error(`${s.name}: not ready`); continue; }
+  if (!ready) { console.error(`${s.name}: not ready`); incomplete.push(`${s.name}: not ready`); continue; }
   await evaluate(HELPERS);
   if (s.before) await evaluate(s.before);
   await sleep(300);
+  let missing = 0;
   for (const [n, sel, text, nth, side] of s.marks || []) {
     const r = await evaluate(`__mark(${JSON.stringify(String(n))}, ${JSON.stringify(sel)}, ${JSON.stringify(text || '')}, ${nth || 0}, ${JSON.stringify(side || 'left')})`);
-    if (r !== 'ok') console.error(`${s.name}: ${r}`);
+    if (r !== 'ok') { console.error(`${s.name}: ${r}`); incomplete.push(`${s.name}: ${r}`); missing++; }
   }
+  // A picture with a number missing would no longer match its list: keep the old one.
+  if (missing) continue;
   const clip = await evaluate(`(() => {
     const a = __el(${JSON.stringify(s.from || 'header')}).getBoundingClientRect();
     const z = __el(${JSON.stringify(s.to || s.from || 'header')}).getBoundingClientRect();
@@ -127,4 +145,8 @@ for (const s of shots) {
 }
 } finally {
   ws.close(); chrome.kill();
+}
+if (incomplete.length) {
+  console.error(`incomplete retake (${incomplete.length}): ${incomplete.join('; ')}`);
+  process.exit(1);
 }
