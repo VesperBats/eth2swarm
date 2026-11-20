@@ -164,6 +164,11 @@ pub async fn serve(
     for n in &state.nodes {
         println!("  node {:<10} {}", n.name, n.url);
     }
+    if state.defaults.owner.is_none() {
+        println!(
+            "  no default SOC owner (--owner / ETH2SWARM_OWNER): enter it in the page's settings bar"
+        );
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -400,9 +405,14 @@ fn parse_chain(s: Option<&str>, default: u64) -> Result<u64> {
     }
 }
 
+/// The error for a lookup without an owner says where the owner comes from: the page's
+/// owner field starts empty unless `ethswarm serve` was given one.
+const OWNER_REQUIRED: &str = "owner address is required: enter the importer's address in the \
+     SOC owner field above, or start `ethswarm serve` with --owner / ETH2SWARM_OWNER";
+
 fn parse_owner(s: Option<&str>) -> Result<Address> {
     s.filter(|s| !s.trim().is_empty())
-        .context("owner address is required")?
+        .context(OWNER_REQUIRED)?
         .trim()
         .parse()
         .context("owner must be a 20-byte hex address")
@@ -429,7 +439,9 @@ async fn soc_handler(State(st): State<Arc<AppState>>, Query(q): Query<SocQuery>)
 
 async fn soc_inspect(st: &AppState, q: SocQuery) -> Result<Value> {
     let mut derivation = Value::Null;
-    let (address, owner) = if let Some(a) = q.addr.as_deref().filter(|s| !s.trim().is_empty()) {
+    // The page sends `addr` only in by-address mode, so its presence picks the mode: a blank
+    // one is reported as a bad SOC address, not as a missing owner.
+    let (address, owner) = if let Some(a) = q.addr.as_deref() {
         // The owner is optional here; an unparsable one is reported, not fatal.
         let owner = match q.owner.as_deref().filter(|s| !s.trim().is_empty()) {
             Some(o) => match parse_owner(Some(o)) {
@@ -1790,5 +1802,40 @@ mod tests {
         h.transactions_root = keccak256(b"txs");
         h.ommers_hash = keccak256(b"uncles");
         assert_eq!(body_contents(&h), ["txs", "uncles", "withdrawals"]);
+    }
+
+    #[tokio::test]
+    async fn blank_soc_address_is_not_a_missing_owner() {
+        let st = AppState {
+            nodes: Vec::new(),
+            defaults: Defaults {
+                owner: None,
+                chain_id: 1,
+                anchor: None,
+            },
+            heads: Default::default(),
+        };
+        let q = SocQuery {
+            node: None,
+            addr: Some(String::new()),
+            owner: Some(String::new()),
+            id: None,
+            idstr: None,
+        };
+        let e = format!("{:#}", soc_inspect(&st, q).await.unwrap_err());
+        assert!(e.contains("SOC address must be 32 bytes of hex"), "{e}");
+    }
+
+    #[test]
+    fn missing_owner_says_where_to_set_it() {
+        for s in [None, Some(""), Some("  ")] {
+            let e = format!("{:#}", parse_owner(s).unwrap_err());
+            assert!(e.contains("SOC owner field"), "{s:?}: {e}");
+            assert!(e.contains("ETH2SWARM_OWNER"), "{s:?}: {e}");
+        }
+        let e = format!("{:#}", parse_owner(Some("0x12")).unwrap_err());
+        assert!(e.contains("20-byte hex address"), "{e}");
+        let a = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+        assert_eq!(parse_owner(Some(a)).unwrap(), a.parse::<Address>().unwrap());
     }
 }
