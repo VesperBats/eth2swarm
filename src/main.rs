@@ -64,8 +64,8 @@ enum Command {
     /// checkpoint table, its docs/ideas/deep-block-verification.md): every header is hashed
     /// here and linked by parentHash down to the genesis hash; the node's hashes are never
     /// used. Writes <out> (32 bytes per entry, entry i = block i·1024) and <out>.json. A full
-    /// build resumes from <out>.work after a stop; --extend walks only the blocks above an
-    /// existing table.
+    /// build resumes from <out>.work after a stop; --extend continues an existing table from
+    /// its last entry up to a new top.
     CheckpointTable {
         /// The table file to write.
         #[arg(long)]

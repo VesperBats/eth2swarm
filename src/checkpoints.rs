@@ -224,14 +224,15 @@ pub struct TableMeta {
     /// `web3_clientVersion` of the node the headers came from (they are checked, not trusted).
     pub source_client: String,
     pub generated_unix: u64,
-    /// For an extended table: the table it extended (its top and keccak256), whose entries it
-    /// keeps unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extended_from: Option<Extended>,
+    /// For an extended table, every table it grew from, oldest first: each one's top, how that
+    /// was pinned and by which node, and its keccak256. Its entries are kept unchanged. Flat,
+    /// so that any number of extensions reads back (nested JSON stops at serde_json's 128
+    /// levels).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extended_from: Vec<Extended>,
 }
 
-/// The table an extension started from: its top, how that was pinned and by which node, its
-/// keccak256, and what it was extended from in turn.
+/// A table an extension started from.
 #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Extended {
     pub top_block: u64,
@@ -239,8 +240,6 @@ pub struct Extended {
     pub top_pinned_by: String,
     pub source_client: String,
     pub table_keccak256: B256,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extended_from: Option<Box<Extended>>,
 }
 
 /// Options of a run.
@@ -306,13 +305,19 @@ fn work_path(out: &Path) -> PathBuf {
     suffixed(out, ".work")
 }
 
-/// Builds the table: walks every header from the top block down to genesis.
-pub async fn build(opts: &Options) -> Result<TableMeta> {
+/// The node the headers come from: its HTTP client (connect and request timeouts), the chain it
+/// serves and its `web3_clientVersion`.
+struct Source {
+    http: reqwest::Client,
+    chain_id: u64,
+    client: String,
+}
+
+async fn connect(rpc: &str) -> Result<Source> {
     let http = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
-    let rpc = opts.rpc.as_str();
     let chain_id = u64::from_str_radix(
         rpc_call(&http, rpc, "eth_chainId", serde_json::json!([]))
             .await?
@@ -321,25 +326,28 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
             .trim_start_matches("0x"),
         16,
     )?;
-    let genesis = match (opts.genesis, chain_id) {
-        (Some(g), _) => g,
-        (None, 1) => MAINNET_GENESIS,
-        (None, c) => bail!("chain {c}: pass its genesis hash with --genesis-hash"),
-    };
     let client = rpc_call(&http, rpc, "web3_clientVersion", serde_json::json!([]))
         .await
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unknown".into());
-    // The work file of an unfinished run: its tag names chain, genesis and top.
-    let work = work_path(&opts.out);
-    let saved = match std::fs::read(&work) {
-        Ok(bytes) => Some(bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("reading {}", work.display())),
-    };
-    let saved_tag = saved.as_deref().and_then(parse_tag);
-    let (top, top_hash, pin) = match (opts.top, opts.top_hash, saved_tag) {
+    Ok(Source {
+        http,
+        chain_id,
+        client,
+    })
+}
+
+/// The top a run is pinned to: the caller's (`--top`/`--top-hash`), an unfinished run's
+/// (`saved`, a full build resuming), or the node's finalized block, hashed here.
+async fn resolve_top(
+    src: &Source,
+    rpc: &str,
+    top: Option<u64>,
+    top_hash: Option<B256>,
+    saved: Option<&Tag>,
+) -> Result<(u64, B256, Pin)> {
+    Ok(match (top, top_hash, saved) {
         (Some(t), Some(h), _) => (t, h, Pin::Caller),
         (Some(_), None, _) | (None, Some(_), _) => bail!("--top and --top-hash go together"),
         // Resuming without --top: the unfinished run's top (the finalized block moves), and
@@ -347,7 +355,7 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
         (None, None, Some(t)) => (t.top, t.top_hash, t.pin),
         (None, None, None) => {
             let f = rpc_call(
-                &http,
+                &src.http,
                 rpc,
                 "eth_getHeaderByNumber",
                 serde_json::json!(["finalized"]),
@@ -357,20 +365,71 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
             let hash = keccak256(alloy::rlp::encode(&header.inner));
             (header.inner.number, hash, Pin::Finalized)
         }
-    };
-    // A top the caller pinned (now or in the run being resumed) or a cross-check: the node's
-    // word alone pins nothing.
+    })
+}
+
+/// A top the caller pinned, or a cross-check against another node: the node's word alone pins
+/// nothing (a walk to genesis cannot authenticate the chain).
+fn check_pin(pin: Pin, cross_check: Option<&str>, rpc: &str) -> Result<()> {
     ensure!(
-        pin == Pin::Caller || opts.cross_check.is_some(),
+        pin == Pin::Caller || cross_check.is_some(),
         "the top block's hash would rest on the node alone, which a walk to genesis cannot \
          authenticate: pass --top-hash (a beacon-attested block) or --cross-check <another node>"
     );
-    if let Some(other) = &opts.cross_check {
+    if let Some(other) = cross_check {
         ensure!(
             other.trim_end_matches('/') != rpc.trim_end_matches('/'),
             "--cross-check must name another node than --rpc"
         );
     }
+    Ok(())
+}
+
+/// What pinned the top, for the sidecar; with a cross-check, runs it on the finished table
+/// first (before anything is written; `nothing_written` says so on a failure).
+async fn pin_record(
+    src: &Source,
+    pin: Pin,
+    cross_check_with: Option<&str>,
+    (table, top, top_hash): (&[u8], u64, B256),
+    nothing_written: &str,
+) -> Result<String> {
+    let pinned = match pin {
+        Pin::Caller => "the caller (--top-hash)".to_string(),
+        Pin::Finalized => format!("the finalized block of the source node ({})", src.client),
+    };
+    let Some(other) = cross_check_with else {
+        return Ok(pinned);
+    };
+    let (n, other_client) = cross_check(&src.http, other, table, top, top_hash, 200)
+        .await
+        .with_context(|| format!("cross-check against {other}; {nothing_written}"))?;
+    Ok(format!(
+        "{pinned}, cross-checked against {other_client}: {n} entries and the top block equal"
+    ))
+}
+
+/// Builds the table: walks every header from the top block down to genesis.
+pub async fn build(opts: &Options) -> Result<TableMeta> {
+    let rpc = opts.rpc.as_str();
+    let src = connect(rpc).await?;
+    let (http, chain_id, client) = (src.http.clone(), src.chain_id, src.client.clone());
+    let genesis = match (opts.genesis, chain_id) {
+        (Some(g), _) => g,
+        (None, 1) => MAINNET_GENESIS,
+        (None, c) => bail!("chain {c}: pass its genesis hash with --genesis-hash"),
+    };
+    // The work file of an unfinished run: its tag names chain, genesis and top.
+    let work = work_path(&opts.out);
+    let saved = match std::fs::read(&work) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", work.display())),
+    };
+    let saved_tag = saved.as_deref().and_then(parse_tag);
+    let (top, top_hash, pin) =
+        resolve_top(&src, rpc, opts.top, opts.top_hash, saved_tag.as_ref()).await?;
+    check_pin(pin, opts.cross_check.as_deref(), rpc)?;
     let chunks = top / K + 1;
 
     let tag = Tag {
@@ -463,23 +522,14 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
     let table = link(&done, chunks, genesis, top, top_hash)?;
     // The cross-check comes before anything is written: a table it does not confirm is never
     // on disk, and the work file stays for the next attempt.
-    let mut pinned = match pin {
-        Pin::Caller => "the caller (--top-hash)".to_string(),
-        Pin::Finalized => format!("the finalized block of the source node ({client})"),
-    };
-    if let Some(other) = &opts.cross_check {
-        let (n, other_client) = cross_check(&http, other, &table, top, top_hash, 200)
-            .await
-            .with_context(|| {
-                format!(
-                    "cross-check against {other}; nothing is written, and {} keeps the walk",
-                    work.display()
-                )
-            })?;
-        pinned = format!(
-            "{pinned}, cross-checked against {other_client}: {n} entries and the top block equal"
-        );
-    }
+    let pinned = pin_record(
+        &src,
+        pin,
+        opts.cross_check.as_deref(),
+        (&table, top, top_hash),
+        &format!("nothing is written, and {} keeps the walk", work.display()),
+    )
+    .await?;
     let tmp = suffixed(&opts.out, ".tmp");
     {
         let mut f = std::fs::File::create(&tmp)?;
@@ -501,7 +551,7 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
         generated_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs(),
-        extended_from: None,
+        extended_from: Vec::new(),
     };
     std::fs::write(
         suffixed(&opts.out, ".json"),
@@ -530,21 +580,24 @@ pub struct ExtendOptions {
 /// Blocks per span an extension fetches in parallel.
 const SPAN: u64 = K;
 
-/// Extends an existing table up to a new top: only the blocks above the old top are walked.
-/// The old table must match its sidecar (keccak256, size, chain, genesis); the old top block
-/// must hash, here, to the old top hash; every block above it links to the one below; the new
-/// top is pinned as in [`build`]. The old entries are kept unchanged, the new ones appended.
+/// Extends an existing table up to a new top. The old table must match its sidecar (keccak256,
+/// size, chain, genesis). The walk starts at its last entry (at most K − 1 blocks below its
+/// top), must reproduce that entry and pass through its recorded top, and goes up to the new
+/// top, every block linked to the one below; the new top is pinned as in [`build`]. The old
+/// entries are kept unchanged, the new ones appended.
 pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
-    let http = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
     let rpc = opts.rpc.as_str();
-    ensure!(
-        !same_file(&opts.from, &opts.out),
-        "--out must be another file than --extend: the old table and its sidecar stay as they \
-         are until the new pair is complete"
-    );
+    // None of the four paths the write touches may be one of the old pair.
+    let old_pair = [opts.from.clone(), suffixed(&opts.from, ".json")];
+    for written in out_paths(&opts.out) {
+        ensure!(
+            !old_pair.iter().any(|o| same_file(o, &written)),
+            "--out {} would write {}, which is part of the table being extended: the old table \
+             and its sidecar stay as they are; pick another --out",
+            opts.out.display(),
+            written.display()
+        );
+    }
     let old_table =
         std::fs::read(&opts.from).with_context(|| format!("reading {}", opts.from.display()))?;
     let side = suffixed(&opts.from, ".json");
@@ -554,53 +607,15 @@ pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
     .with_context(|| format!("parsing {}", side.display()))?;
     check_old_table(&old_table, &old)?;
 
-    let chain_id = u64::from_str_radix(
-        rpc_call(&http, rpc, "eth_chainId", serde_json::json!([]))
-            .await?
-            .as_str()
-            .context("eth_chainId")?
-            .trim_start_matches("0x"),
-        16,
-    )?;
+    let src = connect(rpc).await?;
+    let (http, chain_id, client) = (src.http.clone(), src.chain_id, src.client.clone());
     ensure!(
         chain_id == old.chain_id,
         "--rpc serves chain {chain_id}, the table is for chain {}",
         old.chain_id
     );
-    let client = rpc_call(&http, rpc, "web3_clientVersion", serde_json::json!([]))
-        .await
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "unknown".into());
-    let (top, top_hash, pin) = match (opts.top, opts.top_hash) {
-        (Some(t), Some(h)) => (t, h, Pin::Caller),
-        (Some(_), None) | (None, Some(_)) => bail!("--top and --top-hash go together"),
-        (None, None) => {
-            let f = rpc_call(
-                &http,
-                rpc,
-                "eth_getHeaderByNumber",
-                serde_json::json!(["finalized"]),
-            )
-            .await?;
-            let header: alloy::rpc::types::Header = serde_json::from_value(f)?;
-            (
-                header.inner.number,
-                keccak256(alloy::rlp::encode(&header.inner)),
-                Pin::Finalized,
-            )
-        }
-    };
-    ensure!(
-        pin == Pin::Caller || opts.cross_check.is_some(),
-        "the new top's hash would rest on the node alone: pass --top-hash or --cross-check"
-    );
-    if let Some(other) = &opts.cross_check {
-        ensure!(
-            other.trim_end_matches('/') != rpc.trim_end_matches('/'),
-            "--cross-check must name another node than --rpc"
-        );
-    }
+    let (top, top_hash, pin) = resolve_top(&src, rpc, opts.top, opts.top_hash, None).await?;
+    check_pin(pin, opts.cross_check.as_deref(), rpc)?;
     ensure!(
         top > old.top_block,
         "the new top {top} is not above the table's top {}",
@@ -616,6 +631,7 @@ pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
     let mut spans: BTreeMap<u64, (B256, Vec<B256>)> = BTreeMap::new();
     let mut set = tokio::task::JoinSet::new();
     let mut queue = starts.iter().copied();
+    let mut last_report = Instant::now();
     loop {
         while set.len() < opts.concurrency.max(1) {
             let Some(from) = queue.next() else { break };
@@ -628,35 +644,32 @@ pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
         };
         let (from, span) = joined.context("a span task panicked")?;
         spans.insert(from, span.with_context(|| format!("blocks from {from}"))?);
+        if last_report.elapsed().as_secs() >= 30 || spans.len() == starts.len() {
+            last_report = Instant::now();
+            eprintln!("{}/{} spans of {SPAN} blocks", spans.len(), starts.len());
+        }
     }
-    let hashes = link_extension(&spans, base, top, top_hash)?;
-    ensure!(
-        hashes[0] == old_last_entry,
-        "block {base} hashes to {} here, the table's last entry is {old_last_entry}",
-        hashes[0]
-    );
-    ensure!(
-        hashes[(old.top_block - base) as usize] == old.top_hash,
-        "block {} hashes to {} here, the table's top is {}: the chain the table ends on is not \
-         this node's",
-        old.top_block,
-        hashes[(old.top_block - base) as usize],
-        old.top_hash
-    );
+    let hashes = link_extension(
+        &spans,
+        Anchor {
+            base,
+            last_entry: old_last_entry,
+            old_top: old.top_block,
+            old_top_hash: old.top_hash,
+        },
+        top,
+        top_hash,
+    )?;
     let table = extended_table(&old_table, base, top, &hashes);
 
-    let mut pinned = match pin {
-        Pin::Caller => "the caller (--top-hash)".to_string(),
-        Pin::Finalized => format!("the finalized block of the source node ({client})"),
-    };
-    if let Some(other) = &opts.cross_check {
-        let (n, other_client) = cross_check(&http, other, &table, top, top_hash, 200)
-            .await
-            .with_context(|| format!("cross-check against {other}; nothing is written"))?;
-        pinned = format!(
-            "{pinned}, cross-checked against {other_client}: {n} entries and the top block equal"
-        );
-    }
+    let pinned = pin_record(
+        &src,
+        pin,
+        opts.cross_check.as_deref(),
+        (&table, top, top_hash),
+        "nothing is written",
+    )
+    .await?;
     let entries = table.len() as u64 / 32;
     let meta = TableMeta {
         chain_id,
@@ -672,21 +685,21 @@ pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
         generated_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs(),
-        extended_from: Some(Extended {
-            top_block: old.top_block,
-            top_hash: old.top_hash,
-            top_pinned_by: old.top_pinned_by.clone(),
-            source_client: old.source_client.clone(),
-            table_keccak256: old.table_keccak256,
-            extended_from: old.extended_from.clone().map(Box::new),
-        }),
+        extended_from: {
+            let mut history = old.extended_from.clone();
+            history.push(Extended {
+                top_block: old.top_block,
+                top_hash: old.top_hash,
+                top_pinned_by: old.top_pinned_by.clone(),
+                source_client: old.source_client.clone(),
+                table_keccak256: old.table_keccak256,
+            });
+            history
+        },
     };
-    // Both files written and synced under temporary names, then renamed: --out is not the old
-    // table, so a stop in between never costs the old pair.
-    let (tmp, tmp_side) = (
-        suffixed(&opts.out, ".tmp"),
-        suffixed(&opts.out, ".json.tmp"),
-    );
+    // Both files written and synced under temporary names, then renamed: no path here is one
+    // of the old pair, so a stop in between never costs it.
+    let [_, _, tmp, tmp_side] = out_paths(&opts.out);
     for (path, bytes) in [
         (&tmp, table.clone()),
         (&tmp_side, serde_json::to_vec_pretty(&meta)?),
@@ -698,6 +711,16 @@ pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
     std::fs::rename(&tmp, &opts.out)?;
     std::fs::rename(&tmp_side, suffixed(&opts.out, ".json"))?;
     Ok(meta)
+}
+
+/// The paths an extension to `out` writes: the table, its sidecar, and their temporary names.
+fn out_paths(out: &Path) -> [PathBuf; 4] {
+    [
+        out.to_path_buf(),
+        suffixed(out, ".json"),
+        suffixed(out, ".tmp"),
+        suffixed(out, ".json.tmp"),
+    ]
 }
 
 /// Whether two paths name the same file (an existing one, compared by canonical path).
@@ -748,22 +771,33 @@ fn check_old_table(table: &[u8], meta: &TableMeta) -> Result<()> {
     Ok(())
 }
 
-/// Links the spans of an extension into one chain from block `base` to the new top: each span's
-/// first parent is the last hash of the span below, and the last hash is `top_hash`. Returns
-/// the hashes of blocks `base..=top`.
+/// Where an extension's walk is tied to the old table: it starts at the old table's last entry
+/// `base`, whose hash must come out as `last_entry`, and must pass through the old top.
+#[derive(Debug, Clone, Copy)]
+struct Anchor {
+    base: u64,
+    last_entry: B256,
+    old_top: u64,
+    old_top_hash: B256,
+}
+
+/// Links the spans of an extension into one chain from the anchor's base to the new top: each
+/// span's first parent is the last hash of the span below; the base hashes to the old table's
+/// last entry, the old top to its recorded hash, and the last block to `top_hash`. Returns the
+/// hashes of blocks `base..=top`.
 fn link_extension(
     spans: &BTreeMap<u64, (B256, Vec<B256>)>,
-    base: u64,
+    anchor: Anchor,
     top: u64,
     top_hash: B256,
 ) -> Result<Vec<B256>> {
-    let old_top = base;
-    let mut all: Vec<B256> = Vec::with_capacity((top - old_top + 1) as usize);
+    let base = anchor.base;
+    let mut all: Vec<B256> = Vec::with_capacity((top - base + 1) as usize);
     for (from, (parent, hashes)) in spans {
         ensure!(
-            *from == old_top + all.len() as u64,
+            *from == base + all.len() as u64,
             "a span from {from}, expected one from {}",
-            old_top + all.len() as u64
+            base + all.len() as u64
         );
         if let Some(below) = all.last() {
             ensure!(
@@ -775,10 +809,29 @@ fn link_extension(
         all.extend(hashes);
     }
     ensure!(
-        all.len() as u64 == top - old_top + 1,
+        all.len() as u64 == top - base + 1,
         "{} of {} blocks",
         all.len(),
-        top - old_top + 1
+        top - base + 1
+    );
+    ensure!(
+        all[0] == anchor.last_entry,
+        "block {} hashes to {} here, the table's last entry is {}",
+        anchor.base,
+        all[0],
+        anchor.last_entry
+    );
+    let at_old_top = anchor
+        .old_top
+        .checked_sub(anchor.base)
+        .and_then(|i| all.get(i as usize))
+        .with_context(|| format!("the walk does not reach the old top {}", anchor.old_top))?;
+    ensure!(
+        *at_old_top == anchor.old_top_hash,
+        "block {} hashes to {at_old_top} here, the table's top is {}: the chain the table ends \
+         on is not this node's",
+        anchor.old_top,
+        anchor.old_top_hash
     );
     ensure!(
         *all.last().unwrap() == top_hash,
@@ -1115,7 +1168,13 @@ mod tests {
             );
             from = to + 1;
         }
-        let hashes = link_extension(&spans, base, top, h(top + 1)).unwrap();
+        let anchor = Anchor {
+            base,
+            last_entry: h(2049),
+            old_top: 2100,
+            old_top_hash: h(2101),
+        };
+        let hashes = link_extension(&spans, anchor, top, h(top + 1)).unwrap();
         assert_eq!(hashes.len() as u64, top - base + 1);
         assert_eq!(hashes[0], h(2049), "the old last entry, reproduced");
         assert_eq!(
@@ -1131,14 +1190,44 @@ mod tests {
         assert_eq!(&t[96..128], h(3073).as_slice());
         assert_eq!(&t[128..], h(4097).as_slice());
         // Another new top, a broken link, a missing span: refused.
-        assert!(link_extension(&spans, base, top, h(9)).is_err());
+        assert!(link_extension(&spans, anchor, top, h(9)).is_err());
+        // The walk does not reproduce the old last entry, or misses the old top: refused.
+        let e = link_extension(
+            &spans,
+            Anchor {
+                last_entry: h(9),
+                ..anchor
+            },
+            top,
+            h(top + 1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("last entry"), "{e}");
+        let e = link_extension(
+            &spans,
+            Anchor {
+                old_top_hash: h(9),
+                ..anchor
+            },
+            top,
+            h(top + 1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("not this node's"), "{e}");
+        let beyond = Anchor {
+            old_top: top + 1,
+            ..anchor
+        };
+        assert!(link_extension(&spans, beyond, top, h(top + 1)).is_err());
         let mut broken = spans.clone();
         let second = *broken.keys().nth(1).unwrap();
         broken.get_mut(&second).unwrap().0 = h(77);
-        assert!(link_extension(&broken, base, top, h(top + 1)).is_err());
+        assert!(link_extension(&broken, anchor, top, h(top + 1)).is_err());
         let mut missing = spans.clone();
         missing.remove(&second);
-        assert!(link_extension(&missing, base, top, h(top + 1)).is_err());
+        assert!(link_extension(&missing, anchor, top, h(top + 1)).is_err());
     }
 
     #[test]
@@ -1159,7 +1248,7 @@ mod tests {
             table_keccak256: keccak,
             source_client: String::new(),
             generated_unix: 0,
-            extended_from: None,
+            extended_from: Vec::new(),
         };
         let k = keccak256(&table);
         assert!(check_old_table(&table, &meta(2, 1500, k)).is_ok());
@@ -1207,35 +1296,57 @@ mod tests {
     }
 
     #[test]
-    fn sidecars_keep_their_history() {
-        let ext = Extended {
-            top_block: 1,
-            top_hash: B256::repeat_byte(1),
-            top_pinned_by: "a".into(),
-            source_client: "b".into(),
-            table_keccak256: B256::repeat_byte(2),
-            extended_from: Some(Box::new(Extended {
-                top_block: 0,
-                top_hash: B256::ZERO,
-                top_pinned_by: "c".into(),
-                source_client: "d".into(),
-                table_keccak256: B256::ZERO,
-                extended_from: None,
-            })),
+    fn sidecars_keep_their_history_flat() {
+        let ext = |b: u64| Extended {
+            top_block: b,
+            top_hash: B256::repeat_byte(b as u8),
+            top_pinned_by: format!("pin {b}"),
+            source_client: "c".into(),
+            table_keccak256: B256::repeat_byte((b as u8).wrapping_add(1)),
         };
-        let json = serde_json::to_string(&ext).unwrap();
-        assert_eq!(serde_json::from_str::<Extended>(&json).unwrap(), ext);
-        // A sidecar of a full build has no extended_from, and reads back without it.
         let full = r#"{"chain_id":1,"k":1024,"entries":1,"last_entry_block":0,"top_block":5,
             "top_hash":"0x0000000000000000000000000000000000000000000000000000000000000000",
             "top_pinned_by":"x","genesis_hash":"0x0000000000000000000000000000000000000000000000000000000000000000",
             "table_keccak256":"0x0000000000000000000000000000000000000000000000000000000000000000",
             "source_client":"y","generated_unix":0}"#;
+        // A full build's sidecar has no history, and reads back without it.
+        let mut meta: TableMeta = serde_json::from_str(full).unwrap();
+        assert!(meta.extended_from.is_empty());
+        // 300 extensions: flat, so it reads back (nested, serde_json would stop at 128).
+        meta.extended_from = (0..300).map(ext).collect();
+        let json = serde_json::to_vec_pretty(&meta).unwrap();
+        let back: TableMeta = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.extended_from, meta.extended_from);
+        assert_eq!(back.extended_from[0].top_block, 0, "oldest first");
+    }
+
+    #[test]
+    fn an_extension_never_writes_the_old_pair() {
+        let from = Path::new("/x/t");
+        let old_pair = [from.to_path_buf(), suffixed(from, ".json")];
+        let collides = |out: &str| {
+            out_paths(Path::new(out))
+                .iter()
+                .any(|w| old_pair.iter().any(|o| same_file(o, w)))
+        };
+        // The table itself, its sidecar, and an --out whose temporary name is the old table.
+        assert!(collides("/x/t"));
         assert!(
-            serde_json::from_str::<TableMeta>(full)
-                .unwrap()
-                .extended_from
-                .is_none()
+            collides("/x/t.json"),
+            "would rename the new table over the old sidecar"
+        );
+        assert!(
+            !collides("/x"),
+            "/x, /x.json, /x.tmp, /x.json.tmp are none of the old pair"
+        );
+        assert!(!collides("/x/u"));
+        let from_tmp = Path::new("/x/t.tmp");
+        let pair = [from_tmp.to_path_buf(), suffixed(from_tmp, ".json")];
+        assert!(
+            out_paths(Path::new("/x/t"))
+                .iter()
+                .any(|w| pair.iter().any(|o| same_file(o, w))),
+            "--extend t.tmp --out t would truncate the old table"
         );
         assert!(same_file(Path::new("/tmp"), Path::new("/tmp/")));
     }
