@@ -5,9 +5,11 @@
 #
 # Not covered by any entry, so bumped by hand in a reviewed PR: rust-toolchain.toml,
 # the runner image labels, the Node major in integration.yml, bee-factory's Docker
-# images (pinned by digest in integration.yml), and dtolnay/rust-toolchain's commit
+# images (pinned by digest in integration.yml), dtolnay/rust-toolchain's commit
 # in .github/actions/rust-toolchain (an untagged master commit, which a version
-# update does not move).
+# update does not move), and tools/erigon-trace-export/go.mod (it pins Erigon to
+# the version of the node whose datadir it reads, so it moves with the node, not
+# with Erigon's releases).
 #
 # Cooldown: a version update waits until its release is 7 days old (Myotis's
 # owner decision of 2026-11-12, after the Ethersphere bee-js / Swarm Desktop
