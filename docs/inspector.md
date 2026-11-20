@@ -19,9 +19,14 @@ By default it offers these nodes (pick one in the header bar):
 | queen | http://localhost:1633 |
 | worker1 … worker4 | http://localhost:1635 / 1637 / 1639 / 1641 |
 
-Override with repeated `--node name=url`. Settings (node, owner, chain ID, anchor) are kept in
-the browser's local storage; the URL fragment (`#block/97`, `#bytes/<ref>`, …) makes views
-bookmarkable.
+Override with repeated `--node name=url`.
+
+Every lookup except Bytes and a SOC lookup by address needs the SOC owner. Without
+`--owner` / `ETH2SWARM_OWNER` the owner field starts empty and is outlined in amber; such a
+lookup then fails with "owner address is required" until an address is entered there.
+
+Settings (node, owner, chain ID, anchor) are kept in the browser's local storage; the URL
+fragment (`#block/97`, `#bytes/<ref>`, …) makes views bookmarkable.
 
 ## Tabs
 
