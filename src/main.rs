@@ -257,8 +257,8 @@ enum Command {
     Appearances {
         /// Block number.
         number: u64,
-        /// Also read `trace_block` (Erigon, Reth, Anvil; not geth): internal calls,
-        /// self-destructs, rewards, and words in internal calls' input and output.
+        /// Also read `trace_block` (Erigon, Reth, Anvil; not geth): the addresses of every call
+        /// frame, creations, self-destructs and rewards (no words from trace data).
         #[arg(long)]
         traces: bool,
     },
