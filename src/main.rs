@@ -472,13 +472,15 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!(
-                "Activity in blocks {}..={}: {} transactions, emitter {}, busy {}, authority {}",
+                "Activity in blocks {}..={}: {} transactions, emitter {}, busy {}, authority {}, \
+                 failed creation {}",
                 a.first_block,
                 a.last_block,
                 a.transactions,
                 a.emitter,
                 a.busy,
-                a.authority.map_or("none".to_string(), |x| x.to_string())
+                a.authority.map_or("none".to_string(), |x| x.to_string()),
+                a.failed_creation
             );
         }
         Command::AddrUpload {

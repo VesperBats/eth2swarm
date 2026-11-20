@@ -28,6 +28,16 @@ const VERSION: u8 = 2;
 const FIXED_HEADER: u64 = 4 + 1 + 8 + 8 + 8 + 8 + 1;
 const BLOCK_ENTRY: u64 = 32 + 4;
 const RECORD: u64 = 8 + 4 + 20;
+/// Records read in one call while collecting a block's frames.
+const READ_BATCH: u64 = 512;
+
+fn parse_record(r: &[u8]) -> (u64, u32, Address) {
+    (
+        u64::from_be_bytes(r[..8].try_into().unwrap()),
+        u32::from_be_bytes(r[8..12].try_into().unwrap()),
+        Address::from_slice(&r[12..RECORD as usize]),
+    )
+}
 
 /// One A1TR file, opened and checked.
 #[derive(Debug)]
@@ -186,15 +196,17 @@ impl IndexFile {
         })
     }
 
+    /// Reads `buf.len() / RECORD` records from record `i` on.
+    fn read_records(&self, i: u64, buf: &mut [u8]) -> Result<()> {
+        self.file
+            .read_exact_at(buf, self.records_at + i * RECORD)
+            .with_context(|| format!("reading {} at record {i}", self.path.display()))
+    }
+
     fn record(&self, i: u64) -> Result<(u64, u32, Address)> {
         let mut r = [0u8; RECORD as usize];
-        self.file
-            .read_exact_at(&mut r, self.records_at + i * RECORD)?;
-        Ok((
-            u64::from_be_bytes(r[..8].try_into().unwrap()),
-            u32::from_be_bytes(r[8..12].try_into().unwrap()),
-            Address::from_slice(&r[12..]),
-        ))
+        self.read_records(i, &mut r)?;
+        Ok(parse_record(&r))
     }
 
     /// The first record at or after block `n` (binary search: records are sorted by block).
@@ -214,13 +226,24 @@ impl IndexFile {
     fn block(&self, n: u64) -> Result<IndexedBlock> {
         let mut entry = [0u8; BLOCK_ENTRY as usize];
         self.file
-            .read_exact_at(&mut entry, self.table_at + (n - self.first) * BLOCK_ENTRY)?;
+            .read_exact_at(&mut entry, self.table_at + (n - self.first) * BLOCK_ENTRY)
+            .with_context(|| format!("reading {} at block {n}", self.path.display()))?;
         let hash = B256::from_slice(&entry[..32]);
         let tx_count = u32::from_be_bytes(entry[32..].try_into().unwrap());
         let mut frames: Vec<(u32, Address)> = Vec::new();
         let mut i = self.lower_bound(n)?;
+        // The block's records are read in batches, not one pread each.
+        let mut buf = Vec::new();
+        let mut at = 0;
         while i < self.records {
-            let (block, tx, addr) = self.record(i)?;
+            if at == buf.len() {
+                let count = (self.records - i).min(READ_BATCH);
+                buf.resize((count * RECORD) as usize, 0);
+                self.read_records(i, &mut buf)?;
+                at = 0;
+            }
+            let (block, tx, addr) = parse_record(&buf[at..at + RECORD as usize]);
+            at += RECORD as usize;
             if block != n {
                 // The binary search trusts the order: a smaller block here means it is broken,
                 // and frames of this block may lie beyond.
@@ -425,6 +448,23 @@ pub(crate) mod tests {
         for d in [dir, d2] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[test]
+    fn a_block_spans_several_read_batches() {
+        let dir = tmp("batches");
+        let n = 2 * READ_BATCH as u32 + 7;
+        let addr = |k: u32| Address::left_padding_from(&(k + 0x1_0000).to_be_bytes());
+        let mut records: Vec<(u64, u32, Address)> = (0..n).map(|k| (2, k / 3, addr(k))).collect();
+        records.insert(0, (1, 0, addr(0)));
+        records.push((3, 0, addr(0)));
+        write(&dir, 1, 1, 3, &[(B256::ZERO, n); 3], &records);
+        let idx = TraceIndex::open(&dir, 1).unwrap();
+        let frames = idx.block(2).unwrap().frames;
+        assert_eq!(frames.len(), n as usize);
+        assert_eq!(frames.last(), Some(&((n - 1) / 3, addr(n - 1))));
+        assert_eq!(idx.block(3).unwrap().frames, vec![(0, addr(0))]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

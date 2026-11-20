@@ -1,6 +1,7 @@
 //! `devnet-activity`: traffic for a dev chain (the bee-factory Anvil), so that the address
-//! index sees every kind of appearance: ETH transfers, a contract creation, token-style
-//! `Transfer` logs, a busy address whose entries spill, and an EIP-7702 authorization.
+//! index sees every kind of appearance: ETH transfers, a contract creation and one that
+//! fails, token-style `Transfer` logs, a busy address whose entries spill, and an EIP-7702
+//! authorization.
 //! Only for dev chains: it signs with the keys it is given.
 
 use alloy::eips::eip7702::Authorization;
@@ -45,6 +46,9 @@ pub struct Activity {
     pub transactions: usize,
     /// The authority of the EIP-7702 authorization, if the chain accepted it.
     pub authority: Option<Address>,
+    /// The target of a top-level creation that reverts: `TO`, and with traces `TRACE` (the
+    /// `TRACE` rule counts a creation's target whatever its outcome).
+    pub failed_creation: Address,
 }
 
 /// Sends the activity from `sender`; `authority` signs an EIP-7702 authorization that
@@ -155,13 +159,29 @@ pub async fn run(
         }
     };
 
+    // 5. A creation whose init code reverts (PUSH1 0, PUSH1 0, REVERT). An explicit gas
+    // limit: estimating a reverting transaction fails.
+    let failed_creation = from.create(nonce);
+    let r = provider
+        .send_transaction(
+            tx(nonce)
+                .with_deploy_code(Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xfd]))
+                .with_gas_limit(100_000),
+        )
+        .await?
+        .get_receipt()
+        .await?;
+    ensure!(!r.status(), "the reverting creation succeeded");
+    last_block = last_block.max(r.block_number.context("receipt without a block number")?);
+
     Ok(Activity {
         emitter,
         busy,
         first_block,
         last_block,
-        transactions: transfers + 4 + usize::from(authority_used.is_some()),
+        transactions: transfers + 5 + usize::from(authority_used.is_some()),
         authority: authority_used,
+        failed_creation,
     })
 }
 

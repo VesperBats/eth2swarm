@@ -834,6 +834,12 @@ where
         Some(d) => Traces::Index(std::sync::Arc::new(TraceIndex::open(d, chain_id)?)),
         None => Traces::rpc(opts.traces),
     };
+    if matches!(traces, Traces::Rpc) {
+        tracing::warn!(
+            "TRACE from trace_block misses the target of a failed internal creation, so this \
+             index is not exact under the TRACE rule; a frame index (--trace-index) is"
+        );
+    }
     let roles = role::mask(traces.detects());
     let existing = State::load(dir)?;
     ensure!(
