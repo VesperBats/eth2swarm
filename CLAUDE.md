@@ -22,7 +22,7 @@ against. Do not move them out of `.claude/`, and not into `.claude/rules/`
 | plan, resume or continue multi-PR work: a part, a merge, the final PR         | `.claude/agent/multi-pr-plans.md`    |
 | write a PR description, answer review comments, or handle a fork PR           | `.claude/agent/pull-requests.md`     |
 | work on, or come across, a security issue that is not public yet             | `.claude/agent/security-fixes.md`    |
-| upload to, or buy, top up or dilute a postage batch on, any Bee node other than the local bee-factory | `.claude/agent/postage.md` |
+| upload to a Bee node, or buy, top up or dilute a postage batch (bee-factory included: the file says when it is exempt) | `.claude/agent/postage.md` |
 
 ## Workflow — the mandatory steps for EVERY work item
 
@@ -60,17 +60,22 @@ publishes the advisory; no tag goes on a `main` whose checks are red.
 
 ## Postage batches — ask before using one, never buy one
 
-Full text: `.claude/agent/postage.md` (owner's request, 2026-11-20). On every
-node and chain except the local bee-factory dev chain:
+Full text: `.claude/agent/postage.md` (owner's request, 2026-11-20). It applies on
+every Bee node except the local bee-factory. To tell, ask the node the command
+talks to: `GET /wallet` reports `chainID` 1337 there. Any other value, or no
+answer, is not bee-factory; a port, a URL or the `--rpc` chain settles nothing.
 - **Ask the owner which batches to use**, before the first upload of an index in
-  a work item. Show the candidates with their depth, fill, lifetime and current
-  use. Pass the answer as `--batch` and `--lower-batch`, never leaving it out:
-  today's tools then fall back to a node's "first usable batch".
+  a work item, and again in any later conversation. Show the candidates with
+  their depth, fill, lifetime and current use. Pass the answer as `--batch` and
+  `--lower-batch`, never leaving it out: today's tools then fall back to a
+  node's "first usable batch".
 - **A new batch is proposed, never bought.** Propose its depth (`ethswarm stamps
-  plan` once it exists, until then ⌈log₂(chunks)⌉ + 2), its lifetime and why,
-  its cost and its label. Immutable, and serving one index only.
-- **Never buy, top up or dilute a batch yourself**: give the owner the command.
-  Record every batch ID an index uses in the work item's PR or issue.
+  plan` once it exists, until then max(21, ⌈log₂(stamped chunks)⌉ + 2)), its
+  lifetime and why, its cost and its label. Immutable, and serving one index
+  only.
+- **Never buy, top up or dilute a batch yourself**: give the owner the command,
+  with the immutable flag named. Record every batch ID an index uses in the work
+  item's PR or issue.
 - **An answer covers what it names**: those batches for that index in that work
   item, in this conversation, never inferred from an earlier one.
 
