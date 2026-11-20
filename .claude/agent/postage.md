@@ -31,6 +31,10 @@ whose `UPLOAD_BEE` is one. Rule 5 still applies there.
    - Show the candidates, each with its ID, label, depth, fullest bucket against capacity,
      immutable flag, remaining lifetime in days, and what already uses it. The source is
      `ethswarm stamps`, or Bee's `GET /stamps` until that exists.
+   - Bee does not know what uses a batch. That comes from the batch's label (rule 2), the
+     IDs recorded under rule 3, or `ethswarm stamps --export` for an export's permanent
+     batch. Where none of them says, show the use as unknown, never as unused: this column
+     is what keeps a batch to one index.
    - Pass the answer explicitly: `--batch`, plus `--lower-batch` for each lower batch.
      Today's tools still fall back to the node's first usable batch when `--batch` is
      left out, so never leave it out on such a node. Part 14 makes it required there.
