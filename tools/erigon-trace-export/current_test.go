@@ -26,15 +26,24 @@ func TestCheckIndexFilesCurrent(t *testing.T) {
 	if err := checkIndexFilesCurrent(dir, "tracesfrom", 256*step, step); err == nil {
 		t.Fatal("a file past the opened view was not reported")
 	}
+	if err := checkIndexFilesCurrent(dir, "tracesfrom", 258*step, step); err == nil {
+		t.Fatal("a view whose last file is not on disk was accepted")
+	}
+	if err := checkIndexFilesCurrent(t.TempDir(), "tracesfrom", 0, step); err != nil {
+		t.Fatalf("empty view rejected: %v", err)
+	}
 }
 
 func TestCheckBlockFilesCurrent(t *testing.T) {
 	dir := t.TempDir()
 	touch(t, dir, "v1.1-026451-026452-bodies.seg")
 	touch(t, dir, "v1.1-026452-026453-headers.seg") // not a bodies file: ignored
-	// Frozen blocks up to 26451999: the bodies file ending at 26452000 is in the view.
+	// The opened view ends with the bodies file that ends at block 26452000.
 	if err := checkBlockFilesCurrent(dir, 26_451_999, 26_460_000); err != nil {
 		t.Fatalf("current view rejected: %v", err)
+	}
+	if err := checkBlockFilesCurrent(dir, 26_449_999, 26_460_000); err == nil {
+		t.Fatal("a view whose last file is not on disk was accepted")
 	}
 	touch(t, dir, "v1.1-026452-026453-bodies.seg")
 	if err := checkBlockFilesCurrent(dir, 26_451_999, 26_460_000); err == nil {

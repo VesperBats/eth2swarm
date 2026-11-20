@@ -52,17 +52,21 @@ var traceIndexes = []struct {
 	{kv.TracesToIdx, kv.FileTracesToIdx, kv.TblTracesToKeys},
 }
 
+// blockChunk is how many frozen blocks one short read transaction resolves.
+const blockChunk = 100_000
+
 func sourceString() string {
 	return fmt.Sprintf("erigon v%d.%d.%d", version.Major, version.Minor, version.Micro)
 }
 
 type node struct {
-	raw   kv.RwDB
-	snaps *blocksnapshots.RoSnapshots
-	agg   *dbstate.Aggregator
-	db    *temporal.DB
-	br    *freezeblocks.BlockReader
-	dirs  datadir.Dirs
+	raw     kv.RwDB
+	snaps   *blocksnapshots.RoSnapshots
+	agg     *dbstate.Aggregator
+	db      *temporal.DB
+	br      *freezeblocks.BlockReader
+	dirs    datadir.Dirs
+	chainID uint64
 }
 
 // openNode opens an Erigon datadir the way rpcdaemon does with --datadir, but
@@ -98,10 +102,11 @@ func openNode(ctx context.Context, path string, logger log.Logger) (*node, error
 		if err != nil {
 			return err
 		}
-		if cc == nil {
+		if cc == nil || cc.ChainID == nil {
 			return errors.New("no chain config in chaindata")
 		}
 		chainName = cc.ChainName
+		n.chainID = cc.ChainID.Uint64()
 		return nil
 	}); err != nil {
 		n.close()
@@ -153,6 +158,122 @@ func (n *node) close() {
 	}
 }
 
+// blockInfo is what the export needs of one block: the last txNum of its span
+// and its canonical hash.
+type blockInfo struct {
+	maxTxNum uint64
+	hash     [32]byte
+}
+
+func readBlockInfo(ctx context.Context, br *freezeblocks.BlockReader, tx kv.Tx, block uint64) (blockInfo, error) {
+	h, ok, err := br.CanonicalHash(ctx, tx, block)
+	if err != nil {
+		return blockInfo{}, err
+	}
+	if !ok {
+		return blockInfo{}, fmt.Errorf("block %d is not in the datadir", block)
+	}
+	max, err := br.TxnumReader().Max(ctx, tx, block)
+	if err != nil {
+		return blockInfo{}, err
+	}
+	return blockInfo{maxTxNum: max, hash: h}, nil
+}
+
+// chainReader serves blockInfo without a long-lived read transaction. Blocks
+// not yet frozen are read once, under the transaction that also reads the
+// index tail, because the node prunes them from the database after freezing
+// them. Frozen blocks come from the block files this process opened, in
+// chunks, each under a short transaction of its own.
+type chainReader struct {
+	ctx        context.Context
+	n          *node
+	frozen     uint64
+	tail       map[uint64]blockInfo
+	chunkFirst uint64
+	chunk      []blockInfo
+}
+
+func (c *chainReader) readTail(tx kv.Tx, from, to uint64) error {
+	c.tail = map[uint64]blockInfo{}
+	for b := max(from, c.frozen+1); b <= to; b++ {
+		info, err := readBlockInfo(c.ctx, c.n.br, tx, b)
+		if err != nil {
+			return err
+		}
+		c.tail[b] = info
+	}
+	return nil
+}
+
+func (c *chainReader) info(block uint64) (blockInfo, error) {
+	if block > c.frozen {
+		info, ok := c.tail[block]
+		if !ok {
+			return blockInfo{}, fmt.Errorf("block %d was not read with the database tail", block)
+		}
+		return info, nil
+	}
+	if block >= c.chunkFirst && block < c.chunkFirst+uint64(len(c.chunk)) {
+		return c.chunk[block-c.chunkFirst], nil
+	}
+	last := min(block+blockChunk-1, c.frozen)
+	chunk := make([]blockInfo, 0, last-block+1)
+	if err := c.n.db.View(c.ctx, func(tx kv.Tx) error {
+		for b := block; b <= last; b++ {
+			info, err := readBlockInfo(c.ctx, c.n.br, tx, b)
+			if err != nil {
+				return err
+			}
+			chunk = append(chunk, info)
+		}
+		return nil
+	}); err != nil {
+		return blockInfo{}, err
+	}
+	c.chunkFirst, c.chunk = block, chunk
+	return chunk[0], nil
+}
+
+func (c *chainReader) maxTxNum(block uint64) (uint64, error) {
+	info, err := c.info(block)
+	return info.maxTxNum, err
+}
+
+// blockTable is the A1TR block table of first..last: each block's hash and its
+// number of transactions (its txNum span less the two system txNums).
+func (c *chainReader) blockTable(first, last uint64) ([]blockEntry, error) {
+	prevMax := uint64(0)
+	if first > 0 {
+		var err error
+		if prevMax, err = c.maxTxNum(first - 1); err != nil {
+			return nil, err
+		}
+	}
+	table := make([]blockEntry, 0, last-first+1)
+	for b := first; b <= last; b++ {
+		info, err := c.info(b)
+		if err != nil {
+			return nil, err
+		}
+		span := info.maxTxNum + 1
+		if b > 0 {
+			span = info.maxTxNum - prevMax
+		}
+		if info.maxTxNum < prevMax || span < 2 || span-2 > uint64(^uint32(0)) {
+			return nil, fmt.Errorf("block %d: txNum span ending at %d after %d", b, info.maxTxNum, prevMax)
+		}
+		table = append(table, blockEntry{hash: info.hash, txCount: uint32(span - 2)})
+		prevMax = info.maxTxNum
+	}
+	return table, nil
+}
+
+type openFile struct {
+	d    *seg.Decompressor
+	base uint64
+}
+
 func run(ctx context.Context, cfg config, logger log.Logger) error {
 	if cfg.to < cfg.from {
 		return fmt.Errorf("--to %d is before --from %d", cfg.to, cfg.from)
@@ -164,6 +285,9 @@ func run(ctx context.Context, cfg config, logger log.Logger) error {
 		return errors.New("--sort-buffer-mb must be positive")
 	}
 	if err := os.MkdirAll(cfg.out, 0o755); err != nil {
+		return err
+	}
+	if err := checkNoOverlap(cfg.out, cfg.from, cfg.to, cfg.blocksPerFile); err != nil {
 		return err
 	}
 	tmpdir := cfg.tmpdir
@@ -183,77 +307,9 @@ func run(ctx context.Context, cfg config, logger log.Logger) error {
 	}
 	defer n.close()
 
-	tx, err := n.db.BeginTemporalRo(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if !cfg.allowUnfinalized {
-		fin := rawdb.ReadForkchoiceFinalizedNum(tx)
-		if fin == 0 {
-			return errors.New("the datadir records no finalized block; pass --allow-unfinalized to export anyway")
-		}
-		if cfg.to > fin {
-			return fmt.Errorf("--to %d is above the finalized block %d", cfg.to, fin)
-		}
-	}
-
-	if _, ok, err := n.br.CanonicalHash(ctx, tx, cfg.to); err != nil {
-		return err
-	} else if !ok {
-		return fmt.Errorf("block %d is not in the datadir", cfg.to)
-	}
-	if err := checkBlockFilesCurrent(n.dirs.Snap, n.snaps.BlocksAvailable(), cfg.to); err != nil {
-		return err
-	}
-
-	txNums := n.br.TxnumReader()
-	maxTxNum := func(block uint64) (uint64, error) {
-		return txNums.Max(ctx, tx, block)
-	}
-	mapper, err := newTxNumMapper(cfg.from, maxTxNum)
-	if err != nil {
-		return err
-	}
-	txFrom := mapper.minTxNum()
-	txTo, err := maxTxNum(cfg.to)
-	if err != nil {
-		return err
-	}
-	if txTo <= txFrom {
-		return fmt.Errorf("block %d is not in the datadir", cfg.to)
-	}
-
-	aggTx := dbstate.AggTx(tx)
-	filesEnd := make([]uint64, len(traceIndexes))
-	for i, ti := range traceIndexes {
-		end := uint64(0)
-		for _, f := range aggTx.DbgII(ti.idx).Files() {
-			if f.StartRootNum() != end {
-				return fmt.Errorf("%s: visible files are not contiguous at txNum %d (%s)", ti.idx, end, f.Fullpath())
-			}
-			end = f.EndRootNum()
-		}
-		filesEnd[i] = end
-		if err := checkIndexFilesCurrent(n.dirs.SnapIdx, ti.fileBase, end, n.agg.StepSize()); err != nil {
-			return err
-		}
-		// The last txNum of block --to is its closing system txNum, which addr1
-		// ignores; everything before it must be indexed.
-		indexedEnd, err := dbIndexedEnd(tx, ti.keysTable, end)
-		if err != nil {
-			return err
-		}
-		if indexedEnd < txTo {
-			return fmt.Errorf("%s is indexed below txNum %d only, block %d needs up to %d", ti.idx, indexedEnd, cfg.to, txTo-1)
-		}
-	}
-
 	collector := etl.NewCollector("trace-export", tmpdir, etl.NewSortableBuffer(datasize.ByteSize(cfg.sortBufferMB)*datasize.MB), logger)
 	defer collector.Close()
 	collector.LogLvl(log.LvlDebug)
-
 	var key [8 + 20]byte
 	collect := func(txNum uint64, addr []byte) error {
 		binary.BigEndian.PutUint64(key[:8], txNum)
@@ -261,27 +317,33 @@ func run(ctx context.Context, cfg config, logger log.Logger) error {
 		return collector.Collect(key[:], nil)
 	}
 
+	chain := &chainReader{ctx: ctx, n: n, frozen: n.snaps.BlocksAvailable()}
 	start := time.Now()
-	for i, ti := range traceIndexes {
-		for _, f := range aggTx.DbgII(ti.idx).Files() {
-			if f.EndRootNum() <= txFrom || f.StartRootNum() > txTo {
-				continue
-			}
-			t := time.Now()
-			if err := scanFile(ctx, f.Fullpath(), f.StartRootNum(), txFrom, txTo, collect); err != nil {
-				return err
-			}
-			logf("scanned %s in %s", filepath.Base(f.Fullpath()), time.Since(t).Round(time.Second))
+	files, txFrom, txTo, err := readUnderSnapshot(ctx, cfg, n, chain, collect)
+	defer func() {
+		for _, f := range files {
+			f.d.Close()
 		}
-		if txTo >= filesEnd[i] {
-			if err := scanDB(ctx, tx, ti.keysTable, max(txFrom, filesEnd[i]), txTo, collect); err != nil {
-				return err
-			}
-			logf("scanned %s from txNum %d", ti.keysTable, max(txFrom, filesEnd[i]))
-		}
+	}()
+	if err != nil {
+		return err
 	}
 
-	w := &rangeWriter{dir: cfg.out, source: sourceString(), from: cfg.from, to: cfg.to, per: cfg.blocksPerFile, next: cfg.from}
+	// No read transaction is open from here on: a long-lived reader would keep
+	// the node from reusing the pages it frees.
+	for _, f := range files {
+		t := time.Now()
+		if err := scanFile(ctx, f.d, f.base, txFrom, txTo, collect); err != nil {
+			return err
+		}
+		logf("scanned %s in %s", f.d.FileName(), time.Since(t).Round(time.Second))
+	}
+
+	mapper, err := newTxNumMapper(cfg.from, chain.maxTxNum)
+	if err != nil {
+		return err
+	}
+	w := &rangeWriter{dir: cfg.out, source: sourceString(), chainID: n.chainID, from: cfg.from, to: cfg.to, per: cfg.blocksPerFile, next: cfg.from, blockTable: chain.blockTable}
 	defer w.abort()
 	if err := collector.Load(nil, "", func(k, _ []byte, _ etl.CurrentTableReader, _ etl.LoadNextFunc) error {
 		block, txIndex, isUserTx, err := mapper.lookup(binary.BigEndian.Uint64(k[:8]))
@@ -305,14 +367,102 @@ func run(ctx context.Context, cfg config, logger log.Logger) error {
 	return nil
 }
 
+// readUnderSnapshot does everything that needs one consistent view of the
+// database, in a single short read transaction: the checks, the blocks not yet
+// frozen, the index tail not yet in files, and opening the index files to read
+// later (an open file stays readable even if the node merges it away).
+func readUnderSnapshot(ctx context.Context, cfg config, n *node, chain *chainReader, collect func(uint64, []byte) error) (files []openFile, txFrom, txTo uint64, err error) {
+	tx, err := n.db.BeginTemporalRo(ctx)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	defer tx.Rollback()
+
+	if !cfg.allowUnfinalized {
+		fin := rawdb.ReadForkchoiceFinalizedNum(tx)
+		if fin == 0 {
+			return nil, 0, 0, errors.New("the datadir records no finalized block; pass --allow-unfinalized to export anyway")
+		}
+		if cfg.to > fin {
+			return nil, 0, 0, fmt.Errorf("--to %d is above the finalized block %d", cfg.to, fin)
+		}
+	}
+	if _, ok, err := n.br.CanonicalHash(ctx, tx, cfg.to); err != nil {
+		return nil, 0, 0, err
+	} else if !ok {
+		return nil, 0, 0, fmt.Errorf("block %d is not in the datadir", cfg.to)
+	}
+	if err := checkBlockFilesCurrent(n.dirs.Snap, chain.frozen, cfg.to); err != nil {
+		return nil, 0, 0, err
+	}
+	tailFrom := cfg.from
+	if tailFrom > 0 {
+		tailFrom-- // the span of block --from starts after the previous block's
+	}
+	if err := chain.readTail(tx, tailFrom, cfg.to); err != nil {
+		return nil, 0, 0, err
+	}
+	if cfg.from > 0 {
+		prev, err := chain.maxTxNum(cfg.from - 1)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		txFrom = prev + 1
+	}
+	if txTo, err = chain.maxTxNum(cfg.to); err != nil {
+		return nil, 0, 0, err
+	}
+
+	aggTx := dbstate.AggTx(tx)
+	defer func() {
+		if err != nil {
+			for _, f := range files {
+				f.d.Close()
+			}
+			files = nil
+		}
+	}()
+	for _, ti := range traceIndexes {
+		end := uint64(0)
+		for _, f := range aggTx.DbgII(ti.idx).Files() {
+			if f.StartRootNum() != end {
+				return files, 0, 0, fmt.Errorf("%s: visible files are not contiguous at txNum %d (%s)", ti.idx, end, f.Fullpath())
+			}
+			end = f.EndRootNum()
+			if f.EndRootNum() <= txFrom || f.StartRootNum() > txTo {
+				continue
+			}
+			d, err := seg.NewDecompressor(f.Fullpath())
+			if err != nil {
+				return files, 0, 0, fmt.Errorf("open %s (the node may have merged it away: rerun): %w", f.Fullpath(), err)
+			}
+			files = append(files, openFile{d: d, base: f.StartRootNum()})
+		}
+		if err := checkIndexFilesCurrent(n.dirs.SnapIdx, ti.fileBase, end, n.agg.StepSize()); err != nil {
+			return files, 0, 0, err
+		}
+		// The last txNum of block --to is its closing system txNum, which addr1
+		// ignores; everything before it must be indexed.
+		indexedEnd, err := dbIndexedEnd(tx, ti.keysTable, end)
+		if err != nil {
+			return files, 0, 0, err
+		}
+		if indexedEnd < txTo {
+			return files, 0, 0, fmt.Errorf("%s is indexed below txNum %d only, block %d needs up to %d", ti.idx, indexedEnd, cfg.to, txTo-1)
+		}
+		if txTo >= end {
+			if err := scanDB(ctx, tx, ti.keysTable, max(txFrom, end), txTo, collect); err != nil {
+				return files, 0, 0, err
+			}
+			logf("scanned %s from txNum %d", ti.keysTable, max(txFrom, end))
+		}
+	}
+	return files, txFrom, txTo, nil
+}
+
 // scanFile reads one .ef file: key = address, value = the sorted txNums the
 // address appears at, encoded relative to the file's first txNum.
-func scanFile(ctx context.Context, path string, baseTxNum, txFrom, txTo uint64, collect func(uint64, []byte) error) error {
-	d, err := seg.NewDecompressor(path)
-	if err != nil {
-		return fmt.Errorf("open %s (Erigon may have merged it away: rerun): %w", path, err)
-	}
-	defer d.Close()
+func scanFile(ctx context.Context, d *seg.Decompressor, baseTxNum, txFrom, txTo uint64, collect func(uint64, []byte) error) error {
 	d.MadvSequential()
 	defer d.DisableReadAhead()
 
@@ -325,11 +475,11 @@ func scanFile(ctx context.Context, path string, baseTxNum, txFrom, txTo uint64, 
 		}
 		k, _ := g.NextUncompressed()
 		if !g.HasNext() {
-			return fmt.Errorf("%s: key without a value", path)
+			return fmt.Errorf("%s: key without a value", d.FileName())
 		}
 		v, _ := g.NextUncompressed()
 		if len(k) != len(addr) {
-			return fmt.Errorf("%s: key of %d bytes, want 20", path, len(k))
+			return fmt.Errorf("%s: key of %d bytes, want 20", d.FileName(), len(k))
 		}
 		copy(addr[:], k)
 		if !indexedAddress(addr) {
@@ -339,7 +489,7 @@ func scanFile(ctx context.Context, path string, baseTxNum, txFrom, txTo uint64, 
 		if seq.Count() == 0 || seq.Max() < txFrom || seq.Min() > txTo {
 			continue
 		}
-		it := seq.Iterator(int(txFrom))
+		it := seq.Iterator(int(max(txFrom, baseTxNum)))
 		for it.HasNext() {
 			t, err := it.Next()
 			if err != nil {
@@ -401,15 +551,43 @@ func scanDB(ctx context.Context, tx kv.Tx, table string, txFrom, txTo uint64, co
 	return nil
 }
 
+// plannedRange is the output file that holds block b.
+func plannedRange(b, from, to, per uint64) (first, last uint64) {
+	first = max(b-b%per, from)
+	last = min(b-b%per+per-1, to)
+	return first, last
+}
+
+// checkNoOverlap refuses an output directory that already holds a file
+// overlapping the range under different boundaries; one with the same
+// boundaries is replaced.
+func checkNoOverlap(dir string, from, to, per uint64) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		first, last, ok := parseFileName(e.Name())
+		if !ok || last < from || first > to {
+			continue
+		}
+		if f, l := plannedRange(first, from, to, per); first < from || last > to || f != first || l != last {
+			return fmt.Errorf("%s overlaps blocks %d-%d with other boundaries; remove it or export into another directory", e.Name(), from, to)
+		}
+	}
+	return nil
+}
+
 // rangeWriter splits the sorted records into files of blocksPerFile blocks,
 // aligned to multiples of it and clipped to [from, to]. Every range gets a
 // file, an empty one included, so a directory states its coverage.
 type rangeWriter struct {
-	dir, source         string
-	from, to, per, next uint64
-	cur                 *a1trWriter
-	files               int
-	records             uint64
+	dir, source                  string
+	chainID, from, to, per, next uint64
+	blockTable                   func(first, last uint64) ([]blockEntry, error)
+	cur                          *a1trWriter
+	files                        int
+	records                      uint64
 }
 
 func (rw *rangeWriter) ensure(block uint64) error {
@@ -427,9 +605,12 @@ func (rw *rangeWriter) ensure(block uint64) error {
 		if rw.next > rw.to || block > rw.to {
 			return fmt.Errorf("block %d beyond --to %d", block, rw.to)
 		}
-		first := rw.next
-		last := min(first-first%rw.per+rw.per-1, rw.to)
-		w, err := createA1TR(rw.dir, first, last, rw.source)
+		first, last := plannedRange(rw.next, rw.from, rw.to, rw.per)
+		table, err := rw.blockTable(first, last)
+		if err != nil {
+			return err
+		}
+		w, err := createA1TR(rw.dir, rw.chainID, first, last, rw.source, table)
 		if err != nil {
 			return err
 		}
@@ -465,10 +646,6 @@ func (rw *rangeWriter) abort() {
 	}
 }
 
-func logf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "%s "+format+"\n", append([]any{time.Now().Format("15:04:05")}, args...)...)
-}
-
 // dbIndexedEnd is the exclusive txNum bound up to which an index is complete:
 // the end of its files, or one past the last txNum in its keys table.
 func dbIndexedEnd(tx kv.Tx, table string, filesEnd uint64) (uint64, error) {
@@ -495,12 +672,15 @@ var (
 // checkIndexFilesCurrent fails when the node has built index files past the
 // view this process opened. Erigon prunes the keys table only after it built
 // the file, so with a stale view a range could be missing from both the files
-// read and the database transaction.
+// read and the database transaction. It also fails when it cannot find the
+// opened view's last file, so a naming change disables the export, not the
+// check.
 func checkIndexFilesCurrent(idxDir, fileBase string, filesEnd, stepSize uint64) error {
 	entries, err := os.ReadDir(idxDir)
 	if err != nil {
 		return err
 	}
+	foundEnd := filesEnd == 0
 	for _, e := range entries {
 		m := efFileRe.FindStringSubmatch(e.Name())
 		if m == nil || m[1] != fileBase {
@@ -510,16 +690,23 @@ func checkIndexFilesCurrent(idxDir, fileBase string, filesEnd, stepSize uint64) 
 		if err != nil {
 			continue
 		}
-		if toStep*stepSize > filesEnd {
+		switch end := toStep * stepSize; {
+		case end > filesEnd:
 			return fmt.Errorf("the node wrote %s after this export opened the datadir; rerun", e.Name())
+		case end == filesEnd:
+			foundEnd = true
 		}
+	}
+	if !foundEnd {
+		return fmt.Errorf("%s: no %s file ends at txNum %d, the end of the opened view; unknown file naming?", idxDir, fileBase, filesEnd)
 	}
 	return nil
 }
 
 // checkBlockFilesCurrent fails when the node froze blocks into new snapshot
 // files after this process opened them and the export needs those blocks:
-// their txNum spans may already be gone from the database.
+// their txNum spans may already be gone from the database. Like the index
+// check, it also fails when it cannot find the opened view's last file.
 func checkBlockFilesCurrent(snapDir string, blocksAvailable, toBlock uint64) error {
 	if toBlock <= blocksAvailable {
 		return nil
@@ -528,6 +715,7 @@ func checkBlockFilesCurrent(snapDir string, blocksAvailable, toBlock uint64) err
 	if err != nil {
 		return err
 	}
+	foundEnd := blocksAvailable == 0
 	for _, e := range entries {
 		m := bodyFileRe.FindStringSubmatch(e.Name())
 		if m == nil {
@@ -537,9 +725,19 @@ func checkBlockFilesCurrent(snapDir string, blocksAvailable, toBlock uint64) err
 		if err != nil {
 			continue
 		}
-		if to*1000 > blocksAvailable+1 {
+		switch end := to * 1000; {
+		case end > blocksAvailable+1:
 			return fmt.Errorf("the node wrote %s after this export opened the datadir; rerun", e.Name())
+		case end == blocksAvailable+1:
+			foundEnd = true
 		}
 	}
+	if !foundEnd {
+		return fmt.Errorf("%s: no bodies file ends at block %d, the end of the opened view; unknown file naming?", snapDir, blocksAvailable+1)
+	}
 	return nil
+}
+
+func logf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "%s "+format+"\n", append([]any{time.Now().Format("15:04:05")}, args...)...)
 }

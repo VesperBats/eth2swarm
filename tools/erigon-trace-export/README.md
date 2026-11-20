@@ -1,6 +1,6 @@
 # erigon-trace-export
 
-Writes addr1's `TRACE` appearances for a block range as A1TR v1 files, read
+Writes addr1's `TRACE` appearances for a block range as A1TR v2 files, read
 from the call-trace indexes of an Erigon datadir instead of re-executing every
 block with `trace_block`. `addr-import --trace-index <dir>` reads the files.
 
@@ -32,7 +32,7 @@ Frozen data comes from the visible `.ef` files, the tail not yet in files
 from the `TracesFromKeys` / `TracesToKeys` tables. Both are read through a
 read-only open of the datadir, so the tool can run next to the node.
 
-## Output: A1TR v1
+## Output: A1TR v2
 
 One file per block range, `trace-<first>-<last>.a1tr` with ten-digit,
 zero-padded block numbers, so a directory sorts in block order. Ranges are
@@ -40,14 +40,19 @@ aligned to multiples of `--blocks-per-file` and clipped to `--from`/`--to`;
 every range gets a file, an empty one included.
 
 ```
-header: "A1TR" ‖ version u8 = 1 ‖ first_block u64 BE ‖ last_block u64 BE ‖
-        source_len u8 ‖ source (e.g. "erigon v3.8.1")
-record: block u64 BE ‖ tx_index u32 BE ‖ address [20]byte      (32 bytes)
+header:      "A1TR" ‖ version u8 = 2 ‖ chain_id u64 BE ‖ first_block u64 BE ‖
+             last_block u64 BE ‖ record_count u64 BE ‖
+             source_len u8 ‖ source (e.g. "erigon v3.8.1", the reading library)
+block table: per block first..last: hash [32]byte ‖ tx_count u32 BE
+record:      block u64 BE ‖ tx_index u32 BE ‖ address [20]byte      (32 bytes)
 ```
 
-Records are sorted by (block, tx_index, address), without duplicates, and
-carry only `TRACE`. A file is written under a temporary name and renamed when
-complete.
+Records are sorted by (block, tx_index, address), without duplicates, carry
+only `TRACE`, and every `tx_index` is below its block's `tx_count`. The block
+table holds each block's canonical hash and its number of transactions, so
+the importer can check a file against the blocks it fetches: same chain, same
+blocks, no index beyond a block's transactions, and `record_count` records.
+A file is written under a temporary name and renamed when complete.
 
 ## Build
 
@@ -75,6 +80,13 @@ go test ./...
 - The datadir needs `snapshots/erigondb.toml` (the node creates it at its
   first start). Erigon's loader exits the process if it finds a gap between
   the state files and the database.
+- An output directory that already holds a file overlapping the range with
+  other boundaries (another `--from` or `--blocks-per-file`) is refused; a
+  file with the same boundaries is replaced.
+- The export holds a database read transaction only at the start, while it
+  reads the database tail and the blocks not yet frozen. A long-lived reader
+  would keep the node from reusing the pages it frees, so `chaindata` would
+  grow for as long as the export runs.
 - Each run scans every index file that overlaps the range once, whatever the
   range's size, and spends about 40 s opening the datadir; export large
   ranges per run rather than many small ones.
@@ -96,4 +108,5 @@ like above, equals the export for blocks 2300000–2300009, 4000110–4000125,
 26453740–26453770 (the tail from the database), with one exception: a
 creation that fails. `trace_block` and `callTracer` drop its target address;
 the index keeps it (block 4000118, tx 11). A Geth-style JS tracer's `enter`
-hook and `ctx.to` report it the way the index does.
+hook and `ctx.to` report it the way the index does, and so does addr1's rule
+(from and to of every frame at entry, the owner's decision of 2026-11-20).
