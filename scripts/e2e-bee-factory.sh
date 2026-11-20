@@ -253,7 +253,7 @@ for u in 2 3 4; do
     || { echo "FAIL: addr-verify of the uploaded export, --units $u"; echo "$OUT"; exit 1; }
 done
 # Nothing new: a second upload resumes at the end and sends nothing.
-exp_upload | grep -q ": 0 files, 0 SOCs, 0 heads" || { echo "FAIL: a repeated upload sent records again"; exit 1; }
+exp_upload | grep -q ": 0 files, 0 chunks of large files, 0 SOCs, 0 heads" || { echo "FAIL: a repeated upload sent records again"; exit 1; }
 # Another batch does not resume what the first one stamped.
 if OUT=$(exp_upload --batch 0x$(printf '01%.0s' {1..32}) 2>&1); then
   echo "FAIL: an upload with another batch resumed the progress of the first"; exit 1
@@ -305,8 +305,10 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
     [[ "$T" =~ ^[0-9]+$ ]] && [ $((T % 64)) -le 40 ] && break
     sleep 1
   done
+  # 1,400 transfers: the busy address's spill file has two pages (a page holds 1,363 entries
+  # of 3 bytes), so it can be streamed and read page by page below.
   ACT=$($BIN devnet-activity --key "$KEY" --authority-key "$AUTH_KEY" --busy "$BUSY" \
-    --transfers 120) || { echo "FAIL: devnet-activity"; exit 1; }
+    --transfers 1400) || { echo "FAIL: devnet-activity"; exit 1; }
   echo "$ACT"
   EMITTER=$(echo "$ACT" | awk '{for (i = 1; i < NF; i++) if ($i == "emitter") print $(i + 1)}' | tr -d ,)
   echo "$ACT" | grep -q 'authority 0x' || { echo "FAIL: the chain did not take the EIP-7702 transaction"; exit 1; }
@@ -331,8 +333,9 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   ACT_STATE=$(mktemp -d)
   # The backfill covers the whole dev chain from genesis; its blocks are nearly empty, so
   # even large slices are quick to build here (--max-level 16, above the default of 12), only
-  # slower on an old stack.
-  OUT=$($BIN --bee "$UPLOAD_BEE" addr-import --key "$ACT_KEY" --state "$ACT_STATE" --init \
+  # slower on an old stack. Every spill file is streamed: uploaded chunk by chunk as it is
+  # written, as a busy address of a top-level slice is.
+  OUT=$(ETH2SWARM_ADDR_STREAM_FILE_BYTES=1 $BIN --bee "$UPLOAD_BEE" addr-import --key "$ACT_KEY" --state "$ACT_STATE" --init \
     --units "$ACT_UNITS" --max-level 16 "${TRACE_FLAG[@]}") \
     || { echo "FAIL: addr-import $ACT_UNITS units"; exit 1; }
   ACT_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
@@ -359,12 +362,22 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
           || { echo "FAIL: the authority's newest entry has no AUTH role: $NEWEST"; exit 1; } ;;
     esac
   done
-  [ "${N:-0}" -ge 120 ] || { echo "FAIL: busy address has ${N:-0} appearances, expected >= 120"; exit 1; }
+  [ "${N:-0}" -ge 1400 ] || { echo "FAIL: busy address has ${N:-0} appearances, expected >= 1400"; exit 1; }
   BUSY_FILES=$(echo "$BUSY_OUT" | head -1 | awk '{for (i = 1; i < NF; i++) if ($(i + 1) == "files") print $i}')
   [ "${BUSY_FILES:-0}" -ge 1 ] || { echo "FAIL: the busy address did not spill: $BUSY_OUT"; exit 1; }
   # The full lookup of the (fresh) busy address finds exactly what the incremental one did.
   FULL=$(lookup "$BUSY" | count)
   [ "$FULL" = "$N" ] || { echo "FAIL: the full lookup found $FULL entries, --since $U1 found $N"; exit 1; }
+  # Read page by page through the chunk tree, as a spill file above the whole-file limit is
+  # (a test limit of one page): the same entries, matching the chain; and the whole index
+  # verifies that way too.
+  OUT=$(ETH2SWARM_ADDR_WHOLE_FILE_BYTES=4096 lookup "$BUSY" --since "$U1" --against-chain) \
+    || { echo "FAIL: addr-lookup of the busy address page by page"; echo "$OUT"; exit 1; }
+  PAGED=$(echo "$OUT" | count)
+  [ "$PAGED" = "$N" ] || { echo "FAIL: page by page the busy address has $PAGED entries, not $N"; exit 1; }
+  ETH2SWARM_ADDR_WHOLE_FILE_BYTES=4096 $BIN --bee "$READ_BEE" addr-verify --owner "$ACT_OWNER" \
+    --chain-id "$CHAIN_ID" --units "$ACT_UNITS" >/dev/null \
+    || { echo "FAIL: addr-verify reading spill files page by page"; exit 1; }
   # The sender has appearances before and after unit U1: the incremental lookup must read
   # fewer slices than the full one and match the chain from U1 on.
   slices_read() { awk '/appearances in the index/ {for (i = 1; i < NF; i++) if ($(i + 1) == "slices,") print $i}'; }
@@ -400,14 +413,15 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   LATE_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
   LATE_STATE=$(mktemp -d)
   LATE_DIR=$(mktemp -d)/export
-  # Exported and uploaded later: this index has spill files, so files take that path too.
-  OUT=$(ETH2SWARM_ADDR_SORT_BUFFER_BYTES=180 $BIN --bee http://127.0.0.1:9 addr-import --key "$LATE_KEY" --state "$LATE_STATE" --init \
+  # Exported and uploaded later: this index has spill files, streamed into the log as their
+  # chunks (records of kind CHUNK), so they take that path too.
+  OUT=$(ETH2SWARM_ADDR_SORT_BUFFER_BYTES=180 ETH2SWARM_ADDR_STREAM_FILE_BYTES=1 $BIN --bee http://127.0.0.1:9 addr-import --key "$LATE_KEY" --state "$LATE_STATE" --init \
     --from-block "$LATE_FROM" --units "$ACT_UNITS" --max-level 16 --out "$LATE_DIR" "${TRACE_FLAG[@]}") \
     || { echo "FAIL: addr-import --from-block $LATE_FROM --out"; exit 1; }
   LATE_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
   OUT=$($BIN --bee "$UPLOAD_BEE" addr-upload "$LATE_DIR") || { echo "FAIL: addr-upload of the late index"; echo "$OUT"; exit 1; }
   echo "$OUT"
-  echo "$OUT" | grep -qv ": 0 files" || { echo "FAIL: the late index exported no files: $OUT"; exit 1; }
+  echo "$OUT" | grep -q " 0 chunks of large files" && { echo "FAIL: the late index exported no streamed spill file: $OUT"; exit 1; }
   OUT=$($BIN --bee "$READ_BEE" addr-verify --owner "$LATE_OWNER" --chain-id "$CHAIN_ID" \
     --units "$ACT_UNITS") || { echo "FAIL: addr-verify of the late index"; echo "$OUT"; exit 1; }
   echo "$OUT" | tail -1
@@ -441,6 +455,84 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   rm -rf "$LATE_STATE" "$(dirname "$LATE_DIR")"
   echo "ok: the index from block $((S * 64)) verifies, holds the busy address's $N entries and the sender's $LATE_SENDER since its start, matches the chain from there, and keeps its start"
 fi
+
+echo "== postage batches by lifetime: lower slices go to the batch that expires soonest after them"
+# Two lower batches on the upload node: one at the minimum validity (about 17,500 s on
+# bee-factory) and a long one. A dev chain is short, so --slot-secs 78 stretches a unit to
+# 4,992 s. With no grace period, the backfill of 4 units writes (2, 0), which lives 4 more
+# units (19,968 s: the long batch); units 5 and 6 write (0, 4) and (1, 2), which live 1 and
+# 2 units (the short one); heads and the origin go to the permanent batch.
+buy_batch() {
+  curl -sf -X POST "$UPLOAD_BEE/stamps/$1/17" \
+    | python3 -c 'import json, sys; print("0x" + json.load(sys.stdin)["batchID"])'
+}
+batch_info() {
+  # Bee does not know a batch until its purchase is confirmed: "False 0" until then.
+  curl -sf "$UPLOAD_BEE/stamps/${1#0x}" 2>/dev/null \
+    | python3 -c 'import json, sys; d = json.load(sys.stdin); print(d["usable"], d["batchTTL"])' 2>/dev/null \
+    || echo "False 0"
+}
+PERM=0x$(curl -sf "$UPLOAD_BEE/stamps" \
+  | python3 -c 'import json, sys; print(next(s["batchID"] for s in json.load(sys.stdin)["stamps"] if s["usable"]))')
+SHORT=$(buy_batch 420000000) || { echo "FAIL: buying a short batch"; exit 1; }
+LONG=$(buy_batch 5000000000) || { echo "FAIL: buying a long batch"; exit 1; }
+USABLE=""
+for i in $(seq 1 60); do
+  if [ "$(batch_info "$SHORT" | cut -d' ' -f1)" = True ] && [ "$(batch_info "$LONG" | cut -d' ' -f1)" = True ]; then
+    USABLE=1; break
+  fi
+  sleep 2
+done
+[ -n "$USABLE" ] || { echo "FAIL: the bought batches $SHORT and $LONG are not usable after 120 s"; exit 1; }
+read -r _ SHORT_TTL <<<"$(batch_info "$SHORT")"
+read -r _ LONG_TTL <<<"$(batch_info "$LONG")"
+[ "$SHORT_TTL" -gt 9984 ] && [ "$SHORT_TTL" -lt 19968 ] && [ "$LONG_TTL" -gt 19968 ] \
+  || { echo "FAIL: batch TTLs $SHORT_TTL and $LONG_TTL do not bracket the slices' 9,984 and 19,968 s"; exit 1; }
+LT_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+LT_STATE=$(mktemp -d)
+lt_import() {
+  $BIN --bee "$UPLOAD_BEE" addr-import --key "$LT_KEY" --state "$LT_STATE" --batch "$PERM" \
+    --lower-batch "$SHORT" --lower-batch "$LONG" --grace-days 0 --slot-secs 78 "${TRACE_FLAG[@]}" "$@"
+}
+# "<batch>: <count>" per batch the run stamped, sorted, as one line.
+stamped() {
+  awk -v p="$PERM" -v s="$SHORT" -v l="$LONG" '$1 == "batch" {
+      b = tolower($2); sub(":", "", b)
+      n = (b == tolower(p)) ? "permanent" : (b == tolower(s)) ? "short" : (b == tolower(l)) ? "long" : b
+      print n "=" $3 }
+    /went to the permanent batch/ { print "fell_back=" $1 }' | sort | tr '\n' ' '
+}
+OUT=$(lt_import --init --units 4) || { echo "FAIL: addr-import with lower batches"; echo "$OUT"; exit 1; }
+LT_OWNER=$(echo "$OUT" | awk '/^Address index of owner/ {print $5}')
+GOT=$(echo "$OUT" | stamped)
+[ "$GOT" = "long=1 permanent=2 " ] \
+  || { echo "FAIL: the backfill stamped '$GOT', expected (2, 0) long, head 0 and the origin permanent"; echo "$OUT"; exit 1; }
+OUT=$(lt_import --units 6) || { echo "FAIL: addr-import 6 units with lower batches"; echo "$OUT"; exit 1; }
+GOT=$(echo "$OUT" | stamped)
+[ "$GOT" = "permanent=2 short=2 " ] \
+  || { echo "FAIL: units 5 and 6 stamped '$GOT', expected two short-lived slices and two heads"; echo "$OUT"; exit 1; }
+$BIN --bee "$READ_BEE" addr-verify --owner "$LT_OWNER" --chain-id "$CHAIN_ID" --units 6 >/dev/null \
+  || { echo "FAIL: addr-verify of the index stamped by lifetime"; exit 1; }
+# The same through an export: the log carries each record's lifetime, addr-upload chooses.
+LT_EXP_STATE=$(mktemp -d)
+LT_EXP=$(mktemp -d)/export
+LT_EXP_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+for u in "--init --units 4" "--units 6"; do
+  # shellcheck disable=SC2086
+  $BIN --bee http://127.0.0.1:9 addr-import --key "$LT_EXP_KEY" --state "$LT_EXP_STATE" \
+    --out "$LT_EXP" $u "${TRACE_FLAG[@]}" >/dev/null \
+    || { echo "FAIL: addr-import --out ($u) for the lifetime upload"; exit 1; }
+done
+OUT=$($BIN --bee "$UPLOAD_BEE" addr-upload "$LT_EXP" --batch "$PERM" --lower-batch "$SHORT" \
+  --lower-batch "$LONG" --grace-days 0 --slot-secs 78) \
+  || { echo "FAIL: addr-upload with lower batches"; echo "$OUT"; exit 1; }
+GOT=$(echo "$OUT" | stamped)
+case "$GOT" in
+  "long="[1-9]*" permanent=4 short="[1-9]*" ") ;;
+  *) echo "FAIL: the export's upload stamped '$GOT', expected (2, 0) long, units 5 and 6 short, four heads permanent"; echo "$OUT"; exit 1 ;;
+esac
+rm -rf "$LT_STATE" "$LT_EXP_STATE" "$(dirname "$LT_EXP")"
+echo "ok: lower slices stamped by lifetime (short batch TTL ${SHORT_TTL} s, long ${LONG_TTL} s), directly and through an export; heads and the origin on the permanent batch"
 
 echo "== inspector (ethswarm serve) verifies a block via $READ_BEE"
 # INSPECTOR_ADDR is an IP:port (a socket address, not a host name). Refuse a port that

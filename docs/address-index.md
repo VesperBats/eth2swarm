@@ -8,11 +8,12 @@ and a client (`ethswarm addr-lookup`, head discovery from a finalized block, inc
 sync, and a check against the chain). An index can start at a later block instead of
 genesis (`addr-import --from-block`, *Starting at a later block*), and an import can be
 written to a directory and uploaded later (`--out`, `addr-upload`). `ethswarm devnet-activity` generates test traffic on
-a dev chain. The client reads every slice and whole spill and pages files; steps 3–5 of
-*Client lookup* (page search, last page first, stopping when the screen is full) and the
-time-based head estimate are not implemented. Slices of any level are built with bounded
-memory (*Building large slices*). Still open: postage batches grouped by lifetime (*Lifetime*
-below; one `--batch` so far), and re-measuring with traces. Design issue: #5.
+a dev chain. The client reads every slice, whole pages files, and spill files whole up to
+256 MB and page by page above (every page for a lookup; the newest pages, stopping at its
+limit, in the inspector's spill view); the page search of a paged bucket, stopping a lookup
+when the screen is full, and the time-based head estimate are not implemented. Slices of any level are built with bounded
+memory (*Building large slices*), and stamped with postage batches by lifetime
+(`--lower-batch`, *Lifetime*). Still open: re-measuring with traces. Design issue: #5.
 
 An index from an **address** to the transactions it **appears in**, stored on Swarm next to
 the [SOC block store](soc-block-store.md). A mobile wallet uses it to list an address's
@@ -72,7 +73,7 @@ miner, reward author) and `txIndex + 1` for an appearance in a transaction.
 | `0x02` | `TO` | recipient, or the contract the transaction created |
 | `0x04` | `EMITTER` | address of a log the transaction emitted |
 | `0x08` | `TOPIC` | address in a log topic (ERC-20/721/1155 `from`/`to`, …) |
-| `0x10` | `WORD` | address-shaped 32-byte word in input data, init code, log data, or an internal call's input or output |
+| `0x10` | `WORD` | address-shaped 32-byte word in a transaction's input data or init code, in log data, or an EIP-7702 code address |
 | `0x20` | `TRACE` | address in a call frame, creation or self-destruct (requires traces) |
 | `0x40` | `BLOCK` | block-level: fee recipient, uncle miner, reward author, withdrawal recipient |
 | `0x80` | `AUTH` | authority of an EIP-7702 authorization |
@@ -84,18 +85,30 @@ are normative. They are implemented in `src/addr/detect.rs` and checked by
 `ethswarm appearances <block> [--traces]`.
 
 The rules are a **superset of TrueBlocks'** (`trueblocks-chifra`, `pkg/uniq`, at
-`ff9df4f`): the same sources (traces, receipts, withdrawals, miner) and the same word
-heuristic, plus log emitters, known token events regardless of value, and EIP-7702
-authorities. Every appearance TrueBlocks' scraper finds is found here too, which makes its
-published index a test oracle for this one: its transaction index `i` is slot `i + 1`
-here, and its block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. Two
-exceptions:
+`ff9df4f`) **with three exceptions** (below): the same sources (traces, receipts,
+withdrawals, miner) and the same word heuristic, plus log emitters, known token events
+regardless of value, and EIP-7702 authorities. Every other appearance TrueBlocks' scraper
+finds is found here too, which makes its published index a test oracle for this one once
+the exceptions are filtered out: its transaction index `i` is slot `i + 1` here, and its
+block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. The exceptions:
 
 - TrueBlocks records a reward to a precompile address under a sentinel address; here it is
   ignored like every other address up to `0x…ffff`.
 - TrueBlocks indexes the **genesis allocations** as block 0, from a per-chain `allocs.csv`.
   Genesis state is not in any block, so this detection does not see it; see *Open
   questions*.
+- TrueBlocks also scans the **input and output of every trace** (internal calls, and the
+  top-level call's return data) for address-shaped words. Here traces add only the addresses
+  of the call frames themselves (`TRACE`): that is expected to be the set an archive node
+  keeps an index of (Erigon 3's `tracesfrom` and `tracesto`, keyed by transaction), so a
+  full history with traces could be imported from it in days instead of re-executing every
+  block (owner decision, 2026-11-20). That the two sets match has to be shown, block by
+  block, before the index is used (#8, part 12); failed creations are a known case where
+  they may not (*Open questions*). An address that occurs only in trace data (a recipient a
+  router passes on without calling it, an address a factory returns) is therefore not
+  indexed. Unlike the other two, this exception cannot be filtered out of TrueBlocks' index
+  by itself, which records no reason per appearance: telling such an appearance from a
+  missed one needs the transaction's traces and the word scan this rule no longer makes.
 
 - *Address-shaped* (TrueBlocks' "implicit address"): a 32-byte word whose first 12 bytes
   are zero, whose value is at least 2^104 (one of bytes 12–18 is non-zero, so an address
@@ -132,11 +145,10 @@ exceptions:
     the init code of a creation (as TrueBlocks does; init code mostly yields bytecode
     fragments that pass the heuristic, a known source of noise);
   - the words of every log's data at offset 0;
-  - the code address of every EIP-7702 authorization, whatever its value;
-  - with traces: the words of every trace's `action.input` at offset 4 and of its
-    `result.output` at offset 0. This finds addresses that only occur inside the
-    execution: recipients a multisig, router or bundler passes on, or an address a
-    factory returns.
+  - the code address of every EIP-7702 authorization, whatever its value.
+
+  Traces add no words: the input and output of traces are not scanned, the top-level call's
+  return data included (see the exceptions above).
 - `AUTH`: the authority of an entry in the authorization list of a type-4 transaction. An
   entry counts if `y_parity ∈ {0, 1}`, `0 < r < n`, `0 < s ≤ n/2` (`n` the secp256k1 group
   order) and `ecrecover(keccak256(0x05 ‖ rlp([chain_id, address, nonce])), y_parity, r, s)`
@@ -169,10 +181,11 @@ exceptions:
   is exactly how two importers would end up with different slices.
 
 A wallet that only wants transfers it took part in filters on `FROM | TO | TOPIC | TRACE |
-BLOCK | AUTH`. `WORD` keeps the index as complete as TrueBlocks' and gives spam filters
-something to work with. Without traces it was 1–10 % of all appearances (measured with the
-earlier, stricter heuristic); the share with traces and the TrueBlocks heuristic is still
-to be measured with `addr-stats` on a tracing node (#8).
+BLOCK | AUTH`. `WORD` keeps the index close to TrueBlocks' (all but the words inside internal
+calls) and gives spam filters something to work with. Without traces it was 1–10 % of all
+appearances (measured with the earlier, stricter heuristic); its share under the current
+heuristic, and the share traces add, are still to be measured with `addr-stats` on a
+tracing node (#8).
 
 The appearances of one address at one (block, slot) are merged into one entry whose role
 is the OR of all roles.
@@ -252,13 +265,15 @@ replaces: it is built from the blocks again. The importer does that with bounded
    along it, so a bucket's records are consecutive; they are ordered by (fingerprint,
    address), encoded, paged if needed, and published at once. The descriptor goes last.
 
-Memory is the sort buffer, one bucket, the entries (16 bytes each) and spill file of the
-busiest address, and 32 bytes per bucket and per file of the slice; temporary disk is about
-45 bytes per appearance of the slice being built, plus its records. The busiest address is
-the one part that grows with the slice: a token contract in a top-level slice has tens of
-millions of entries, which is several GB and a spill file beyond the client's 256 MB read
-limit. Writing spill files as a stream, and paging them for the client, is still open; up to
-level 12 (about a month) it stays in the hundreds of MB. Measured on
+Memory is the sort buffer, one bucket, and 32 bytes per bucket and per file of the slice;
+temporary disk is about 45 bytes per appearance of the slice being built, plus its records.
+A busy address does not add to it: its entries go into its spill file page by page as the
+merge yields them, and a spill file above 1 MiB is chunked as it is written (the chunks of
+Bee's tree for the whole file, its root last) and handed out chunk by chunk, so memory holds
+one page and one path of the tree. A token contract in a top-level slice, tens of millions of
+entries and several GB of spill file, takes no more memory than a quiet address. Such a file
+is above the 256 MB a client reads whole: a client reads it page by page (*Client lookup*,
+step 4). Measured on
 synthetic data: 100 M appearances (about a week of mainnet) in one slice with a 64 MB buffer
 peaked at 91 MiB and took 95 s, against about 10 GB in memory before.
 
@@ -326,9 +341,13 @@ SOCs are signed at export time, and their addresses and the files' references ar
 locally, so the uploaded index is the one a direct import would have published; only the
 postage stamps come from the upload.
 
-- The export is one append-only log of records in upload order (`kind ‖ key ‖ length ‖
-  data`): files under their reference, slice descriptors and buckets as SOCs in wire form
-  under their address, and heads (and the origin) the same way. A head is a barrier:
+- The export is one append-only log of records in upload order (`kind ‖ key ‖ life ‖ length ‖
+  data`): files under their reference (a spill file above 1 MiB as its chunks, each in wire
+  form under its address, the root last), slice descriptors and buckets as SOCs in wire form
+  under their address, and heads (and the origin) the same way; `life` is how many more
+  units the record must stay (layouts 2 and 3, *Lifetime*; permanent: all ones; layout 3 adds
+  the chunk records, so a build that cannot upload them refuses the export up front). A head
+  is a barrier:
   `addr-upload` sends the records between two heads in parallel, and a head only after
   everything before it, as the importer does with a Bee node.
 - At every save of its state the importer syncs the log, records its length in the state,
@@ -341,8 +360,13 @@ postage stamps come from the upload.
   an index with another origin, the export is refused (the importer has no Bee node to ask).
   It keeps its progress in the directory (also within long stretches without a head, such
   as a backfill) and resumes there, also while the importer goes on appending. The progress
-  is tied to its batch: a resumed upload takes that batch, another one needs `--from-start`,
-  which sends everything again.
+  is tied to its permanent batch: a resumed upload takes that batch, another one needs
+  `--from-start`, which sends everything again. Lower batches can change between uploads; a
+  resumed upload does not send again what went to a lower batch that has expired since
+  (`--from-start` does).
+- An export keeps the layout it started in when it is continued. One started before layout 3
+  writes spill files whole, so an address whose spill file would exceed 256 MB stops it (start
+  a new export); one started before layout 2 has no lifetimes either.
 - Moving an export between machines while the importer runs: copy `committed` first and the
   log after it (every byte below `committed` is final), or stop the importer. Do not mirror
   with deletion (`rsync --delete`): `uploaded.json`, the upload's progress, lives in the
@@ -384,6 +408,48 @@ the permanent top level, grouped by lifetime (level `L` lives `2^L·U` blocks; l
 291 days) so that each batch expires soon after its slices are dead. A mutable batch does
 not help here: it evicts the oldest stamps first, and the oldest live lower slices are the
 long-lived ones. See *Full history and cost* for the size.
+
+How the importer stamps (`addr-import` and `addr-upload`, `--batch` and `--lower-batch`):
+
+- A slice `(L, i)` below `L_max` with an even `i` stays in the cover until it merges with
+  `(L, i + 1)`: it is dead once the head reaches unit `(i + 2)·2^L`. Written while the head
+  has `N` units, its records must live that unit minus `N` more units (a deferred merge is
+  counted from its own end, the earliest head it can be written at), at 64 blocks of
+  `--slot-secs` per unit (default 12 s, mainnet's slot: 768 s), plus a grace period
+  (`--grace-days`, default 7, given to `addr-upload` for an export) for clients holding an
+  older head and the cases below.
+- An odd `i` is only ever written as the level-0 slice `(0, N − 1)` of a unit whose merge is
+  deferred: it is read from head `N`, which lists the merge as pending, until the merge is
+  uploaded. Its lifetime by the formula above (`(⌊i/2⌋ + 1)·2^(L+1)`, the unit it is written
+  at) is zero: the grace period alone covers it, as it covers the rest of a pending merge's
+  expansion from that unit on.
+- Each lower slice goes to the `--lower-batch` with the smallest remaining TTL (`batchTTL`
+  of `GET /stamps/{id}`, asked at most once a minute) that is at least that long, so the
+  batch expires soon after the slice is dead. If none lives long enough, it goes to the
+  permanent `--batch`, and the run says how many did. Top-level slices, heads and the origin
+  always go to `--batch`.
+- The importer never buys or tops up a batch. The operator keeps lower batches of staggered
+  lifetimes (for example one bought every few weeks, each living somewhat longer than the
+  longest-lived lower level written meanwhile); a slice that no lower batch outlives goes to
+  the permanent batch and costs permanent storage. A lower batch Bee cannot tell about (it
+  expired, or the request failed) is left out until the next refresh.
+- The lifetime assumes the head keeps moving at `--slot-secs` per block. Four things keep a
+  lower slice in use longer, and the grace period must cover them: the importer being stopped
+  or behind (its last head still lists the slice); a deferred merge taking long to build (its
+  expansion stays in use until it is uploaded); a backfill, whose slices are stamped as they
+  are written but whose head 0 appears only once all of them are; and, for an export uploaded
+  periodically, the time between two uploads (the head that drops a slice is uploaded up to
+  one interval after it was written). Past the grace period the slice's batch
+  can expire while a head still uses it; topping up that batch (or importing again) is the
+  remedy.
+- An export records each record's remaining lifetime in the log (layouts 2 and 3), so `addr-upload`
+  chooses the batches; a layout-1 export (written before lifetimes) uploads as permanent, and
+  `addr-upload` warns when it is given lower batches for one. A layout-1 export stays in
+  layout 1 when it is continued: lifetimes need an export started by this build.
+  The lifetime is counted from when the record was written, so an upload long after the
+  export over-provisions rather than under-provisions.
+- A batch fills up as well as expiring: a lower batch must be deep enough for what it is
+  chosen for, or the upload fails when it is full.
 
 The cap is what keeps the history from being rewritten: without it, the whole history
 would be merged into one new top slice every time `N` reaches a power of two, briefly
@@ -598,7 +664,9 @@ Newest first, for address `A`:
    `k` and `fp`, read bucket `k`, and scan it for `fp` (records have variable length, so the
    2.8 KB are read front to back). For a paged bucket, binary-search its pages.
 4. For a spilled address, walk the spill file's tree from its root chunk to the last page,
-   then earlier pages as the user scrolls. Each tree level is one chunk and one round
+   then earlier pages as the user scrolls. (`ethswarm` reads a spill file of up to 256 MB
+   whole; a larger one page by page, every page for a lookup, the newest pages in the
+   inspector's spill view.) Each tree level is one chunk and one round
    trip: root and page for up to 128 pages, one intermediate level more up to 16,384 pages
    (≈ 16 million entries). A binary search over pages costs such a path per probe.
 5. Stop when the screen is full; continue with older slices on demand.
@@ -619,12 +687,11 @@ Oldest first is the same in the opposite order.
   - `BLOCK` (slot 0): the header itself (beneficiary) or the body (withdrawals, uncles),
     checked against the header's roots. A pre-merge reward `author` from a trace is the
     beneficiary of the block or an uncle, so the same evidence applies.
-  - `TRACE`, and a `WORD` found only in a trace's input or output: cannot be checked from
-    the block. Internal calls are not recorded in the transaction or the receipt; checking
-    one needs re-execution with the state, or an execution proof. A client trusts the
-    importer for these entries, or compares importers. A client cannot tell from the
-    entry whether a `WORD` came from a trace; if it finds the address in neither the
-    transaction nor the receipt, it treats the entry as trace-derived.
+  - `TRACE`: cannot be checked from the block. Internal calls are not recorded in the
+    transaction or the receipt; checking one needs re-execution with the state, or an
+    execution proof. A client trusts the importer for these entries, or compares
+    importers. Every other role, `WORD` included, comes from the transaction, the receipt
+    or the header.
 - **Checking one transaction is cheap only if the block store supports it.** Today's block
   store, like devp2p, delivers only whole bodies (164 KB on average at the tip), and the
   client recomputes `transactionsRoot` from all of them. To read one transaction, the block
@@ -661,8 +728,8 @@ Oldest first is the same in the opposite order.
 ## Measurements
 
 **These figures predate the current detection rules.** They were measured with the earlier
-rule set: the 2^128 word bound, no init code, no `topic0`, no traces. The current rules (the
-TrueBlocks superset) find more appearances, so the totals, sizes and costs below are lower
+rule set: the 2^128 word bound, no init code, no `topic0`, no traces. The current rules
+(TrueBlocks' heuristic and sources, with the exceptions above) find more appearances, so the totals, sizes and costs below are lower
 bounds until they are measured again with `addr-stats`, with traces once a tracing node is
 available.
 
@@ -777,10 +844,11 @@ receipts on top for log roles.
 
 ## Open questions
 
-- **Relation source.** Without traces (`TRACE`) internal ETH transfers are missing. Our geth
-  node has full history but not archive state, so it cannot trace historical blocks.
-  Options: TrueBlocks' published index for history plus a tracing client (Erigon, Reth) for
-  new blocks.
+- **Relation source.** Without traces (`TRACE`) internal ETH transfers are missing. nuc now
+  runs an Erigon v3.8.1 archive node, but `trace_block` manages only about 1–2 blocks/s
+  there, most of a year for the whole history. The plan is Erigon's own index of call-frame
+  addresses (#8, part 12). TrueBlocks' published index cannot be the source under the
+  current rules: it holds the words of trace data, without marking them.
 - **Where the blocks come from.** The index does not care: an entry is (block, slot). Since
   2025 execution clients can drop pre-merge bodies and receipts, and many nodes do, while
   post-merge history is still served over devp2p; eth/69 announces each peer's earliest available block, so a
@@ -798,13 +866,25 @@ receipts on top for log roles.
 - **Block store.** Receipts, transaction offsets and trie nodes (above); moving the header
   accumulator to a Merkle Mountain Range (the same doubling scheme) would remove the
   "extending the range changes the anchor" limitation.
-- **Tracer-dependent edge cases.** `TRACE` and trace `WORD`s are defined by an RPC
-  format, not by the EVM, and Parity-style tracers differ at the edges. For example, a
-  reverted frame's revert data may or may not be in `result.output`. A call to a precompile
-  may get a frame only at top level or with value, and `ecrecover`'s output is an
-  address-shaped word. Identical slices across importers need these cases written into the
-  rules, or the tracer named as part of them. To be settled when the detection is compared
-  against TrueBlocks on an Erigon node.
+- **Tracer-dependent edge cases.** `TRACE` is defined by an RPC format, not by the EVM, and
+  tracers differ at the edges:
+  - whether a call that fails before it executes (insufficient balance, the depth limit)
+    gets a frame;
+  - **failed creations**: a Parity-style trace of a creation that fails has `result: null`
+    (one that reverts keeps `result.address` with Erigon and Reth, as far as known), so the
+    address it aimed at is not in the `trace_block` answer, while a frame index records it
+    whatever the outcome. A failed top-level deployment would then be `TO` from
+    `trace_block` and `TO | TRACE` from the index. Either the rule takes every creation
+    frame's address whatever its outcome (and `trace_block` can no longer produce the set
+    for internal creations: it has no nonce or salt), or the import needs each creation's
+    outcome, which the index does not hold;
+  - frames of precompile calls (precompiles are below `0x…ffff` and never indexed, so
+    this matters only where it changes another address's frame, such as a failed creation).
+
+  Comparing Erigon's index with Erigon's `trace_block` (#8, part 12) shows where the two
+  differ on one client. It does not settle what Reth or Nethermind trace; that needs the
+  cases written into the rules, or a tracer (for example Erigon's frame tracer) named as
+  part of them. Owner decision once the comparison has the data.
 - **Genesis allocations.** TrueBlocks indexes the prefunded addresses of the genesis
   state at block 0 (about 8,900 on mainnet). Adding them needs the allocation list as an
   input (it is not in any block), and a convention for its slots.

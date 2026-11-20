@@ -55,7 +55,10 @@ bookmarkable.
     `#addr/index:<units>:<since>` (the head without an address), `#addr/slice:<L>:<i>:<address>`,
     `#addr/bucket:<L>:<i>:<k>:<address>` (the address is optional and is what the view
     highlights), `#addr/spill:<L>:<i>:<ref>:<count>` and `#addr/examples:<units>`. A lookup and a spill file show their
-    newest 500 entries (the API's `limit`), newest first, and always the full count.
+    newest 500 entries (the API's `limit`), newest first, and always the full count. A spill file
+    above 256 MB is read from its last page backwards and only as far as the limit: the view
+    says so (`read`: newest pages only), and its count is the bucket record's, not checked
+    against the file.
   - A failed read keeps what was read before it: a lookup that fails in one slice still shows
     the head and the slice links, a bucket or spill view still shows the slice.
   - *Show example addresses*: well-known addresses of the chain (mainnet: tokens, the

@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use super::build::{Output, SliceBuilder};
+use super::build::{Output, STREAM_FILE, SliceBuilder};
 use super::detect::role;
 use super::export::{self, ExportLog, ExportMeta};
 use super::fetch::fetch_appearances;
@@ -32,6 +32,7 @@ use super::layout::{
     last_block, origin_id, slice_id,
 };
 use super::slice::{SliceId, cover, held, held_level, new_slice, resolve_after, units};
+use super::stamps::{self, Stamps};
 use crate::swarm::{bee::Bee, soc};
 
 /// Name of the state file in the state directory.
@@ -255,7 +256,15 @@ pub struct ImportOptions {
     /// (default: from genesis). A later run must state the same unit or nothing.
     pub from_block: Option<u64>,
     pub traces: bool,
+    /// The permanent batch: top-level slices, heads, the origin (and everything without
+    /// `lower_batches`).
     pub batch: Option<B256>,
+    /// Batches for the lower slices, chosen by TTL ([`super::stamps`]).
+    pub lower_batches: Vec<B256>,
+    /// Days a lower batch must outlive the slices it stamps (default 7; for uploading only).
+    pub grace_days: Option<u64>,
+    /// Seconds per block of the chain, for lifetimes (default 12; for uploading only).
+    pub slot_secs: Option<u64>,
     /// Write to this directory instead of uploading (`addr-upload` uploads it later).
     pub out: Option<PathBuf>,
     /// Merges of this level and above are built in the background.
@@ -273,7 +282,10 @@ pub struct ImportOptions {
 /// the order they would be uploaded.
 #[derive(Clone)]
 enum Sink {
-    Bee { bee: Bee, batch: B256 },
+    Bee {
+        bee: Bee,
+        stamps: std::sync::Arc<Stamps>,
+    },
     Dir(std::sync::Arc<std::sync::Mutex<ExportLog>>),
 }
 
@@ -300,6 +312,8 @@ struct Ctx<P> {
     _sort_lock: std::sync::Arc<std::fs::File>,
     /// Bytes of one sort buffer (a background merge and a unit can each hold one).
     sort_buffer: usize,
+    /// Spill files above this many bytes are uploaded chunk by chunk as they are written.
+    stream_file: usize,
 }
 
 /// Sets a build's cancel flag when dropped.
@@ -309,6 +323,14 @@ impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Where a SOC goes: a batch already chosen, or the batch (for an export: the lifetime) for
+/// a record that must live this many more units (`None`: permanently).
+#[derive(Clone, Copy)]
+enum Stamp {
+    Batch(B256),
+    Life(Option<u64>),
 }
 
 /// The last block of a published slice.
@@ -322,14 +344,21 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
     /// [`SliceBuilder`] (sort runs on disk under the sort directory), then every file and
     /// bucket goes to the sink as it is made, the descriptor last. With `parent`, the slice's
     /// first block must be its child; with `end`, its last block must be that one. Both are
-    /// checked before anything is published.
+    /// checked before anything is published. `head_units` is the head's unit count when the
+    /// slice is written: with the slice's grid position, it fixes how long its records must
+    /// live ([`stamps::life_units`]).
     async fn publish(
         &self,
         slice: SliceId,
         parent: Option<B256>,
         end: Option<B256>,
+        head_units: u64,
     ) -> Result<Published> {
         check_level(slice, self.first_unit, self.max_level)?;
+        let life = stamps::life_units(slice, head_units);
+        // The batch is chosen when the first record is ready to upload, after the blocks are
+        // fetched (hours, for a large slice): its TTL is then as current as it can be.
+        let mut batch: Option<B256> = None;
         let (level, index) = slice;
         let mut builder = SliceBuilder::new(
             slice,
@@ -337,7 +366,8 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
             role::mask(self.traces),
             &self.sort_dir,
             self.sort_buffer,
-        )?;
+        )?
+        .with_stream_file(self.stream_file);
         let (first, last) = (
             held_first_block(level, index, self.first_unit),
             last_block(level, index),
@@ -394,7 +424,10 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
         while let Some(out) = rx.recv().await {
             match (&self.sink, out) {
                 (Sink::Dir(log), Output::File(reference, file)) => {
-                    lock(log)?.append(export::FILE, &reference, &file)?
+                    lock(log)?.append(export::FILE, &reference, life, &file)?
+                }
+                (Sink::Dir(log), Output::Chunk(address, wire)) => {
+                    lock(log)?.append(export::CHUNK, &address, life, &wire)?
                 }
                 (Sink::Dir(log), Output::Bucket(k, payload)) => {
                     let soc = soc::sign(
@@ -402,19 +435,31 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
                         bucket_id(self.chain_id, level, index, k),
                         payload,
                     )?;
-                    lock(log)?.append_soc(export::SOC, &owner, &soc)?
+                    lock(log)?.append_soc(export::SOC, &owner, life, &soc)?
                 }
-                (Sink::Bee { bee, batch }, out) => {
+                (Sink::Bee { bee, stamps }, out) => {
                     if set.len() >= limit {
                         join_one(&mut set).await?;
                     }
-                    let (bee, batch) = (bee.clone(), *batch);
+                    let batch = match batch {
+                        Some(b) => b,
+                        None => *batch.insert(stamps.batch_for(life).await?),
+                    };
+                    let bee = bee.clone();
                     match out {
                         Output::File(reference, file) => set.spawn(async move {
                             let got = bee.upload_file(&batch, file).await?;
                             ensure!(
                                 got == reference,
                                 "Bee stored a file under {got}, the bucket names {reference}"
+                            );
+                            Ok(())
+                        }),
+                        Output::Chunk(address, wire) => set.spawn(async move {
+                            let got = bee.upload_chunk(&batch, wire).await?;
+                            ensure!(
+                                got == address,
+                                "Bee stored a chunk under {got}, it hashes to {address}"
                             );
                             Ok(())
                         }),
@@ -439,6 +484,7 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
             export::SOC,
             slice_id(self.chain_id, level, index),
             built.record.encode(),
+            batch.map_or(Stamp::Life(life), Stamp::Batch),
         )
         .await?;
         Ok(Published {
@@ -447,26 +493,44 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
         })
     }
 
-    /// Uploads one SOC; `kind` says, for an export, whether it is a head ([`export::HEAD`]).
-    async fn upload_soc(&self, kind: u8, id: B256, payload: Vec<u8>) -> Result<()> {
+    /// Uploads one SOC; `kind` says, for an export, whether it is a head ([`export::HEAD`]),
+    /// `stamp` which batch it goes to (or, for an export, how long it must live).
+    async fn upload_soc(&self, kind: u8, id: B256, payload: Vec<u8>, stamp: Stamp) -> Result<()> {
         let soc = soc::sign(&self.signer, id, payload)?;
         let owner = self.signer.address();
-        match &self.sink {
-            Sink::Bee { bee, batch } => {
-                bee.upload_soc(batch, &owner, &soc).await?;
+        match (&self.sink, stamp) {
+            (Sink::Bee { bee, .. }, Stamp::Batch(batch)) => {
+                bee.upload_soc(&batch, &owner, &soc).await?;
             }
-            Sink::Dir(log) => lock(log)?.append_soc(kind, &owner, &soc)?,
+            (Sink::Bee { bee, stamps }, Stamp::Life(life)) => {
+                let batch = stamps.batch_for(life).await?;
+                bee.upload_soc(&batch, &owner, &soc).await?;
+            }
+            (Sink::Dir(log), Stamp::Life(life)) => {
+                lock(log)?.append_soc(kind, &owner, life, &soc)?
+            }
+            (Sink::Dir(_), Stamp::Batch(_)) => bail!("an export has no batches"),
         }
         Ok(())
     }
 
     async fn publish_head(&self, n: u64, head: &HeadRecord) -> Result<()> {
         let payload = head.encode();
-        self.upload_soc(export::HEAD, head_id(self.chain_id, n), payload.clone())
-            .await?;
+        self.upload_soc(
+            export::HEAD,
+            head_id(self.chain_id, n),
+            payload.clone(),
+            Stamp::Life(None),
+        )
+        .await?;
         if n == 0 {
-            self.upload_soc(export::HEAD, origin_id(self.chain_id), payload)
-                .await?;
+            self.upload_soc(
+                export::HEAD,
+                origin_id(self.chain_id),
+                payload,
+                Stamp::Life(None),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -508,7 +572,10 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
     /// Builds and uploads a deferred merge. It must continue the published chain (`before`,
     /// the hash of the unit before it) and end on it (`end`, the hash of its last unit).
     async fn merge(&self, slice: SliceId, end: B256, before: Option<B256>) -> Result<SliceId> {
-        self.publish(slice, before, Some(end)).await?;
+        // Built while the head moves on: its own end is the earliest head it is written at,
+        // which makes the lifetime the longest it can need.
+        let at = units(slice).end;
+        self.publish(slice, before, Some(end), at).await?;
         info!(level = slice.0, index = slice.1, "deferred merge uploaded");
         Ok(slice)
     }
@@ -655,6 +722,10 @@ pub struct Summary {
     pub chain_id: u64,
     pub units: u64,
     pub head_index: u64,
+    /// Slices and heads per batch this run stamped (empty for an export).
+    pub batches: BTreeMap<B256, u64>,
+    /// Lower slices that went to the permanent batch: no lower batch lived long enough.
+    pub fell_back: u64,
 }
 
 /// Imports up to the target unit count (or, with `follow`, keeps importing), resuming from the
@@ -734,8 +805,12 @@ where
     let sink = match (&opts.out, existing.as_ref().map(|s| s.export_len)) {
         (Some(out), None | Some(Some(_))) => {
             ensure!(
-                opts.batch.is_none(),
-                "--batch is for uploading; an export takes it at addr-upload"
+                opts.batch.is_none()
+                    && opts.lower_batches.is_empty()
+                    && opts.grace_days.is_none()
+                    && opts.slot_secs.is_none(),
+                "--batch, --lower-batch, --grace-days and --slot-secs are for uploading; an \
+                 export takes them at addr-upload"
             );
             let meta = ExportMeta::new(chain_id, signer.address());
             let resume = existing.as_ref().and_then(|s| s.export_len);
@@ -743,13 +818,33 @@ where
                 out, &meta, resume,
             )?)))
         }
-        (None, None | Some(None)) => Sink::Bee {
-            bee: bee.clone(),
-            batch: match opts.batch {
+        (None, None | Some(None)) => {
+            let permanent = match opts.batch {
                 Some(b) => b,
-                None => bee.usable_batch().await?,
-            },
-        },
+                None => {
+                    // With lower batches, the node's "first usable batch" may well be a short
+                    // one: the permanent records must not land there by accident.
+                    ensure!(
+                        opts.lower_batches.is_empty(),
+                        "--lower-batch needs the permanent batch named with --batch"
+                    );
+                    bee.usable_batch().await?
+                }
+            };
+            Sink::Bee {
+                bee: bee.clone(),
+                stamps: std::sync::Arc::new(
+                    Stamps::open(
+                        bee.clone(),
+                        permanent,
+                        opts.lower_batches.clone(),
+                        opts.grace_days.unwrap_or(stamps::GRACE_DAYS),
+                        opts.slot_secs.unwrap_or(stamps::SLOT_SECS),
+                    )
+                    .await?,
+                ),
+            }
+        }
         (Some(_), Some(None)) => bail!(
             "the index in {} uploads to a Bee node; it cannot switch to --out",
             dir.display()
@@ -759,6 +854,17 @@ where
              addr-upload)",
             dir.display()
         ),
+    };
+    let stream_file = match (&sink, std::env::var("ETH2SWARM_ADDR_STREAM_FILE_BYTES")) {
+        // An export started before layout 3 has no chunk records: its spill files stay whole
+        // (and stay within MAX_FILE).
+        (Sink::Dir(log), _) if lock(log)?.format() < 3 => usize::MAX,
+        // Test hook: a small value makes a dev chain's busy address go through the chunked
+        // path (`scripts/e2e-bee-factory.sh`).
+        (_, Ok(v)) => v
+            .parse()
+            .with_context(|| format!("ETH2SWARM_ADDR_STREAM_FILE_BYTES={v}"))?,
+        (_, Err(_)) => STREAM_FILE,
     };
     let ctx = Ctx {
         provider: provider.clone(),
@@ -779,6 +885,7 @@ where
                 .with_context(|| format!("ETH2SWARM_ADDR_SORT_BUFFER_BYTES={v}"))?,
             Err(_) => opts.sort_buffer,
         },
+        stream_file,
     };
 
     let mut state = match existing {
@@ -868,11 +975,17 @@ where
         merges.collect(&ctx, &mut state, true).await?;
         ctx.save(&mut state, dir)?;
     }
+    let (batches, fell_back) = match &ctx.sink {
+        Sink::Bee { stamps, .. } => (stamps.used(), stamps.fell_back()),
+        Sink::Dir(_) => (BTreeMap::new(), 0),
+    };
     Ok(Summary {
         owner: signer.address(),
         chain_id,
         units: state.units,
         head_index: state.head_index(),
+        batches,
+        fell_back,
     })
 }
 
@@ -896,7 +1009,7 @@ async fn import_unit<P: Provider + Clone + 'static>(
             .with_context(|| format!("publishing unit {}", n - 1))?;
     }
     let parent = state.parent_of(held(now, state.first_unit).start)?;
-    let f = ctx.publish(now, parent, None).await?;
+    let f = ctx.publish(now, parent, None, n).await?;
     state.unit_hashes.insert(n - 1, f.last_hash);
     if let Some(merge) = deferred {
         // Backpressure: not more than MAX_PENDING_MERGES listed at a time.
@@ -965,7 +1078,7 @@ async fn backfill<P: Provider + Clone + 'static>(
     let (mut parent, mut last) = (None, None);
     for s in slices {
         info!(level = s.0, index = s.1, "backfill");
-        let f = ctx.publish(s, parent, None).await?;
+        let f = ctx.publish(s, parent, None, target).await?;
         failpoint("backfill-slice")?;
         parent = Some(f.last_hash);
         state.unit_hashes.insert(units(s).end - 1, f.last_hash);

@@ -1110,19 +1110,15 @@ async fn addr_spill_inspect(st: &AppState, q: AddrQuery) -> Result<Value> {
         check_exists(s, &origin)?;
         let rec = r.slice(s, origin.first_unit).await?;
         out["slice"] = slice_json(&rec);
-        let entries = r.spill_entries(&rec, &spill_ref, count).await?;
-        // Newest first, as the lookup lists them: the file holds them oldest first.
+        // Newest first, as the lookup lists them (the file holds them oldest first). A file
+        // too large to read whole is read from its last page backwards, as a client would.
+        let (newest, whole) = r.spill_newest(&rec, &spill_ref, count, p.limit).await?;
         out["spillRef"] = json!(spill_ref);
-        out["count"] = json!(entries.len());
-        out["shown"] = json!(entries.len().min(p.limit));
-        out["entries"] = json!(
-            entries
-                .iter()
-                .rev()
-                .take(p.limit)
-                .map(entry_json)
-                .collect::<Vec<_>>()
-        );
+        // The record's count; with `readWhole` false only the newest pages were read.
+        out["count"] = json!(count);
+        out["shown"] = json!(newest.len());
+        out["readWhole"] = json!(whole);
+        out["entries"] = json!(newest.iter().map(entry_json).collect::<Vec<_>>());
         Ok(())
     })
     .await

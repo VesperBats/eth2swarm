@@ -45,6 +45,33 @@ struct Cli {
 }
 
 /// Where a client finds data on Swarm.
+/// How uploads are stamped (`addr-import`, `addr-upload`; see `docs/address-index.md`,
+/// "Lifetime").
+#[derive(clap::Args, Debug, Clone)]
+struct Stamping {
+    /// Postage batch ID for the permanent records: heads, the origin, top-level slices, and
+    /// everything without --lower-batch. Defaults to the batch of the earlier uploads of the
+    /// directory (addr-upload), else the Bee node's first usable batch; required with
+    /// --lower-batch.
+    #[arg(long)]
+    batch: Option<B256>,
+    /// A batch for the lower slices, which die once the head has passed them (repeatable).
+    /// Each lower slice goes to the one that expires soonest after the slice is dead plus
+    /// --grace-days, or to --batch if none lives that long. Batches are never bought or
+    /// topped up.
+    #[arg(long = "lower-batch")]
+    lower_batches: Vec<B256>,
+    /// Days a lower batch must outlive a slice (default 7): for clients holding an older
+    /// head, a deferred merge still being built (whose expansion stays in use meanwhile), the
+    /// importer being stopped, and for an export the time between two uploads.
+    #[arg(long)]
+    grace_days: Option<u64>,
+    /// Seconds per block of the chain (default 12, mainnet's slot time): how long a unit, and
+    /// so a lower slice's lifetime, lasts.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    slot_secs: Option<u64>,
+}
+
 #[derive(clap::Args)]
 struct Source {
     /// Address of the SOC owner (the importer's key).
@@ -96,9 +123,8 @@ enum Command {
         /// Also read `trace_block` (see `appearances`).
         #[arg(long)]
         traces: bool,
-        /// Postage batch ID. Defaults to the Bee node's first usable batch.
-        #[arg(long)]
-        batch: Option<B256>,
+        #[command(flatten)]
+        stamping: Stamping,
         /// Write everything to this directory instead of uploading it (no Bee node needed);
         /// `addr-upload` pushes it through a Bee node later. Every run of the index then
         /// passes the same directory. Keep it apart from --state.
@@ -107,10 +133,10 @@ enum Command {
         /// Merges of this level and above are built in the background.
         #[arg(long, default_value_t = 6)]
         defer_level: u8,
-        /// Highest slice level built. Memory is bounded by --sort-memory-mb except for the
-        /// busiest address of a slice, whose entries and spill file are held whole: up to
-        /// level 12 (about a month) that stays in the hundreds of MB; above it a token
-        /// contract can need GBs and a spill file beyond what clients read (still open).
+        /// Highest slice level built. Memory is bounded by --sort-memory-mb at any level (a
+        /// busy address's spill file is written page by page, and above 1 MiB uploaded chunk
+        /// by chunk; an export started before layout 3 writes it whole and refuses one above
+        /// 256 MB); the cap bounds the time and the temporary disk one slice takes.
         #[arg(long, default_value_t = 12)]
         max_level: u8,
         /// Directory for the sort runs of the slice being built (default: --state); they go in
@@ -152,10 +178,8 @@ enum Command {
     AddrUpload {
         /// The export directory.
         dir: std::path::PathBuf,
-        /// Postage batch ID. Defaults to the batch of the earlier uploads of this directory,
-        /// else the Bee node's first usable batch.
-        #[arg(long)]
-        batch: Option<B256>,
+        #[command(flatten)]
+        stamping: Stamping,
         /// Records uploaded in parallel (between two heads).
         #[arg(long, default_value_t = 16)]
         concurrency: usize,
@@ -233,8 +257,8 @@ enum Command {
     Appearances {
         /// Block number.
         number: u64,
-        /// Also read `trace_block` (Erigon, Reth, Anvil; not geth): internal calls,
-        /// self-destructs, rewards, and words in internal calls' input and output.
+        /// Also read `trace_block` (Erigon, Reth, Anvil; not geth): the addresses of every call
+        /// frame, creations, self-destructs and rewards (no words from trace data).
         #[arg(long)]
         traces: bool,
     },
@@ -363,7 +387,7 @@ async fn main() -> Result<()> {
             init,
             from_block,
             traces,
-            batch,
+            stamping,
             out,
             defer_level,
             max_level,
@@ -378,7 +402,10 @@ async fn main() -> Result<()> {
                 init,
                 from_block,
                 traces,
-                batch,
+                batch: stamping.batch,
+                lower_batches: stamping.lower_batches,
+                grace_days: stamping.grace_days,
+                slot_secs: stamping.slot_secs,
                 out,
                 defer_level,
                 max_level,
@@ -391,6 +418,7 @@ async fn main() -> Result<()> {
                 "Address index of owner {} on chain {}: {} units, head update {}",
                 s.owner, s.chain_id, s.units, s.head_index
             );
+            print_batches(&s.batches, s.fell_back, "slices and heads", "lower slices");
         }
         Command::DevnetActivity {
             key,
@@ -420,15 +448,27 @@ async fn main() -> Result<()> {
         }
         Command::AddrUpload {
             dir,
-            batch,
+            stamping,
             concurrency,
             from_start,
         } => {
-            let s = addr::export::upload(&bee, batch, &dir, concurrency, from_start).await?;
+            let batches = addr::export::Batches {
+                permanent: stamping.batch,
+                lower: stamping.lower_batches,
+                grace_days: stamping.grace_days.unwrap_or(addr::stamps::GRACE_DAYS),
+                slot_secs: stamping.slot_secs.unwrap_or(addr::stamps::SLOT_SECS),
+            };
+            let s = addr::export::upload(&bee, batches, &dir, concurrency, from_start).await?;
             println!(
-                "Uploaded the export of owner {} on chain {}: {} files, {} SOCs, {} heads \
-                 ({} of {} bytes)",
-                s.owner, s.chain_id, s.files, s.socs, s.heads, s.offset, s.committed
+                "Uploaded the export of owner {} on chain {}: {} files, {} chunks of large \
+                 files, {} SOCs, {} heads ({} of {} bytes)",
+                s.owner, s.chain_id, s.files, s.chunks, s.socs, s.heads, s.offset, s.committed
+            );
+            print_batches(
+                &s.batches,
+                s.fell_back,
+                "records",
+                "records of lower slices",
             );
         }
         Command::AddrLookup {
@@ -829,4 +869,22 @@ where
         println!("Matches the chain: every entry is on it, none is missing.");
     }
     Ok(())
+}
+
+/// The batches a run stamped with, and how many lower-slice items fell back to the permanent
+/// batch.
+fn print_batches(
+    batches: &std::collections::BTreeMap<B256, u64>,
+    fell_back: u64,
+    what: &str,
+    lower: &str,
+) {
+    for (b, n) in batches {
+        println!("  batch {b}: {n} {what}");
+    }
+    if fell_back > 0 {
+        println!(
+            "  {fell_back} {lower} went to the permanent batch: no --lower-batch lived long enough"
+        );
+    }
 }
