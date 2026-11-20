@@ -2,9 +2,10 @@
 //!
 //! The rules are normative (`docs/address-index.md`, "Detection rules"): independent
 //! importers must find exactly the same appearances. They are a superset of TrueBlocks'
-//! (`trueblocks-chifra`, `pkg/uniq`): the same trace, receipt, withdrawal and miner sources
-//! with the same address-shaped-word heuristic, plus log emitters, known token events
-//! regardless of value, and EIP-7702 authorities.
+//! (`trueblocks-chifra`, `pkg/uniq`) with three exceptions (the doc lists them; one is that
+//! trace data is not scanned for words): the same trace, receipt, withdrawal and miner
+//! sources with the same address-shaped-word heuristic on transaction input and logs, plus
+//! log emitters, known token events regardless of value, and EIP-7702 authorities.
 //!
 //! [`detect`] is pure: [`BlockData`] holds what the RPC delivered (see `super::fetch`).
 
@@ -615,7 +616,7 @@ mod tests {
     fn traces_from_parity_json() {
         let json = r#"[
           {"action":{"from":"0x1111111111111111111111111111111111111111","to":"0x3333333333333333333333333333333333333333","input":"0xa9059cbb","callType":"call","gas":"0x0","value":"0x0"},
-           "result":{"gasUsed":"0x0","output":"0x"},"traceAddress":[],"transactionPosition":0,"type":"call"},
+           "result":{"gasUsed":"0x0","output":"0x000000000000000000000000abababababababababababababababababababab"},"traceAddress":[],"transactionPosition":0,"type":"call"},
           {"action":{"from":"0x3333333333333333333333333333333333333333","to":"0x4444444444444444444444444444444444444444","input":"0x12345678000000000000000000000000555555555555555555555555555555555555555500","callType":"delegatecall"},
            "result":{"output":"0x0000000000000000000000006666666666666666666666666666666666666666"},"traceAddress":[0],"transactionPosition":0,"type":"call"},
           {"action":{"address":"0x4444444444444444444444444444444444444444","refundAddress":"0x7777777777777777777777777777777777777777","balance":"0x1"},
@@ -645,8 +646,12 @@ mod tests {
             find(&apps, x("4444444444444444444444444444444444444444"), 1),
             Some(TRACE)
         );
-        // Words in an internal call's input and output are not indexed: traces add only the
-        // frames' own addresses.
+        // Words in trace data are not indexed, the top-level call's return data included:
+        // traces add only the frames' own addresses.
+        assert_eq!(
+            find(&apps, x("abababababababababababababababababababab"), 1),
+            None
+        );
         assert_eq!(
             find(&apps, x("5555555555555555555555555555555555555555"), 1),
             None

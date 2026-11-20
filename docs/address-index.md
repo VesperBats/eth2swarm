@@ -97,15 +97,18 @@ block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. The e
 - TrueBlocks indexes the **genesis allocations** as block 0, from a per-chain `allocs.csv`.
   Genesis state is not in any block, so this detection does not see it; see *Open
   questions*.
-- TrueBlocks also scans the **input and output of internal calls** for address-shaped words.
-  Here traces add only the addresses of the call frames themselves (`TRACE`): that is the
-  set an archive node keeps an index of (Erigon 3's `tracesfrom` and `tracesto`, keyed by
-  transaction), so a full history with traces can be imported from it in days instead of
-  re-executing every block (owner decision, 2026-11-20). That the two sets match exactly is
-  proven by comparing them block by block before the index is used (part 12 of the importer
-  plan; *Open questions*, tracer edge cases). An address that occurs only inside internal call data (a
-  recipient a router passes on without calling it, an address a factory returns) is
-  therefore not indexed.
+- TrueBlocks also scans the **input and output of every trace** (internal calls, and the
+  top-level call's return data) for address-shaped words. Here traces add only the addresses
+  of the call frames themselves (`TRACE`): that is expected to be the set an archive node
+  keeps an index of (Erigon 3's `tracesfrom` and `tracesto`, keyed by transaction), so a
+  full history with traces could be imported from it in days instead of re-executing every
+  block (owner decision, 2026-11-20). That the two sets match has to be shown, block by
+  block, before the index is used (#8, part 12); failed creations are a known case where
+  they may not (*Open questions*). An address that occurs only in trace data (a recipient a
+  router passes on without calling it, an address a factory returns) is therefore not
+  indexed. Unlike the other two, this exception cannot be filtered out of TrueBlocks' index
+  by itself, which records no reason per appearance: telling such an appearance from a
+  missed one needs the transaction's traces and the word scan this rule no longer makes.
 
 - *Address-shaped* (TrueBlocks' "implicit address"): a 32-byte word whose first 12 bytes
   are zero, whose value is at least 2^104 (one of bytes 12–18 is non-zero, so an address
@@ -144,8 +147,8 @@ block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. The e
   - the words of every log's data at offset 0;
   - the code address of every EIP-7702 authorization, whatever its value.
 
-  Traces add no words: the input and output of internal calls are not scanned (see the
-  exceptions above).
+  Traces add no words: the input and output of traces are not scanned, the top-level call's
+  return data included (see the exceptions above).
 - `AUTH`: the authority of an entry in the authorization list of a type-4 transaction. An
   entry counts if `y_parity ∈ {0, 1}`, `0 < r < n`, `0 < s ≤ n/2` (`n` the secp256k1 group
   order) and `ecrecover(keccak256(0x05 ‖ rlp([chain_id, address, nonce])), y_parity, r, s)`
@@ -841,10 +844,11 @@ receipts on top for log roles.
 
 ## Open questions
 
-- **Relation source.** Without traces (`TRACE`) internal ETH transfers are missing. Our geth
-  node has full history but not archive state, so it cannot trace historical blocks.
-  Options: TrueBlocks' published index for history plus a tracing client (Erigon, Reth) for
-  new blocks.
+- **Relation source.** Without traces (`TRACE`) internal ETH transfers are missing. nuc now
+  runs an Erigon v3.8.1 archive node, but `trace_block` manages only about 1–2 blocks/s
+  there, most of a year for the whole history. The plan is Erigon's own index of call-frame
+  addresses (#8, part 12). TrueBlocks' published index cannot be the source under the
+  current rules: it holds the words of trace data, without marking them.
 - **Where the blocks come from.** The index does not care: an entry is (block, slot). Since
   2025 execution clients can drop pre-merge bodies and receipts, and many nodes do, while
   post-merge history is still served over devp2p; eth/69 announces each peer's earliest available block, so a
@@ -863,12 +867,24 @@ receipts on top for log roles.
   accumulator to a Merkle Mountain Range (the same doubling scheme) would remove the
   "extending the range changes the anchor" limitation.
 - **Tracer-dependent edge cases.** `TRACE` is defined by an RPC format, not by the EVM, and
-  tracers differ at the edges: whether a call that fails before it executes (insufficient
-  balance, the depth limit) gets a frame, and frames of precompile calls (precompiles are
-  below `0x…ffff` and never indexed, so only the first matters). Identical slices across
-  importers need these cases written into the rules, or the tracer named as part of them.
-  To be settled by comparing Erigon's trace index with `trace_block` on the same blocks
-  (part 12 of the importer plan).
+  tracers differ at the edges:
+  - whether a call that fails before it executes (insufficient balance, the depth limit)
+    gets a frame;
+  - **failed creations**: a Parity-style trace of a creation that fails has `result: null`
+    (one that reverts keeps `result.address` with Erigon and Reth, as far as known), so the
+    address it aimed at is not in the `trace_block` answer, while a frame index records it
+    whatever the outcome. A failed top-level deployment would then be `TO` from
+    `trace_block` and `TO | TRACE` from the index. Either the rule takes every creation
+    frame's address whatever its outcome (and `trace_block` can no longer produce the set
+    for internal creations: it has no nonce or salt), or the import needs each creation's
+    outcome, which the index does not hold;
+  - frames of precompile calls (precompiles are below `0x…ffff` and never indexed, so
+    this matters only where it changes another address's frame, such as a failed creation).
+
+  Comparing Erigon's index with Erigon's `trace_block` (#8, part 12) shows where the two
+  differ on one client. It does not settle what Reth or Nethermind trace; that needs the
+  cases written into the rules, or a tracer (for example Erigon's frame tracer) named as
+  part of them. Owner decision once the comparison has the data.
 - **Genesis allocations.** TrueBlocks indexes the prefunded addresses of the genesis
   state at block 0 (about 8,900 on mainnet). Adding them needs the allocation list as an
   input (it is not in any block), and a convention for its slots.
