@@ -319,8 +319,9 @@ where
     );
     let last = head.last_block();
     let mut last_hash = None;
-    // TRACE as the index detects it: from a frame index if one is given (exact under rule
-    // (A)), else from `trace_block` (which misses the target of a failed internal creation).
+    // TRACE as the index detects it: from a frame index if one is given (exact for the
+    // `TRACE` rule), else from `trace_block` (which misses the target of a failed internal
+    // creation).
     let traces = match (found.roles & super::detect::role::TRACE != 0, trace_index) {
         (false, None) => Traces::Off,
         (false, Some(_)) => anyhow::bail!(

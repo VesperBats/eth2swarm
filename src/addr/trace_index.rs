@@ -96,6 +96,25 @@ impl TraceIndex {
         self.files.iter().map(|f| f.first..=f.last).collect()
     }
 
+    /// The last block of the coverage that starts at `start` and has no gap (files that
+    /// adjoin count as one); `None` if no file covers `start`.
+    pub fn covered_until(&self, start: u64) -> Option<u64> {
+        let mut i = self
+            .files
+            .iter()
+            .position(|f| (f.first..=f.last).contains(&start))?;
+        let mut end = self.files[i].last;
+        while self
+            .files
+            .get(i + 1)
+            .is_some_and(|f| Some(f.first) == end.checked_add(1))
+        {
+            i += 1;
+            end = self.files[i].last;
+        }
+        Some(end)
+    }
+
     /// The index's entry for block `n`; an error if no file covers it.
     pub fn block(&self, n: u64) -> Result<IndexedBlock> {
         let Some(f) = self.files.iter().find(|f| (f.first..=f.last).contains(&n)) else {
@@ -203,6 +222,14 @@ impl IndexFile {
         while i < self.records {
             let (block, tx, addr) = self.record(i)?;
             if block != n {
+                // The binary search trusts the order: a smaller block here means it is broken,
+                // and frames of this block may lie beyond.
+                ensure!(
+                    block > n,
+                    "{}: record {i} is for block {block} after records for block {n} (records \
+                     not ascending)",
+                    self.path.display()
+                );
                 break;
             }
             ensure!(
@@ -268,33 +295,151 @@ pub(crate) mod tests {
         d
     }
 
+    /// The bytes `tools/erigon-trace-export`'s `TestA1TRLayout` requires of the writer: blocks
+    /// 1..=2 of chain 1 with hashes 0x01…/0x02… and 6 transactions each, source "x", and one
+    /// record (block 2, transaction 5, 0xaa00…07).
+    const GOLDEN: &str = include_str!("../../tools/erigon-trace-export/testdata/a1tr-layout.hex");
+
+    fn golden() -> Vec<u8> {
+        let hex: String = GOLDEN.split_whitespace().collect();
+        alloy::primitives::hex::decode(hex).unwrap()
+    }
+
+    fn golden_hash(first: u8) -> B256 {
+        let mut h = B256::ZERO;
+        h.0[0] = first;
+        h
+    }
+
+    fn golden_address() -> Address {
+        let mut a = Address::ZERO;
+        a.0[0] = 0xaa;
+        a.0[19] = 7;
+        a
+    }
+
     #[test]
     fn the_writers_layout_reads_back() {
-        // The writer's golden layout (a1tr_test.go, TestA1TRLayout): blocks 1..=2, one
-        // record (2, 5, addr 7).
         let dir = tmp("layout");
-        let a = Address::repeat_byte(7);
-        let blocks = [(B256::repeat_byte(1), 3), (B256::repeat_byte(2), 6)];
-        let path = write(&dir, 1, 1, 2, &blocks, &[(2, 5, a)]);
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().len(),
-            38 + 1 + 2 * 36 + 32
-        );
+        std::fs::write(dir.join("trace-0000000001-0000000002.a1tr"), golden()).unwrap();
         let idx = TraceIndex::open(&dir, 1).unwrap();
         assert_eq!(idx.ranges(), vec![1..=2]);
         assert_eq!(
             idx.block(1).unwrap(),
             IndexedBlock {
-                hash: B256::repeat_byte(1),
-                tx_count: 3,
+                hash: golden_hash(1),
+                tx_count: 6,
                 frames: vec![]
             }
         );
-        assert_eq!(idx.block(2).unwrap().frames, vec![(5, a)]);
+        assert_eq!(
+            idx.block(2).unwrap(),
+            IndexedBlock {
+                hash: golden_hash(2),
+                tx_count: 6,
+                frames: vec![(5, golden_address())]
+            }
+        );
         assert!(idx.block(3).is_err(), "no file covers block 3");
         // Another chain is refused.
         assert!(TraceIndex::open(&dir, 5).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        // The test writer produces the same bytes.
+        let d2 = tmp("layout-writer");
+        let p = write(
+            &d2,
+            1,
+            1,
+            2,
+            &[(golden_hash(1), 6), (golden_hash(2), 6)],
+            &[(2, 5, golden_address())],
+        );
+        assert_eq!(std::fs::read(p).unwrap(), golden());
+        for d in [dir, d2] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn damaged_headers_and_directories_are_refused() {
+        let open = |name: &str, bytes: &[u8]| {
+            let d = tmp(name);
+            std::fs::write(d.join("trace-0000000001-0000000002.a1tr"), bytes).unwrap();
+            let r = TraceIndex::open(&d, 1)
+                .map(|_| ())
+                .map_err(|e| format!("{e:#}"));
+            let _ = std::fs::remove_dir_all(d);
+            r
+        };
+        assert_eq!(open("ok", &golden()), Ok(()));
+        let patched = |at: usize, with: &[u8]| {
+            let mut b = golden();
+            b[at..at + with.len()].copy_from_slice(with);
+            b
+        };
+        let err = |name: &str, bytes: Vec<u8>, says: &str| {
+            let e = open(name, &bytes).unwrap_err();
+            assert!(e.contains(says), "{name}: {e}");
+        };
+        err("magic", patched(0, b"A1TX"), "not an A1TR file");
+        err("version", patched(4, &[3]), "version 3");
+        // first 3 > last 2.
+        err(
+            "range",
+            patched(13, &3u64.to_be_bytes()),
+            "block range 3..=2",
+        );
+        // A record count whose size overflows, and a last block whose table does.
+        err("records", patched(29, &u64::MAX.to_be_bytes()), "overflow");
+        err("table", patched(21, &u64::MAX.to_be_bytes()), "overflow");
+        err("short header", golden()[..20].to_vec(), "header truncated");
+        // No file at all, and only files under other names.
+        let empty = tmp("empty");
+        std::fs::write(empty.join("notes.txt"), b"x").unwrap();
+        let e = TraceIndex::open(&empty, 1).unwrap_err();
+        assert!(format!("{e:#}").contains("no trace-*.a1tr file"), "{e:#}");
+        let _ = std::fs::remove_dir_all(empty);
+    }
+
+    #[test]
+    fn records_out_of_order_are_refused() {
+        // A record of block 1 after one of block 2: the binary search for block 2 lands on
+        // its record and must not stop quietly at the stray one.
+        let dir = tmp("order");
+        let a = Address::repeat_byte(9);
+        write(
+            &dir,
+            1,
+            1,
+            2,
+            &[(B256::ZERO, 2); 2],
+            &[(1, 0, a), (2, 0, a), (1, 1, a)],
+        );
+        let idx = TraceIndex::open(&dir, 1).unwrap();
+        let e = idx.block(2).unwrap_err();
+        assert!(format!("{e:#}").contains("not ascending"), "{e:#}");
+        // Within a block, too.
+        let d2 = tmp("order-tx");
+        write(&d2, 1, 1, 1, &[(B256::ZERO, 2)], &[(1, 1, a), (1, 0, a)]);
+        let e = TraceIndex::open(&d2, 1).unwrap().block(1).unwrap_err();
+        assert!(format!("{e:#}").contains("not ascending"), "{e:#}");
+        for d in [dir, d2] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn coverage_runs_over_adjoining_files() {
+        let dir = tmp("coverage");
+        write(&dir, 1, 10, 19, &[(B256::ZERO, 0); 10], &[]);
+        write(&dir, 1, 20, 29, &[(B256::ZERO, 0); 10], &[]);
+        write(&dir, 1, 40, 49, &[(B256::ZERO, 0); 10], &[]);
+        let idx = TraceIndex::open(&dir, 1).unwrap();
+        assert_eq!(idx.covered_until(10), Some(29));
+        assert_eq!(idx.covered_until(25), Some(29));
+        assert_eq!(idx.covered_until(30), None);
+        assert_eq!(idx.covered_until(9), None);
+        assert_eq!(idx.covered_until(45), Some(49));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

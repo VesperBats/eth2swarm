@@ -158,7 +158,7 @@ block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. The e
   keeps importers on different libraries in agreement.
 - `BLOCK` (slot 0): the header's beneficiary, the beneficiary of every uncle, the address of
   every withdrawal, and with traces the `author` of every `reward` trace.
-- `TRACE`: the from and to of every call frame as it is entered, including the top-level one
+- `TRACE` (*the `TRACE` rule*): the from and to of every call frame as it is entered, including the top-level one
   and delegate and static calls, whatever the frame's outcome. For a creation, to is the
   address it creates, also when the creation fails (reverts, runs out of gas, or fails
   before it executes); for a self-destruct, from is the destroyed contract and to its
@@ -168,8 +168,14 @@ block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. The e
   - **An archive node's frame index** (`addr-import --trace-index <dir>`): A1TR files that
     `tools/erigon-trace-export` writes from Erigon's `tracesfrom`/`tracesto`. Exact for this
     rule. Every file must be for the chain imported, and every block's hash and
-    transaction count must match the block fetched; a block no file covers stops the
-    import.
+    transaction count must match the block fetched. Every transaction's top-level frame
+    must be there: its sender and its recipient (the created address for a creation) are
+    among the block's frames unless they are never indexed, which rules out a block whose
+    records are missing or cut short. The files must cover every block from the index's
+    first one to the run's target without a gap, checked before anything is fetched (the
+    error names the first uncovered block and the largest `--units` the files allow);
+    `--follow` is refused, since the files end where the export ended. Keep the files of
+    blocks already imported: a merge reads its range again.
   - **Parity-style `trace_block`** (Erigon, Reth, Anvil; not geth, `--traces`): from every
     trace `action.from` and `action.to`, the created contract (`result.address` of a
     `create`), and for a `suicide` `action.address` and `action.refundAddress`; for a
@@ -178,8 +184,8 @@ block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. The e
     creation (the trace has neither the nonce nor the salt), so it is exact only where no
     internal creation fails. `ethswarm trace-compare` lists where it and an index differ.
 
-  Traces cannot be verified without re-executing the block, so an importer that sets
-  `TRACE` checks the `trace_block` answer and **rejects the block** (publishes nothing for
+  Traces cannot be verified without re-executing the block, so an importer that reads
+  `trace_block` checks the answer and **rejects the block** (publishes nothing for
   it, and stops) unless:
   - every trace has type `call`, `create`, `suicide` or `reward`, and this block's
     `blockHash`;
@@ -859,9 +865,10 @@ receipts on top for log roles.
 
 - **Relation source.** Without traces (`TRACE`) internal ETH transfers are missing. nuc now
   runs an Erigon v3.8.1 archive node, but `trace_block` manages only about 1–2 blocks/s
-  there, most of a year for the whole history. The plan is Erigon's own index of call-frame
-  addresses (#8, part 12). TrueBlocks' published index cannot be the source under the
-  current rules: it holds the words of trace data, without marking them.
+  there, most of a year for the whole history. Settled by Erigon's own index of call-frame
+  addresses (#8, part 12): `tools/erigon-trace-export` writes it as A1TR files, which
+  `addr-import --trace-index` reads. TrueBlocks' published index cannot be the source
+  under the current rules: it holds the words of trace data, without marking them.
 - **Where the blocks come from.** The index does not care: an entry is (block, slot). Since
   2025 execution clients can drop pre-merge bodies and receipts, and many nodes do, while
   post-merge history is still served over devp2p; eth/69 announces each peer's earliest available block, so a

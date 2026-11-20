@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -108,6 +110,18 @@ func TestA1TRLayout(t *testing.T) {
 	want = append(want, a[:]...)
 	if !bytes.Equal(data, want) {
 		t.Fatalf("layout:\n got %x\nwant %x", data, want)
+	}
+	// The same bytes pin the reader: src/addr/trace_index.rs reads this file back.
+	text, err := os.ReadFile(filepath.Join("testdata", "a1tr-layout.hex"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	golden, err := hex.DecodeString(strings.Join(strings.Fields(string(text)), ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, golden) {
+		t.Fatalf("layout differs from testdata/a1tr-layout.hex:\n got %x\nwant %x", data, golden)
 	}
 }
 

@@ -730,6 +730,46 @@ async fn finalized_units(provider: &impl Provider) -> Result<(u64, u64)> {
     Ok(((finalized + 1) / UNIT_BLOCKS, finalized))
 }
 
+/// With `TRACE` from a frame index: refuses the run unless the files cover the blocks of
+/// units `first_unit..units` without a gap, before anything is fetched (a block found
+/// uncovered only when it is reached would end a backfill after days, and the next run would
+/// repeat it). `done` units are imported already: a smaller `--units` cannot help those.
+fn check_coverage(index: &TraceIndex, first_unit: u64, units: u64, done: u64) -> Result<()> {
+    let ranges: Vec<String> = index
+        .ranges()
+        .iter()
+        .map(|r| format!("{}..={}", r.start(), r.end()))
+        .collect();
+    info!(files = %ranges.join(", "), "trace index");
+    if units <= first_unit {
+        // Nothing to read; `backfill_slices` refuses an empty backfill.
+        return Ok(());
+    }
+    let (from, to) = (first_unit * UNIT_BLOCKS, units * UNIT_BLOCKS - 1);
+    let Some(end) = index.covered_until(from) else {
+        bail!(
+            "the trace index does not cover block {from}, where the index starts (its files \
+             cover {})",
+            ranges.join(", ")
+        );
+    };
+    if end >= to {
+        return Ok(());
+    }
+    let allowed = (end + 1) / UNIT_BLOCKS;
+    let hint = if allowed > first_unit && allowed >= done {
+        format!(", or pass --units {allowed} (the most the files allow)")
+    } else {
+        String::new()
+    };
+    bail!(
+        "this run reads blocks {from}..={to}, but the trace index covers them only up to block \
+         {end}: block {} is not covered. Export the missing blocks{hint}; the files of blocks \
+         already imported must stay, since merges read them again",
+        end + 1
+    )
+}
+
 /// How long `--follow` waits between looking for newly finalized units (one slot).
 const FOLLOW_POLL: std::time::Duration = std::time::Duration::from_secs(12);
 
@@ -784,6 +824,11 @@ where
     ensure!(
         !(opts.traces && opts.trace_index.is_some()),
         "--traces and --trace-index are two sources of TRACE: pass one"
+    );
+    ensure!(
+        !(opts.follow && opts.trace_index.is_some()),
+        "--follow cannot take TRACE from --trace-index: the files end where their export \
+         ended, and the next finalized unit would stop the run"
     );
     let traces = match &opts.trace_index {
         Some(d) => Traces::Index(std::sync::Arc::new(TraceIndex::open(d, chain_id)?)),
@@ -841,6 +886,12 @@ where
             first_unit
         }
     };
+    if let Traces::Index(index) = &traces {
+        // Every block the run can read: the backfill's (or a resumed one's), the new units',
+        // and the ranges merges read again, all from the first unit on.
+        let done = existing.as_ref().map_or(0, |s| s.units.max(s.n0));
+        check_coverage(index, first_unit, target.max(done), done)?;
+    }
     let (sort_dir, sort_lock) = sort_dir(&opts)?;
     let sink = match (&opts.out, existing.as_ref().map(|s| s.export_len)) {
         (Some(out), None | Some(Some(_))) => {
@@ -1148,6 +1199,38 @@ async fn backfill<P: Provider + Clone + 'static>(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn a_trace_index_must_cover_the_run() {
+        use super::super::trace_index::tests::write;
+        let dir = std::env::temp_dir().join(format!("a1tr-coverage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Units 2..10 in two adjoining files (blocks 128..=639), then a gap.
+        write(&dir, 1, 128, 383, &[(B256::ZERO, 0); 256], &[]);
+        write(&dir, 1, 384, 639, &[(B256::ZERO, 0); 256], &[]);
+        write(&dir, 1, 700, 767, &[(B256::ZERO, 0); 68], &[]);
+        let idx = TraceIndex::open(&dir, 1).unwrap();
+        let err = |first, units, done| {
+            format!(
+                "{:#}",
+                check_coverage(&idx, first, units, done).unwrap_err()
+            )
+        };
+        assert!(check_coverage(&idx, 2, 10, 0).is_ok());
+        assert!(check_coverage(&idx, 4, 10, 7).is_ok());
+        let e = err(2, 12, 0);
+        assert!(
+            e.contains("block 640 is not covered") && e.contains("--units 10"),
+            "{e}"
+        );
+        // Imported past the coverage already: a smaller --units cannot help.
+        let e = err(2, 12, 11);
+        assert!(e.contains("block 640") && !e.contains("--units"), "{e}");
+        let e = err(1, 5, 0);
+        assert!(e.contains("does not cover block 64"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_sort_directory_is_locked_and_only_our_leftovers_go() {

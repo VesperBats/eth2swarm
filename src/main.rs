@@ -126,8 +126,10 @@ enum Command {
         /// Read TRACE from an archive node's frame index instead: a directory of A1TR files
         /// written by tools/erigon-trace-export, exact under the TRACE rule (every frame at
         /// entry). Each file must be for this chain, and each block's hash and transaction
-        /// count must match the block fetched from --rpc.
-        #[arg(long, conflicts_with = "traces")]
+        /// count must match the block fetched from --rpc. The files must cover every block
+        /// from the index's start to --units without a gap (checked before anything is
+        /// fetched), and stay: merges read imported blocks again. Not with --follow.
+        #[arg(long, conflicts_with_all = ["traces", "follow"])]
         trace_index: Option<std::path::PathBuf>,
         #[command(flatten)]
         stamping: Stamping,

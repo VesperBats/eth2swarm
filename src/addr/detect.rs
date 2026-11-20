@@ -232,6 +232,26 @@ pub fn check_traces(
     Ok(())
 }
 
+/// The frame index's counterpart of [`check_traces`]: under the `TRACE` rule every
+/// transaction has its top-level frame, so its sender and its recipient (the created address
+/// for a creation) are among `frames` unless they are never indexed ([`ignored`]). This rules
+/// out a block whose records are missing or cut short; `frames` are ascending, as
+/// `super::trace_index` returns them.
+pub fn check_frames(block: &BlockData, frames: &[(u32, Address)]) -> Result<()> {
+    for (i, tx) in block.txs.iter().enumerate() {
+        let to = tx.to.unwrap_or_else(|| tx.sender.create(tx.nonce));
+        for (what, a) in [("sender", tx.sender), ("recipient", to)] {
+            if !ignored(&a) && frames.binary_search(&(i as u32, a)).is_err() {
+                bail!(
+                    "transaction {i}: the trace index has no frame for its {what} {a} (records \
+                     missing from the index?)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Addresses up to `0x…ffff` (the zero address, precompiles) are never indexed, as in
 /// TrueBlocks.
 pub fn ignored(address: &Address) -> bool {
@@ -367,7 +387,7 @@ pub fn detect_with_frames(block: &BlockData, frames: Option<&[(u32, Address)]>) 
         c.add(tx.sender, slot, FROM);
         let to = tx.to.unwrap_or_else(|| tx.sender.create(tx.nonce));
         c.add(to, slot, TO);
-        // Rule (A): a creation frame's target counts whatever the outcome. `trace_block` names
+        // The `TRACE` rule (docs/address-index.md): a creation frame's target counts whatever the outcome. `trace_block` names
         // it only for a creation that succeeded (`result.address`); for a top-level creation
         // it is known from the transaction itself.
         if block.traces.is_some() && tx.to.is_none() {
@@ -587,7 +607,7 @@ mod tests {
 
     #[test]
     fn a_creation_target_counts_as_trace_whatever_its_outcome() {
-        // Rule (A): with traces, a top-level creation's target is TRACE even when its trace
+        // The `TRACE` rule: with traces, a top-level creation's target is TRACE even when its trace
         // has no result (a failed creation): trace_block does not name it, the transaction
         // does.
         let sender = address!("0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0");
@@ -631,6 +651,38 @@ mod tests {
         // An address up to 0x…ffff is never indexed, from the index either.
         assert_eq!(find(&apps, Address::with_last_byte(1), 1), None);
         assert_eq!(apps.len(), 3, "one entry per (slot, address)");
+    }
+
+    #[test]
+    fn every_transaction_needs_its_top_level_frame() {
+        let sender = address!("0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0");
+        let created = sender.create(3);
+        let block = BlockData {
+            txs: vec![
+                TxData {
+                    sender,
+                    to: Some(Address::with_last_byte(4)),
+                    ..Default::default()
+                },
+                TxData {
+                    sender,
+                    nonce: 3,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        // A call to a precompile (never indexed) needs only its sender; a creation needs the
+        // created address, also when it failed.
+        let mut frames = vec![(0, sender), (1, sender), (1, created)];
+        frames.sort();
+        assert!(check_frames(&block, &frames).is_ok());
+        let e = check_frames(&block, &[(0, sender), (1, sender)]).unwrap_err();
+        assert!(e.to_string().contains("transaction 1"), "{e}");
+        assert!(e.to_string().contains("recipient"), "{e}");
+        assert!(check_frames(&block, &[]).is_err(), "an empty record set");
+        // A block without transactions needs no frames.
+        assert!(check_frames(&BlockData::default(), &[]).is_ok());
     }
 
     fn signed_auth(key: &PrivateKeySigner, target: Address) -> SignedAuthorization {

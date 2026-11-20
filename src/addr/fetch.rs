@@ -23,7 +23,8 @@ use std::collections::BTreeMap;
 use alloy::primitives::B256;
 
 use super::detect::{
-    Appearance, BlockData, LogData, Trace, TxData, check_traces, detect, detect_with_frames, role,
+    Appearance, BlockData, LogData, Trace, TxData, check_frames, check_traces, detect,
+    detect_with_frames, role,
 };
 use super::layout::{first_block, last_block};
 use super::slice::{BuiltSlice, SliceId, build_slice};
@@ -183,7 +184,7 @@ async fn fetch_with_retry<P: Provider>(
 }
 
 /// Where `TRACE` comes from: nowhere, `trace_block` (Erigon, Reth, Anvil), or an archive
-/// node's frame index (`super::trace_index`, the exact source under rule (A)).
+/// node's frame index (`super::trace_index`, exact for the `TRACE` rule of `docs/address-index.md`).
 #[derive(Debug, Clone, Default)]
 pub enum Traces {
     #[default]
@@ -205,7 +206,8 @@ impl Traces {
 }
 
 /// [`detect`] for a fetched block, `TRACE` from `traces`: an index's entry for the block must
-/// name the same block (hash) with the same number of transactions.
+/// name the same block (hash) with the same number of transactions, and hold every
+/// transaction's top-level frame ([`check_frames`]).
 fn detect_block(data: &BlockData, traces: &Traces) -> Result<Vec<Appearance>> {
     match traces {
         Traces::Index(index) => {
@@ -225,6 +227,7 @@ fn detect_block(data: &BlockData, traces: &Traces) -> Result<Vec<Appearance>> {
                 entry.tx_count,
                 data.txs.len()
             );
+            check_frames(data, &entry.frames).with_context(|| format!("block {}", data.number))?;
             Ok(detect_with_frames(data, Some(&entry.frames)))
         }
         _ => Ok(detect(data)),
@@ -343,13 +346,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let hash = B256::repeat_byte(5);
-        let inner = alloy::primitives::Address::repeat_byte(0x44);
-        write(&dir, 1, 7, 7, &[(hash, 1)], &[(7, 0, inner)]);
+        let (sender, to, inner) = (
+            Address::repeat_byte(0x22),
+            Address::repeat_byte(0x33),
+            Address::repeat_byte(0x44),
+        );
+        write(
+            &dir,
+            1,
+            7,
+            8,
+            &[(hash, 1), (B256::repeat_byte(8), 1)],
+            // Block 8's records lack the top-level frame's recipient.
+            &[(7, 0, sender), (7, 0, to), (7, 0, inner), (8, 0, sender)],
+        );
         let traces = Traces::Index(std::sync::Arc::new(TraceIndex::open(&dir, 1).unwrap()));
+        let tx = TxData {
+            sender,
+            to: Some(to),
+            ..Default::default()
+        };
         let data = BlockData {
             number: 7,
             hash,
-            txs: vec![TxData::default()],
+            txs: vec![tx.clone()],
             ..Default::default()
         };
         let apps = super::detect_block(&data, &traces).unwrap();
@@ -364,10 +384,21 @@ mod tests {
         };
         assert!(super::detect_block(&other, &traces).is_err());
         let more = BlockData {
-            txs: vec![TxData::default(), TxData::default()],
-            ..data
+            txs: vec![tx.clone(), tx],
+            ..data.clone()
         };
         assert!(super::detect_block(&more, &traces).is_err());
+        // Records cut short: refused, not imported as fewer frames.
+        let short = BlockData {
+            number: 8,
+            hash: B256::repeat_byte(8),
+            ..data
+        };
+        let e = super::detect_block(&short, &traces).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("no frame for its recipient"),
+            "{e:#}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
