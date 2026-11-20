@@ -1,5 +1,6 @@
 mod accumulator;
 mod chain;
+mod checkpoints;
 mod client;
 mod import;
 mod inspect;
@@ -59,6 +60,31 @@ struct Source {
 
 #[derive(Subcommand)]
 enum Command {
+    /// The hash of every 1024th block from genesis up to a finalized block (Myotis's
+    /// checkpoint table, its docs/ideas/deep-block-verification.md): every header is hashed
+    /// here and linked by parentHash down to the genesis hash; the node's hashes are never
+    /// used. Writes <out> (32 bytes per entry, entry i = block i·1024) and <out>.json, and
+    /// resumes from <out>.work after a stop.
+    CheckpointTable {
+        /// The table file to write.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// The block to walk down from (default: the node's finalized block).
+        #[arg(long, requires = "top_hash")]
+        top: Option<u64>,
+        /// The top block's hash, from a source you trust (a beacon-attested finalized block).
+        #[arg(long, requires = "top")]
+        top_hash: Option<B256>,
+        /// The network's genesis hash (default: mainnet's, on chain 1).
+        #[arg(long)]
+        genesis_hash: Option<B256>,
+        /// Chunks of 1024 headers fetched in parallel.
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+        /// After building, compare sampled entries with this node (another client).
+        #[arg(long)]
+        cross_check: Option<Url>,
+    },
     /// Show the connected chain and its current head.
     Tip,
     /// Print a summary of a single block.
@@ -139,6 +165,29 @@ async fn main() -> Result<()> {
     let bee = Bee::new(cli.bee.clone())?;
 
     match cli.command {
+        Command::CheckpointTable {
+            out,
+            top,
+            top_hash,
+            genesis_hash,
+            concurrency,
+            cross_check,
+        } => {
+            let meta = checkpoints::build(&checkpoints::Options {
+                rpc: cli.rpc.to_string(),
+                out: out.clone(),
+                top,
+                top_hash,
+                genesis: genesis_hash,
+                concurrency,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&meta)?);
+            if let Some(other) = cross_check {
+                let n = checkpoints::cross_check(&out, other.as_str(), 200).await?;
+                println!("Cross-checked {n} entries against {other}: all equal.");
+            }
+        }
         Command::Tip => {
             let chain_id = provider.get_chain_id().await.context("querying chain id")?;
             let block = provider
