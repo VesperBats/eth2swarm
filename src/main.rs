@@ -863,12 +863,12 @@ where
                 apps.extend(b.appearances);
                 txs += b.txs as u64;
                 let t = now();
+                run.count();
                 if let Some(line) = window.block(t) {
                     eprintln!("  window {}/{count}: {line}", k + 1);
                     // The run's line goes with the window's, on the same 30 s.
                     eprintln!("  whole run: {}", run.line(t));
                 }
-                run.block(t);
                 Ok(())
             },
         )

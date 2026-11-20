@@ -205,11 +205,12 @@ header's `receiptsRoot`. A receipt before Byzantium (mainnet block 4,370,000) ho
 state root after its transaction instead of a status, and the root covers it. Erigon 3
 answers such a receipt with a status and without that state root, so the check fails
 from its answer alone. `--receipts-rpc <url>` reads those blocks' receipts from a node
-that keeps the root, such as geth. Blocks, traces, the frame index and every later
-receipt still come from `--rpc`, and both nodes must be on the same chain. The node is set
-up once, before the first block is fetched: on a chain without blocks before Byzantium it is
-never contacted (a warning says the option has no effect); otherwise it must answer within a
-connect timeout, in a few attempts, or the run stops at once. Without the option, the
+that keeps the root, such as geth. Blocks, traces and every later receipt still come from
+`--rpc` (the frame index from `--trace-index`), and both nodes must be on the same chain. The
+node is set up once, when the first block before mainnet's Byzantium is to be fetched: a run
+that reads only later blocks never contacts it, and on a chain without blocks before
+Byzantium it is not contacted either (a warning says the option has no effect). Otherwise it
+must answer within a connect timeout, in a few attempts, or the run stops at once. Without the option, the
 failure says to pass it; from a `--receipts-rpc` node that drops the root too, it says that
 node will not do.
 

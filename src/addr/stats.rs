@@ -127,7 +127,6 @@ pub fn window_stats(
     Ok(out)
 }
 
-/// The window as a Markdown table, one row per level, averages per slice.
 /// Progress of an `addr-stats` run, for a line every [`Progress::EVERY`]: blocks done of the
 /// total, the rate since the start, and the time left at that rate.
 pub struct Progress {
@@ -148,6 +147,11 @@ impl Progress {
             started: now,
             last: now,
         }
+    }
+
+    /// Counts one block without reporting (a line is asked for with [`Self::line`]).
+    pub fn count(&mut self) {
+        self.done += 1;
     }
 
     /// Counts one block; a line when [`Self::EVERY`] has passed since the last one.
@@ -182,6 +186,7 @@ impl Progress {
     }
 }
 
+/// The window as a Markdown table, one row per level, averages per slice.
 pub fn render(w: &WindowStats) -> String {
     let blocks = w.last_block - w.first_block + 1;
     let pct = |n: u64| 100.0 * n as f64 / w.appearances.max(1) as f64;

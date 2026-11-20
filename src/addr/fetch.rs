@@ -72,7 +72,8 @@ pub fn set_receipts_rpc(url: alloy::transports::http::reqwest::Url) -> Result<()
         .map_err(|_| anyhow::anyhow!("--receipts-rpc is set already"))
 }
 
-/// Sets up `--receipts-rpc` once, before any block is fetched: asks `--rpc`'s chain, and on a
+/// Sets up `--receipts-rpc` once, when the first block before mainnet's Byzantium is to be
+/// fetched (later blocks never need it, on any chain): asks `--rpc`'s chain, and on a
 /// chain without blocks before Byzantium warns and never contacts the node. Otherwise connects
 /// (with a connect timeout) and checks that the node serves the same chain, a few attempts in
 /// all. Later calls return the result.
@@ -185,7 +186,13 @@ pub async fn fetch_block_data(
     number: u64,
     traces: bool,
 ) -> Result<BlockData> {
-    let early = prepare_early_receipts(provider).await?;
+    // No chain this tool knows has receipts with state roots from mainnet's Byzantium on, so a
+    // later block never needs (or contacts) the --receipts-rpc node.
+    let early = if number < MAINNET_BYZANTIUM {
+        prepare_early_receipts(provider).await?
+    } else {
+        None
+    };
     fetch_block_data_with(provider, early, number, traces).await
 }
 
@@ -442,9 +449,12 @@ where
     if next_spawn > end {
         return Ok(());
     }
-    // Set up --receipts-rpc once, before the tasks: its connect timeout and attempts then
-    // apply once, not under every block's retries.
-    prepare_early_receipts(provider).await?;
+    // Set up --receipts-rpc once, before the tasks, when the range has a block that may need
+    // it: its connect timeout and attempts then apply once, not under every block's retries.
+    // A range after Byzantium never contacts it.
+    if next_spawn < MAINNET_BYZANTIUM {
+        prepare_early_receipts(provider).await?;
+    }
     let mut next_emit = next_spawn;
     let mut waiting: BTreeMap<u64, BlockAppearances> = BTreeMap::new();
     let mut prev_hash: Option<B256> = None;
