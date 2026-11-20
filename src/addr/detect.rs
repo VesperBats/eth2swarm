@@ -232,6 +232,26 @@ pub fn check_traces(
     Ok(())
 }
 
+/// The frame index's counterpart of [`check_traces`]: under the `TRACE` rule every
+/// transaction has its top-level frame, so its sender and its recipient (the created address
+/// for a creation) are among `frames` unless they are never indexed ([`ignored`]). This rules
+/// out a block whose records are missing or cut short; `frames` are ascending, as
+/// `super::trace_index` returns them.
+pub fn check_frames(block: &BlockData, frames: &[(u32, Address)]) -> Result<()> {
+    for (i, tx) in block.txs.iter().enumerate() {
+        let to = tx.to.unwrap_or_else(|| tx.sender.create(tx.nonce));
+        for (what, a) in [("sender", tx.sender), ("recipient", to)] {
+            if !ignored(&a) && frames.binary_search(&(i as u32, a)).is_err() {
+                bail!(
+                    "transaction {i}: the trace index has no frame for its {what} {a} (records \
+                     missing from the index?)"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Addresses up to `0x…ffff` (the zero address, precompiles) are never indexed, as in
 /// TrueBlocks.
 pub fn ignored(address: &Address) -> bool {
@@ -340,6 +360,14 @@ impl Collector {
 /// All appearances in a block, ascending by (slot, address). The traces, if any, must have
 /// passed [`check_traces`].
 pub fn detect(block: &BlockData) -> Vec<Appearance> {
+    detect_with_frames(block, None)
+}
+
+/// [`detect`], with `TRACE` from an archive node's frame index instead of `block.traces`:
+/// `frames` are (transaction index, address) of every call frame at entry, as
+/// `super::trace_index` reads them (the caller has bound them to this block's hash and
+/// transaction count).
+pub fn detect_with_frames(block: &BlockData, frames: Option<&[(u32, Address)]>) -> Vec<Appearance> {
     use role::*;
     let mut c = Collector {
         block: block.number,
@@ -359,6 +387,12 @@ pub fn detect(block: &BlockData) -> Vec<Appearance> {
         c.add(tx.sender, slot, FROM);
         let to = tx.to.unwrap_or_else(|| tx.sender.create(tx.nonce));
         c.add(to, slot, TO);
+        // The `TRACE` rule (docs/address-index.md): a creation frame's target counts whatever the outcome. `trace_block` names
+        // it only for a creation that succeeded (`result.address`); for a top-level creation
+        // it is known from the transaction itself.
+        if block.traces.is_some() && tx.to.is_none() {
+            c.add(to, slot, TRACE);
+        }
         // Call data after the selector; for a creation the init code, scanned the same way
         // (as TrueBlocks does for top-level creations).
         for a in words(&tx.input, 4) {
@@ -422,6 +456,9 @@ pub fn detect(block: &BlockData) -> Vec<Appearance> {
         }
     }
 
+    for &(tx, address) in frames.unwrap_or_default() {
+        c.add(address, tx + 1, TRACE);
+    }
     c.finish()
 }
 
@@ -566,6 +603,86 @@ mod tests {
             ),
             Some(role::TO)
         );
+    }
+
+    #[test]
+    fn a_creation_target_counts_as_trace_whatever_its_outcome() {
+        // The `TRACE` rule: with traces, a top-level creation's target is TRACE even when its trace
+        // has no result (a failed creation): trace_block does not name it, the transaction
+        // does.
+        let sender = address!("0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0");
+        let created = address!("0xcd234a471b72ba2f1ccf0a70fcaba648a5eecd8d");
+        let block = |traces| BlockData {
+            number: 1,
+            txs: vec![TxData {
+                sender,
+                to: None,
+                nonce: 0,
+                ..Default::default()
+            }],
+            traces,
+            ..Default::default()
+        };
+        assert_eq!(
+            find(&detect(&block(Some(vec![]))), created, 1),
+            Some(role::TO | role::TRACE)
+        );
+        // Without traces, only TO.
+        assert_eq!(find(&detect(&block(None)), created, 1), Some(role::TO));
+    }
+
+    #[test]
+    fn index_frames_merge_with_the_other_roles() {
+        let sender = address!("0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0");
+        let inner = Address::repeat_byte(0x44);
+        let block = BlockData {
+            number: 9,
+            txs: vec![TxData {
+                sender,
+                to: Some(Address::repeat_byte(0x33)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let frames = [(0, sender), (0, inner), (0, Address::with_last_byte(1))];
+        let apps = detect_with_frames(&block, Some(&frames));
+        assert_eq!(find(&apps, sender, 1), Some(role::FROM | role::TRACE));
+        assert_eq!(find(&apps, inner, 1), Some(role::TRACE));
+        // An address up to 0x…ffff is never indexed, from the index either.
+        assert_eq!(find(&apps, Address::with_last_byte(1), 1), None);
+        assert_eq!(apps.len(), 3, "one entry per (slot, address)");
+    }
+
+    #[test]
+    fn every_transaction_needs_its_top_level_frame() {
+        let sender = address!("0x6ac7ea33f8831ea9dcc53393aaa88b25a785dbf0");
+        let created = sender.create(3);
+        let block = BlockData {
+            txs: vec![
+                TxData {
+                    sender,
+                    to: Some(Address::with_last_byte(4)),
+                    ..Default::default()
+                },
+                TxData {
+                    sender,
+                    nonce: 3,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        // A call to a precompile (never indexed) needs only its sender; a creation needs the
+        // created address, also when it failed.
+        let mut frames = vec![(0, sender), (1, sender), (1, created)];
+        frames.sort();
+        assert!(check_frames(&block, &frames).is_ok());
+        let e = check_frames(&block, &[(0, sender), (1, sender)]).unwrap_err();
+        assert!(e.to_string().contains("transaction 1"), "{e}");
+        assert!(e.to_string().contains("recipient"), "{e}");
+        assert!(check_frames(&block, &[]).is_err(), "an empty record set");
+        // A block without transactions needs no frames.
+        assert!(check_frames(&BlockData::default(), &[]).is_ok());
     }
 
     fn signed_auth(key: &PrivateKeySigner, target: Address) -> SignedAuthorization {

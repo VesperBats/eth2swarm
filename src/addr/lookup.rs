@@ -5,7 +5,7 @@ use alloy::primitives::{Address, B256, keccak256};
 use alloy::providers::Provider;
 use anyhow::{Context, Result, bail, ensure};
 
-use super::fetch::fetch_appearances;
+use super::fetch::{Traces, fetch_appearances};
 use super::layout::{
     AddressRecord, Entries, Entry, HeadRecord, MAX_UNITS, SliceRecord, UNIT_BLOCKS,
 };
@@ -306,6 +306,8 @@ pub async fn against_chain<P>(
     found: &Found,
     head: &HeadRecord,
     chain_id: u64,
+    trace_index: Option<&std::path::Path>,
+    concurrency: usize,
 ) -> Result<ChainCheck>
 where
     P: Provider + Clone + 'static,
@@ -317,24 +319,42 @@ where
     );
     let last = head.last_block();
     let mut last_hash = None;
-    let traces = found.roles & super::detect::role::TRACE != 0;
+    // TRACE as the index detects it: from a frame index if one is given (exact for the
+    // `TRACE` rule), else from `trace_block` (which misses the target of a failed internal
+    // creation).
+    let traces = match (found.roles & super::detect::role::TRACE != 0, trace_index) {
+        (false, None) => Traces::Off,
+        (false, Some(_)) => anyhow::bail!(
+            "--trace-index is for an index with TRACE; this one's slices detect no traces"
+        ),
+        (true, Some(d)) => Traces::Index(std::sync::Arc::new(
+            super::trace_index::TraceIndex::open(d, chain_id)?,
+        )),
+        (true, None) => Traces::Rpc,
+    };
     let mut chain = Vec::new();
-    fetch_appearances(provider, found.first_block..=last, traces, 16, |b| {
-        if b.number == last {
-            last_hash = Some(b.hash);
-        }
-        chain.extend(
-            b.appearances
-                .into_iter()
-                .filter(|a| a.address == address)
-                .map(|a| Entry {
-                    block: a.block,
-                    slot: a.slot,
-                    roles: a.roles,
-                }),
-        );
-        Ok(())
-    })
+    fetch_appearances(
+        provider,
+        found.first_block..=last,
+        &traces,
+        concurrency,
+        |b| {
+            if b.number == last {
+                last_hash = Some(b.hash);
+            }
+            chain.extend(
+                b.appearances
+                    .into_iter()
+                    .filter(|a| a.address == address)
+                    .map(|a| Entry {
+                        block: a.block,
+                        slot: a.slot,
+                        roles: a.roles,
+                    }),
+            );
+            Ok(())
+        },
+    )
     .await
     .context("detecting the range from the chain")?;
     ensure!(

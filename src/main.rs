@@ -123,6 +123,14 @@ enum Command {
         /// Also read `trace_block` (see `appearances`).
         #[arg(long)]
         traces: bool,
+        /// Read TRACE from an archive node's frame index instead: a directory of A1TR files
+        /// written by tools/erigon-trace-export, exact under the TRACE rule (every frame at
+        /// entry). Each file must be for this chain, and each block's hash and transaction
+        /// count must match the block fetched from --rpc. The files must cover every block
+        /// from the index's start to --units without a gap (checked before anything is
+        /// fetched), and stay: merges read imported blocks again. Not with --follow.
+        #[arg(long, conflicts_with_all = ["traces", "follow"])]
+        trace_index: Option<std::path::PathBuf>,
         #[command(flatten)]
         stamping: Stamping,
         /// Write everything to this directory instead of uploading it (no Bee node needed);
@@ -211,6 +219,15 @@ enum Command {
         /// or if --rpc serves another chain.
         #[arg(long)]
         against_chain: bool,
+        /// With --against-chain on an index with TRACE: take TRACE from this frame index (A1TR
+        /// files) instead of `trace_block`, which misses the target of a failed internal
+        /// creation.
+        #[arg(long, requires = "against_chain")]
+        trace_index: Option<std::path::PathBuf>,
+        /// With --against-chain: blocks fetched from --rpc in parallel (nuc's archive node:
+        /// at most 4 beside other load).
+        #[arg(long, default_value_t = 16, requires = "against_chain")]
+        concurrency: usize,
     },
     /// Read the published address index back and check what one head makes a client read:
     /// every slice's buckets against its descriptor, every file against its reference, and
@@ -252,6 +269,22 @@ enum Command {
         /// Also read `trace_block` (see `appearances`).
         #[arg(long)]
         traces: bool,
+    },
+    /// Compare an archive node's frame index (A1TR files from tools/erigon-trace-export) with
+    /// `trace_block` over a block range, one block at a time: the TRACE appearances each gives.
+    /// An appearance only `trace_block` has is an error; one only the index has is listed as
+    /// a candidate failed internal creation, whose target `trace_block` does not name (the
+    /// TRACE rule counts it). Every block's hash and transaction count are checked too.
+    TraceCompare {
+        /// The directory of A1TR files.
+        #[arg(long)]
+        trace_index: std::path::PathBuf,
+        /// First block.
+        #[arg(long)]
+        from: u64,
+        /// Last block.
+        #[arg(long)]
+        to: u64,
     },
     /// List the address appearances in a block (docs/address-index.md, detection rules).
     Appearances {
@@ -387,6 +420,7 @@ async fn main() -> Result<()> {
             init,
             from_block,
             traces,
+            trace_index,
             stamping,
             out,
             defer_level,
@@ -402,6 +436,7 @@ async fn main() -> Result<()> {
                 init,
                 from_block,
                 traces,
+                trace_index,
                 batch: stamping.batch,
                 lower_batches: stamping.lower_batches,
                 grace_days: stamping.grace_days,
@@ -437,13 +472,15 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!(
-                "Activity in blocks {}..={}: {} transactions, emitter {}, busy {}, authority {}",
+                "Activity in blocks {}..={}: {} transactions, emitter {}, busy {}, authority {}, \
+                 failed creation {}",
                 a.first_block,
                 a.last_block,
                 a.transactions,
                 a.emitter,
                 a.busy,
-                a.authority.map_or("none".to_string(), |x| x.to_string())
+                a.authority.map_or("none".to_string(), |x| x.to_string()),
+                a.failed_creation
             );
         }
         Command::AddrUpload {
@@ -479,6 +516,8 @@ async fn main() -> Result<()> {
             since,
             limit,
             against_chain,
+            trace_index,
+            concurrency,
         } => {
             addr_lookup(
                 &provider,
@@ -487,7 +526,7 @@ async fn main() -> Result<()> {
                 units,
                 since,
                 limit,
-                against_chain,
+                against_chain.then_some((trace_index.as_deref(), concurrency)),
             )
             .await?;
         }
@@ -533,6 +572,18 @@ async fn main() -> Result<()> {
             traces,
         } => {
             addr_slice(&provider, level, index, traces).await?;
+        }
+        Command::TraceCompare {
+            trace_index,
+            from,
+            to,
+        } => {
+            let s = trace_compare(&provider, &trace_index, from, to).await?;
+            println!(
+                "Blocks {from}..={to}: {} TRACE appearances from trace_block, {} from the index; \
+                 {} only in the index (candidate failed internal creations)",
+                s.rpc, s.index, s.index_only
+            );
         }
         Command::Appearances { number, traces } => {
             let data = addr::fetch::fetch_block_data(&provider, number, traces).await?;
@@ -704,7 +755,13 @@ where
 
     ensure!(level <= L_MAX, "slice level {level} above {L_MAX}");
     let (first, last) = (first_block(level, index), last_block(level, index));
-    let built = addr::fetch::fetch_slice(provider, (level, index), traces, 16).await?;
+    let built = addr::fetch::fetch_slice(
+        provider,
+        (level, index),
+        &addr::fetch::Traces::rpc(traces),
+        16,
+    )
+    .await?;
     let r = &built.record;
     let file_bytes: usize = built.files.iter().map(|(_, f)| f.len()).sum();
     let chunks: usize = built.files.iter().map(|(_, f)| file_chunks(f.len())).sum();
@@ -781,11 +838,17 @@ where
         eprintln!("fetching blocks {first}..={last}");
         let mut apps = Vec::new();
         let mut txs = 0u64;
-        addr::fetch::fetch_appearances(provider, first..=last, traces, concurrency, |b| {
-            apps.extend(b.appearances);
-            txs += b.txs as u64;
-            Ok(())
-        })
+        addr::fetch::fetch_appearances(
+            provider,
+            first..=last,
+            &addr::fetch::Traces::rpc(traces),
+            concurrency,
+            |b| {
+                apps.extend(b.appearances);
+                txs += b.txs as u64;
+                Ok(())
+            },
+        )
         .await?;
         let w = addr::stats::window_stats((level, index), &apps, txs, roles)?;
         println!("{}", addr::stats::render(&w));
@@ -801,7 +864,9 @@ async fn addr_lookup<P>(
     units: Option<u64>,
     since: Option<u64>,
     limit: usize,
-    against_chain: bool,
+    // Compare with the chain (with this frame index for TRACE if given, and this many blocks
+    // fetched at a time).
+    against_chain: Option<(Option<&std::path::Path>, usize)>,
 ) -> Result<()>
 where
     P: Provider + Clone + 'static,
@@ -855,8 +920,17 @@ where
             head.first_block()
         );
     }
-    if against_chain {
-        let c = addr::lookup::against_chain(provider, address, &found, &head, chain_id).await?;
+    if let Some((trace_index, concurrency)) = against_chain {
+        let c = addr::lookup::against_chain(
+            provider,
+            address,
+            &found,
+            &head,
+            chain_id,
+            trace_index,
+            concurrency,
+        )
+        .await?;
         ensure!(
             c.not_on_chain.is_empty() && c.missing.is_empty(),
             "index and chain differ for {address}: {} entries not on the chain {:?}, {} \
@@ -887,4 +961,79 @@ fn print_batches(
             "  {fell_back} {lower} went to the permanent batch: no --lower-batch lived long enough"
         );
     }
+}
+
+/// What [`trace_compare`] counted.
+struct TraceComparison {
+    rpc: u64,
+    index: u64,
+    index_only: u64,
+}
+
+/// The TRACE appearances of every block in `from..=to` from `trace_block` and from the frame
+/// index in `dir`, compared (see `Command::TraceCompare`).
+async fn trace_compare<P: Provider>(
+    provider: &P,
+    dir: &std::path::Path,
+    from: u64,
+    to: u64,
+) -> Result<TraceComparison> {
+    use addr::detect::{detect, detect_with_frames, role};
+    ensure!(from <= to, "--from {from} is after --to {to}");
+    let chain_id = provider.get_chain_id().await.context("querying chain id")?;
+    let index = addr::trace_index::TraceIndex::open(dir, chain_id)?;
+    for n in [from, to] {
+        ensure!(
+            index.ranges().iter().any(|r| r.contains(&n)),
+            "the index does not cover block {n} (it covers {:?})",
+            index.ranges()
+        );
+    }
+    let trace =
+        |apps: Vec<addr::detect::Appearance>| -> std::collections::BTreeSet<(u32, Address)> {
+            apps.into_iter()
+                .filter(|a| a.roles & role::TRACE != 0)
+                .map(|a| (a.slot, a.address))
+                .collect()
+        };
+    let mut s = TraceComparison {
+        rpc: 0,
+        index: 0,
+        index_only: 0,
+    };
+    let mut missing = Vec::new();
+    for n in from..=to {
+        let data = addr::fetch::fetch_block_data(provider, n, true).await?;
+        let entry = index.block(n)?;
+        ensure!(
+            entry.hash == data.hash && entry.tx_count as usize == data.txs.len(),
+            "block {n}: the index has hash {} and {} transactions, the node {} and {}",
+            entry.hash,
+            entry.tx_count,
+            data.hash,
+            data.txs.len()
+        );
+        let rpc = trace(detect(&data));
+        let plain = addr::detect::BlockData {
+            traces: None,
+            ..data
+        };
+        let idx = trace(detect_with_frames(&plain, Some(&entry.frames)));
+        for (slot, a) in rpc.difference(&idx) {
+            missing.push(format!("block {n} tx {} {a}", slot - 1));
+        }
+        for (slot, a) in idx.difference(&rpc) {
+            println!("only in the index: block {n} tx {} {a}", slot - 1);
+            s.index_only += 1;
+        }
+        s.rpc += rpc.len() as u64;
+        s.index += idx.len() as u64;
+    }
+    ensure!(
+        missing.is_empty(),
+        "{} TRACE appearances from trace_block are missing in the index: {}",
+        missing.len(),
+        missing.join("; ")
+    );
+    Ok(s)
 }

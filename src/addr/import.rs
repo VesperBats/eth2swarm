@@ -25,7 +25,7 @@ use tracing::info;
 use super::build::{Output, STREAM_FILE, SliceBuilder};
 use super::detect::role;
 use super::export::{self, ExportLog, ExportMeta};
-use super::fetch::fetch_appearances;
+use super::fetch::{Traces, fetch_appearances};
 use super::io::{join_one, write_atomic};
 use super::layout::{
     HeadRecord, L_MAX, MAX_UNITS, UNIT_BLOCKS, bucket_id, first_block, head_id, held_first_block,
@@ -33,6 +33,7 @@ use super::layout::{
 };
 use super::slice::{SliceId, cover, held, held_level, new_slice, resolve_after, units};
 use super::stamps::{self, Stamps};
+use super::trace_index::TraceIndex;
 use crate::swarm::{bee::Bee, soc};
 
 /// Name of the state file in the state directory.
@@ -144,6 +145,20 @@ pub struct State {
     /// the start falls into depends on the start, and its identifiers do not.
     #[serde(default)]
     pub backfilling: bool,
+    /// Where the index's `TRACE` comes from ([`trace_source`]), fixed by the first run: slices
+    /// from different sources (or from `trace_block` under the earlier `TRACE` rule, which
+    /// left out failed creations) must not be mixed in one index.
+    #[serde(default)]
+    pub trace_source: Option<String>,
+}
+
+/// The name a state records for a `TRACE` source: `None` without traces.
+fn trace_source(traces: &Traces) -> Option<String> {
+    match traces {
+        Traces::Off => None,
+        Traces::Rpc => Some("trace_block".into()),
+        Traces::Index(_) => Some("index".into()),
+    }
 }
 
 impl State {
@@ -256,6 +271,8 @@ pub struct ImportOptions {
     /// (default: from genesis). A later run must state the same unit or nothing.
     pub from_block: Option<u64>,
     pub traces: bool,
+    /// `TRACE` from an archive node's frame index (A1TR files) instead of `trace_block`.
+    pub trace_index: Option<PathBuf>,
     /// The permanent batch: top-level slices, heads, the origin (and everything without
     /// `lower_batches`).
     pub batch: Option<B256>,
@@ -303,7 +320,7 @@ struct Ctx<P> {
     chain_id: u64,
     /// The first unit the index covers.
     first_unit: u64,
-    traces: bool,
+    traces: Traces,
     max_level: u8,
     concurrency: usize,
     /// Where slices keep their sort runs while they are built.
@@ -363,7 +380,7 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
         let mut builder = SliceBuilder::new(
             slice,
             self.first_unit,
-            role::mask(self.traces),
+            role::mask(self.traces.detects()),
             &self.sort_dir,
             self.sort_buffer,
         )?
@@ -378,7 +395,7 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
         fetch_appearances(
             &self.provider,
             first..=last,
-            self.traces,
+            &self.traces,
             self.concurrency,
             |b| {
                 first_parent.get_or_insert(b.parent_hash);
@@ -713,6 +730,50 @@ async fn finalized_units(provider: &impl Provider) -> Result<(u64, u64)> {
     Ok(((finalized + 1) / UNIT_BLOCKS, finalized))
 }
 
+/// With `TRACE` from a frame index: refuses the run unless the files cover the blocks of
+/// units `first_unit..units` without a gap, before anything is fetched (a block found
+/// uncovered only when it is reached would end a backfill after days, and the next run would
+/// repeat it). `done` units are imported already: a smaller `--units` cannot help those.
+fn check_coverage(index: &TraceIndex, first_unit: u64, units: u64, done: u64) -> Result<()> {
+    // Adjoining files as one run: a mainnet export has hundreds of files and few gaps.
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for r in index.ranges() {
+        match runs.last_mut() {
+            Some(last) if last.1.checked_add(1) == Some(*r.start()) => last.1 = *r.end(),
+            _ => runs.push((*r.start(), *r.end())),
+        }
+    }
+    let ranges: Vec<String> = runs.iter().map(|(a, b)| format!("{a}..={b}")).collect();
+    info!(blocks = %ranges.join(", "), files = index.ranges().len(), "trace index");
+    if units <= first_unit {
+        // Nothing to read; `backfill_slices` refuses an empty backfill.
+        return Ok(());
+    }
+    let (from, to) = (first_unit * UNIT_BLOCKS, units * UNIT_BLOCKS - 1);
+    let Some(end) = index.covered_until(from) else {
+        bail!(
+            "the trace index does not cover block {from}, where the index starts (its files \
+             cover {})",
+            ranges.join(", ")
+        );
+    };
+    if end >= to {
+        return Ok(());
+    }
+    let allowed = (end + 1) / UNIT_BLOCKS;
+    let hint = if allowed > first_unit && allowed >= done {
+        format!(", or pass --units {allowed} (the most the files allow)")
+    } else {
+        String::new()
+    };
+    bail!(
+        "this run reads blocks {from}..={to}, but the trace index covers them only up to block \
+         {end}: block {} is not covered. Export the missing blocks{hint}; the files of blocks \
+         already imported must stay, since merges read them again",
+        end + 1
+    )
+}
+
 /// How long `--follow` waits between looking for newly finalized units (one slot).
 const FOLLOW_POLL: std::time::Duration = std::time::Duration::from_secs(12);
 
@@ -764,7 +825,20 @@ where
     };
     let (complete, finalized) = finalized_units(provider).await?;
     let mut target = target_now(complete, finalized)?;
-    let roles = role::mask(opts.traces);
+    ensure!(
+        !(opts.traces && opts.trace_index.is_some()),
+        "--traces and --trace-index are two sources of TRACE: pass one"
+    );
+    ensure!(
+        !(opts.follow && opts.trace_index.is_some()),
+        "--follow cannot take TRACE from --trace-index: the files end where their export \
+         ended, and the next finalized unit would stop the run"
+    );
+    let traces = match &opts.trace_index {
+        Some(d) => Traces::Index(std::sync::Arc::new(TraceIndex::open(d, chain_id)?)),
+        None => Traces::rpc(opts.traces),
+    };
+    let roles = role::mask(traces.detects());
     let existing = State::load(dir)?;
     ensure!(
         existing.is_some() || opts.init,
@@ -787,6 +861,21 @@ where
                 s.roles,
                 signer.address()
             );
+            // A state from before the source was recorded, with TRACE: `trace_block` under the
+            // earlier rule.
+            let had = s.trace_source.clone().or_else(|| {
+                (s.roles & role::TRACE != 0).then(|| "trace_block (the earlier TRACE rule)".into())
+            });
+            ensure!(
+                had == trace_source(&traces),
+                "the index in {} takes TRACE from {}; this run from {}: one index keeps one \
+                 source (and one TRACE rule)",
+                dir.display(),
+                had.as_deref().unwrap_or("nowhere (no traces)"),
+                trace_source(&traces)
+                    .as_deref()
+                    .unwrap_or("nowhere (no traces)")
+            );
             ensure!(
                 requested.is_none_or(|u| u == s.first_unit),
                 "the index in {} starts at block {}; --from-block cannot move it",
@@ -801,6 +890,18 @@ where
             first_unit
         }
     };
+    if matches!(traces, Traces::Rpc) && existing.is_none() {
+        tracing::warn!(
+            "TRACE from trace_block misses the target of a failed internal creation, so this \
+             index is not exact under the TRACE rule; a frame index (--trace-index) is"
+        );
+    }
+    if let Traces::Index(index) = &traces {
+        // Every block the run can read: the backfill's (or a resumed one's), the new units',
+        // and the ranges merges read again, all from the first unit on.
+        let done = existing.as_ref().map_or(0, |s| s.units.max(s.n0));
+        check_coverage(index, first_unit, target.max(done), done)?;
+    }
     let (sort_dir, sort_lock) = sort_dir(&opts)?;
     let sink = match (&opts.out, existing.as_ref().map(|s| s.export_len)) {
         (Some(out), None | Some(Some(_))) => {
@@ -872,7 +973,7 @@ where
         signer: signer.clone(),
         chain_id,
         first_unit,
-        traces: opts.traces,
+        traces,
         max_level: opts.max_level,
         concurrency: opts.concurrency,
         sort_dir,
@@ -1073,6 +1174,7 @@ async fn backfill<P: Provider + Clone + 'static>(
         prepared: None,
         export_len: None,
         backfilling: true,
+        trace_source: trace_source(&ctx.traces),
     };
     ctx.save(&mut state, dir)?;
     let (mut parent, mut last) = (None, None);
@@ -1107,6 +1209,38 @@ async fn backfill<P: Provider + Clone + 'static>(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn a_trace_index_must_cover_the_run() {
+        use super::super::trace_index::tests::write;
+        let dir = std::env::temp_dir().join(format!("a1tr-coverage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Units 2..10 in two adjoining files (blocks 128..=639), then a gap.
+        write(&dir, 1, 128, 383, &[(B256::ZERO, 0); 256], &[]);
+        write(&dir, 1, 384, 639, &[(B256::ZERO, 0); 256], &[]);
+        write(&dir, 1, 700, 767, &[(B256::ZERO, 0); 68], &[]);
+        let idx = TraceIndex::open(&dir, 1).unwrap();
+        let err = |first, units, done| {
+            format!(
+                "{:#}",
+                check_coverage(&idx, first, units, done).unwrap_err()
+            )
+        };
+        assert!(check_coverage(&idx, 2, 10, 0).is_ok());
+        assert!(check_coverage(&idx, 4, 10, 7).is_ok());
+        let e = err(2, 12, 0);
+        assert!(
+            e.contains("block 640 is not covered") && e.contains("--units 10"),
+            "{e}"
+        );
+        // Imported past the coverage already: a smaller --units cannot help.
+        let e = err(2, 12, 11);
+        assert!(e.contains("block 640") && !e.contains("--units"), "{e}");
+        let e = err(1, 5, 0);
+        assert!(e.contains("does not cover block 64"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_sort_directory_is_locked_and_only_our_leftovers_go() {
@@ -1233,6 +1367,7 @@ mod tests {
             }),
             export_len: None,
             backfilling: false,
+            trace_source: None,
         };
         s.save(&dir).unwrap();
         assert_eq!(State::load(&dir).unwrap(), Some(s.clone()));

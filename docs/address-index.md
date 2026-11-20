@@ -99,12 +99,12 @@ block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. The e
   questions*.
 - TrueBlocks also scans the **input and output of every trace** (internal calls, and the
   top-level call's return data) for address-shaped words. Here traces add only the addresses
-  of the call frames themselves (`TRACE`): that is expected to be the set an archive node
-  keeps an index of (Erigon 3's `tracesfrom` and `tracesto`, keyed by transaction), so a
-  full history with traces could be imported from it in days instead of re-executing every
-  block (owner decision, 2026-11-20). That the two sets match has to be shown, block by
-  block, before the index is used (#8, part 12); failed creations are a known case where
-  they may not (*Open questions*). An address that occurs only in trace data (a recipient a
+  of the call frames themselves (`TRACE`): the set an archive node keeps an index of
+  (Erigon 3's `tracesfrom` and `tracesto`, keyed by transaction), so a full history with
+  traces can be imported from it in days instead of re-executing every block (owner
+  decision, 2026-11-20). Compared block by block with `trace_block` over nine ranges from
+  block 2,300,000 to the head, the index matches exactly except for failed creations, which
+  the `TRACE` rule (below) counts (#8, part 12). An address that occurs only in trace data (a recipient a
   router passes on without calling it, an address a factory returns) is therefore not
   indexed. Unlike the other two, this exception cannot be filtered out of TrueBlocks' index
   by itself, which records no reason per appearance: telling such an appearance from a
@@ -158,15 +158,35 @@ block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. The e
   keeps importers on different libraries in agreement.
 - `BLOCK` (slot 0): the header's beneficiary, the beneficiary of every uncle, the address of
   every withdrawal, and with traces the `author` of every `reward` trace.
-- `TRACE`, from Parity-style `trace_block` (Erigon, Reth, Anvil; not geth): for every trace
-  of a transaction, `action.from` and `action.to` (every call frame, including the
-  top-level one and delegate and static calls), the created contract (`result.address` of a
-  `create`), and for a `suicide` the destroyed contract (`action.address`) and its
-  beneficiary (`action.refundAddress`). Only importers with a tracing source set it; the
-  slice's `roles` byte says which roles were detected.
+- `TRACE` (*the `TRACE` rule*): the from and to of every call frame as it is entered, including the top-level one
+  and delegate and static calls, whatever the frame's outcome. For a creation, to is the
+  address it creates, also when the creation fails (reverts, runs out of gas, or fails
+  before it executes); for a self-destruct, from is the destroyed contract and to its
+  beneficiary (owner decision, 2026-11-20: a frame index records exactly this). Only
+  importers with a tracing source set it; the slice's `roles` byte says which roles were
+  detected. Two sources:
+  - **An archive node's frame index** (`addr-import --trace-index <dir>`): A1TR files that
+    `tools/erigon-trace-export` writes from Erigon's `tracesfrom`/`tracesto`. Exact for this
+    rule. Every file must be for the chain imported, and every block's hash and
+    transaction count must match the block fetched. Every transaction's top-level frame
+    must be there: its sender and its recipient (the created address for a creation) are
+    among the block's frames unless they are never indexed, which rules out a block whose
+    records are missing or cut short. The files must cover every block from the index's
+    first one to the run's target without a gap, checked before anything is fetched (the
+    error names the first uncovered block, and the largest `--units` the files allow where a
+    smaller `--units` would help);
+    `--follow` is refused, since the files end where the export ended. Keep the files of
+    blocks already imported: a merge reads its range again.
+  - **Parity-style `trace_block`** (Erigon, Reth, Anvil; not geth, `--traces`): from every
+    trace `action.from` and `action.to`, the created contract (`result.address` of a
+    `create`), and for a `suicide` `action.address` and `action.refundAddress`; for a
+    top-level creation also its target from the transaction (sender and nonce), since a
+    failed creation's trace has no result. It misses the target of a failed *internal*
+    creation (the trace has neither the nonce nor the salt), so it is exact only where no
+    internal creation fails. `ethswarm trace-compare` lists where it and an index differ.
 
-  Traces cannot be verified without re-executing the block, so an importer that sets
-  `TRACE` checks the `trace_block` answer and **rejects the block** (publishes nothing for
+  Traces cannot be verified without re-executing the block, so an importer that reads
+  `trace_block` checks the answer and **rejects the block** (publishes nothing for
   it, and stops) unless:
   - every trace has type `call`, `create`, `suicide` or `reward`, and this block's
     `blockHash`;
@@ -846,9 +866,10 @@ receipts on top for log roles.
 
 - **Relation source.** Without traces (`TRACE`) internal ETH transfers are missing. nuc now
   runs an Erigon v3.8.1 archive node, but `trace_block` manages only about 1–2 blocks/s
-  there, most of a year for the whole history. The plan is Erigon's own index of call-frame
-  addresses (#8, part 12). TrueBlocks' published index cannot be the source under the
-  current rules: it holds the words of trace data, without marking them.
+  there, most of a year for the whole history. Settled by Erigon's own index of call-frame
+  addresses (#8, part 12): `tools/erigon-trace-export` writes it as A1TR files, which
+  `addr-import --trace-index` reads. TrueBlocks' published index cannot be the source
+  under the current rules: it holds the words of trace data, without marking them.
 - **Where the blocks come from.** The index does not care: an entry is (block, slot). Since
   2025 execution clients can drop pre-merge bodies and receipts, and many nodes do, while
   post-merge history is still served over devp2p; eth/69 announces each peer's earliest available block, so a
@@ -870,21 +891,18 @@ receipts on top for log roles.
   tracers differ at the edges:
   - whether a call that fails before it executes (insufficient balance, the depth limit)
     gets a frame;
-  - **failed creations**: a Parity-style trace of a creation that fails has `result: null`
-    (one that reverts keeps `result.address` with Erigon and Reth, as far as known), so the
-    address it aimed at is not in the `trace_block` answer, while a frame index records it
-    whatever the outcome. A failed top-level deployment would then be `TO` from
-    `trace_block` and `TO | TRACE` from the index. Either the rule takes every creation
-    frame's address whatever its outcome (and `trace_block` can no longer produce the set
-    for internal creations: it has no nonce or salt), or the import needs each creation's
-    outcome, which the index does not hold;
+  - failed creations: settled by the rule (every frame at entry, owner decision
+    2026-11-20). Erigon's index records the target whatever the outcome; `trace_block`
+    names it only for a creation that succeeded, which is why a top-level creation's target
+    is taken from the transaction and a failed internal creation needs the index;
   - frames of precompile calls (precompiles are below `0x…ffff` and never indexed, so
     this matters only where it changes another address's frame, such as a failed creation).
 
-  Comparing Erigon's index with Erigon's `trace_block` (#8, part 12) shows where the two
-  differ on one client. It does not settle what Reth or Nethermind trace; that needs the
-  cases written into the rules, or a tracer (for example Erigon's frame tracer) named as
-  part of them. Owner decision once the comparison has the data.
+  Comparing Erigon's index with Erigon's `trace_block` (#8, part 12) showed where the two
+  differ on one client: only failed creations. What Reth or Nethermind trace at the other
+  edges (a call that fails before it executes) is still open; a frame tracer with an
+  enter hook (Geth-style, which Erigon, Geth and Reth support) reproduces the rule on any
+  of them.
 - **Genesis allocations.** TrueBlocks indexes the prefunded addresses of the genesis
   state at block 0 (about 8,900 on mainnet). Adding them needs the allocation list as an
   input (it is not in any block), and a convention for its slots.

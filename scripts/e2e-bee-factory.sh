@@ -312,6 +312,8 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   echo "$ACT"
   EMITTER=$(echo "$ACT" | awk '{for (i = 1; i < NF; i++) if ($i == "emitter") print $(i + 1)}' | tr -d ,)
   echo "$ACT" | grep -q 'authority 0x' || { echo "FAIL: the chain did not take the EIP-7702 transaction"; exit 1; }
+  FAILED=$(echo "$ACT" | awk '{for (i = 1; i < NF; i++) if ($i == "failed" && $(i + 1) == "creation") print $(i + 2)}')
+  [[ "$FAILED" =~ ^0x[0-9a-fA-F]{40}$ ]] || { echo "FAIL: no failed creation in: $ACT"; exit 1; }
   ACT_RANGE=$(echo "$ACT" | awk '{print $4}' | tr -d :)
   ACT_FIRST=${ACT_RANGE%%..=*}
   ACT_LAST=${ACT_RANGE##*..=}
@@ -349,7 +351,7 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   count() { awk '/appearances in the index/ {print $2}'; }
   # Checked against the chain from the activity's first unit on: re-detecting the whole chain
   # would grow with its age (the authority key has appearances from earlier runs too).
-  for A in "$BUSY" "$EMITTER" "$AUTHORITY" 0x9999999999999999999999999999999999999999; do
+  for A in "$BUSY" "$EMITTER" "$AUTHORITY" "$FAILED" 0x9999999999999999999999999999999999999999; do
     OUT=$(lookup "$A" --since "$U1" --against-chain) \
       || { echo "FAIL: addr-lookup $A"; echo "$OUT"; exit 1; }
     echo "$OUT" | head -1
@@ -360,6 +362,17 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
           --chain-id "$CHAIN_ID" --units "$ACT_UNITS" --since "$U1" --limit 1)
         echo "$NEWEST" | head -1 | grep -qw auth \
           || { echo "FAIL: the authority's newest entry has no AUTH role: $NEWEST"; exit 1; } ;;
+      "$FAILED")
+        # A reverted top-level creation: its target is TO, and with traces also TRACE.
+        ENTRY=$($BIN --bee "$READ_BEE" addr-lookup "$A" --owner "$ACT_OWNER" \
+          --chain-id "$CHAIN_ID" --units "$ACT_UNITS" --since "$U1" --limit 1)
+        ENTRY=$(echo "$ENTRY" | head -1)
+        echo "$ENTRY" | grep -qw to \
+          || { echo "FAIL: the failed creation's target has no TO role: $ENTRY"; exit 1; }
+        if [ ${#TRACE_FLAG[@]} -gt 0 ]; then
+          echo "$ENTRY" | grep -qw trace \
+            || { echo "FAIL: the failed creation's target has no TRACE role: $ENTRY"; exit 1; }
+        fi ;;
     esac
   done
   [ "${N:-0}" -ge 1400 ] || { echo "FAIL: busy address has ${N:-0} appearances, expected >= 1400"; exit 1; }
@@ -394,7 +407,7 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   [ "$FOUND_UNITS" = "$ACT_UNITS" ] \
     || { echo "FAIL: head discovery found $FOUND_UNITS units, the index has $ACT_UNITS"; exit 1; }
   rm -rf "$ACT_STATE"
-  echo "ok: busy address ($N appearances, $BUSY_FILES spill file), emitter, authority and an unrelated address match the chain since unit $U1; the full lookup agrees; the sender's incremental lookup reads $SINCE_SLICES of $FULL_SLICES slices; head discovery finds $ACT_UNITS units"
+  echo "ok: busy address ($N appearances, $BUSY_FILES spill file), emitter, authority, a failed creation's target and an unrelated address match the chain since unit $U1; the full lookup agrees; the sender's incremental lookup reads $SINCE_SLICES of $FULL_SLICES slices; head discovery finds $ACT_UNITS units"
 
   echo "== address index from a later block (--from-block): import, verify, lookups checked against the chain"
   # Start one unit into the newest slice of the cover (at most unit U1) that is longer than one
