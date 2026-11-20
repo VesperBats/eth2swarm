@@ -1,6 +1,7 @@
 mod accumulator;
 mod addr;
 mod chain;
+mod checkpoints;
 mod client;
 mod devnet;
 mod import;
@@ -123,6 +124,42 @@ enum StampsCommand {
 
 #[derive(Subcommand)]
 enum Command {
+    /// The hash of every 1024th block from genesis up to a finalized block (Myotis's
+    /// checkpoint table, its docs/ideas/deep-block-verification.md): every header is hashed
+    /// here and linked by parentHash down to the genesis hash; the node's hashes are never
+    /// used. Writes <out> (32 bytes per entry, entry i = block i·1024) and <out>.json. A full
+    /// build resumes from <out>.work after a stop; --extend continues an existing table from
+    /// its last entry up to a new top.
+    CheckpointTable {
+        /// The table file to write.
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Extend this existing table (with its <table>.json) instead of walking from genesis:
+        /// the walk starts at its last entry, which it must reproduce, passes through its
+        /// recorded top, and goes up to the new top; its entries are kept and the new ones
+        /// appended. --out must be another file; the old pair is never changed. For weeks of
+        /// blocks (it keeps them in memory and does not resume): a full build resumes.
+        #[arg(long, conflicts_with = "genesis_hash")]
+        extend: Option<std::path::PathBuf>,
+        /// The table's new top: the block a full build walks down from, or an extension walks
+        /// up to (default: the node's finalized block).
+        #[arg(long, requires = "top_hash")]
+        top: Option<u64>,
+        /// The top block's hash, from a source you trust (a beacon-attested finalized block).
+        #[arg(long, requires = "top")]
+        top_hash: Option<B256>,
+        /// The network's genesis hash (default: mainnet's, on chain 1).
+        #[arg(long)]
+        genesis_hash: Option<B256>,
+        /// Chunks of 1024 headers fetched in parallel.
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+        /// Before anything is written, compare about 200 entries, the last one and the top
+        /// block with this node (another client than --rpc). Pins the top in place of
+        /// --top-hash; a run with neither is refused, and a mismatch writes nothing.
+        #[arg(long)]
+        cross_check: Option<Url>,
+    },
     /// Show the connected chain and its current head.
     Tip,
     /// Print a summary of a single block.
@@ -438,6 +475,48 @@ async fn main() -> Result<()> {
     let bee = Bee::new(cli.bee.clone())?;
 
     match cli.command {
+        Command::CheckpointTable {
+            out,
+            extend: Some(from),
+            top,
+            top_hash,
+            concurrency,
+            cross_check,
+            ..
+        } => {
+            let meta = checkpoints::extend(&checkpoints::ExtendOptions {
+                rpc: cli.rpc.to_string(),
+                from,
+                out,
+                top,
+                top_hash,
+                concurrency,
+                cross_check: cross_check.as_ref().map(|u| u.to_string()),
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&meta)?);
+        }
+        Command::CheckpointTable {
+            out,
+            extend: None,
+            top,
+            top_hash,
+            genesis_hash,
+            concurrency,
+            cross_check,
+        } => {
+            let meta = checkpoints::build(&checkpoints::Options {
+                rpc: cli.rpc.to_string(),
+                out: out.clone(),
+                top,
+                top_hash,
+                genesis: genesis_hash,
+                concurrency,
+                cross_check: cross_check.as_ref().map(|u| u.to_string()),
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&meta)?);
+        }
         Command::Tip => {
             let chain_id = provider.get_chain_id().await.context("querying chain id")?;
             let block = provider
