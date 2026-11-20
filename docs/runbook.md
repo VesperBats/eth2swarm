@@ -19,7 +19,8 @@ Replace them elsewhere.
 
 **Load rules on the nuc** (32 GB until the upgrade):
 - **One heavy client on Erigon at a time.** Heavy means `trace_block`, the frame-index export,
-  or an import fetching blocks. A header-only `checkpoint-table` run is light.
+  an import fetching blocks, or `addr-lookup --against-chain` (it fetches every block of its
+  range again). A header-only `checkpoint-table` run is light.
 - **Everything long runs in a memory-limited systemd unit or scope:** `MemoryHigh=3G
   MemoryMax=6G` for imports and exports. The worst case then kills the job, not Erigon:
   systemd-oomd once killed Erigon under combined load.
@@ -27,6 +28,14 @@ Replace them elsewhere.
   8 and 16 before raising.
 - **Disk:** a full run peaks at about 1.3 TB (the export directory, sort runs, the frame
   index). Check `df -h ~` first.
+- **User units outlive a logout only with lingering on.** Without it, every `--user` unit
+  below stops with the last session, and the full backfill starts over. On the nuc it is on
+  (`loginctl show-user $USER -p Linger` says `Linger=yes`); elsewhere run
+  `loginctl enable-linger $USER` once.
+- **A failed unit keeps its name.** A unit that exited with an error, or was killed at
+  `MemoryMax`, stays loaded as *failed*, and `systemd-run --unit` with the same name is
+  refused. Read `systemctl --user status <unit>` and the log, then
+  `systemctl --user reset-failed <unit>` before starting it again.
 
 **Postage:** `.claude/agent/postage.md` governs every upload to a real Bee node and every
 batch purchase. Ask before using a batch; propose a new one, never buy it yourself; use
@@ -48,8 +57,11 @@ CC=gcc-13 CXX=g++-13 /usr/local/go/bin/go build -o ~/bin/erigon-trace-export .
 key must never have published another one.
 ```sh
 mkdir -p ~/addr1-<name>/state
-(umask 077; echo "0x$(openssl rand -hex 32)" > ~/addr1-<name>/key)
+(umask 077; set -C; echo "0x$(openssl rand -hex 32)" > ~/addr1-<name>/key)
 ```
+`set -C` makes the shell refuse to overwrite a key that is already there: a lost key can
+never publish another head for its index. Keep a copy of `key` and `state` somewhere else.
+Together they are the index's identity, and a lost state is restored, not started over.
 Commands take it as `--key "$(cat key)"`, or via `ETH2SWARM_KEY`, which keeps it off the
 process list.
 
@@ -71,14 +83,18 @@ systemd-run --user --scope -q -p MemoryHigh=3G -p MemoryMax=6G \
   --from 26236928 --to "$FINAL" --out ~/erigon-data/a1tr/mainnet-month
 
 # Full, from genesis (≈ 0.5–1 day in all, a few hundred GB), in ranges of 2,000,000 blocks:
-# a run that stops loses its whole range (see below), so a range is the unit of retry
-for FROM in $(seq 0 2000000 "$FINAL"); do
-  TO=$(( FROM + 1999999 < FINAL ? FROM + 1999999 : FINAL ))
-  systemd-run --user --scope -q -p MemoryHigh=3G -p MemoryMax=6G \
+# a run that stops loses its whole range (see below), so a range is the unit of retry. The
+# loop is a unit of its own, so a dropped SSH session does not end it. $FINAL and $START are
+# expanded now, \$FROM and \$TO when it runs.
+systemd-run --user --unit a1tr-export -p MemoryHigh=3G -p MemoryMax=6G \
+  --working-directory="$HOME" sh -c "for FROM in \$(seq ${START:-0} 2000000 $FINAL); do
+    TO=\$(( FROM + 1999999 < $FINAL ? FROM + 1999999 : $FINAL ))
     ~/bin/erigon-trace-export --datadir ~/erigon-data/mainnet-archive \
-    --from "$FROM" --to "$TO" --out ~/erigon-data/a1tr/mainnet >> ~/a1tr-export.log 2>&1 \
-    || { echo "range $FROM..=$TO failed: rerun it"; break; }
-done
+      --from \$FROM --to \$TO --out ~/erigon-data/a1tr/mainnet >> ~/a1tr-export.log 2>&1 \
+      || { echo \"range \$FROM..=\$TO failed: rerun with START=\$FROM\" >> ~/a1tr-export.log; exit 1; }
+  done"
+# After a failure: systemctl --user reset-failed a1tr-export, then START=<that FROM> and the
+# same command. The finished ranges before it are kept.
 ```
 
 - **Files:** one per 100,000 blocks (`--blocks-per-file`), named `trace-<first>-<last>.a1tr`,
@@ -136,7 +152,9 @@ systemd-run --user --unit addr1-full-import -p MemoryHigh=3G -p MemoryMax=6G \
 off the command line systemd records.
 
 - **`--init` only on the first run.** Later runs resume from `--state`, and pass the same
-  `--out`.
+  `--out`. Leaving `--init` and `--from-block` in is harmless: with a state they are checked
+  against it, not applied again. A failed unit needs `systemctl --user reset-failed` first
+  (step 0).
 - **`--units`:** with `--trace-index`, the files must cover every block from the index's
   start to `--units · 64 − 1`. The run refuses otherwise, naming the first uncovered block and
   the largest `--units` the files allow. Without `--units` the target is every finalized
@@ -165,8 +183,8 @@ ethswarm --bee <bee> stamps plan ~/addr1-<name>/export --days 30 \
   --label "addr1 chain 1, owner <owner>, from <first block>"
 ```
 
-- **The example:** the month index stamps 779,755 chunks with a fullest bucket of 32, which
-  calls for depth 22.
+- **The example:** the month index, followed to unit 413,417, stamps 852,615 chunks with a
+  fullest bucket of 33, which calls for depth 23.
 - **Lower batches:** with lower slices in the export, `plan` also sizes the permanent batch
   and a lower batch apart. A lower batch needs only its slices' lifetime plus `--grace-days`
   (default 7). Run `plan` again with those `--days` and its own `--label`.
@@ -229,14 +247,23 @@ index can be extended in steps instead:
 # The published index: every slice, bucket and spill file of the head (default: the origin)
 ethswarm --bee http://localhost:1733 addr-verify --owner <owner> --chain-id 1 [--units <n>]
 
-# An address, newest first; with --against-chain compared with the chain itself over the same
-# blocks (TRACE from the frame index with --trace-index, else trace_block)
-ethswarm --bee http://localhost:1733 --rpc http://127.0.0.1:8645 addr-lookup <address> \
-  --owner <owner> --chain-id 1 --limit 20 \
-  --against-chain --trace-index ~/erigon-data/a1tr/mainnet --concurrency 4
+# An address, newest first, from the queen (1733)
+ethswarm --bee http://localhost:1733 addr-lookup <address> --owner <owner> --chain-id 1 --limit 20
 
-# The inspector: heads, slices, buckets and lookups in a browser
-ethswarm --rpc http://127.0.0.1:8645 serve --owner <owner> [--tailscale]
+# The same, compared with the chain itself: every block of the range is detected again from
+# --rpc (TRACE from the index's own frame-index directory, else trace_block). Check a recent
+# window with --since <units − 1000> (64,000 blocks, ≈ 30 min at the import's rate; <units> is
+# the head's, as the last "head published" line of the import log shows). The whole month
+# takes about 1.5 h. From genesis it would refetch 26 M blocks, about a week, and need
+# --receipts-rpc below Byzantium: do not.
+ethswarm --bee http://localhost:1733 --rpc http://127.0.0.1:8645 addr-lookup <address> \
+  --owner <owner> --chain-id 1 --limit 20 --since <units − 1000> \
+  --against-chain --trace-index ~/erigon-data/a1tr/mainnet-month --concurrency 4
+
+# The inspector: heads, slices, buckets and lookups in a browser. Name the nodes: the default
+# list has the unpatched ports, which on the nuc are the DAppNode Bee, not bee-factory
+ethswarm --rpc http://127.0.0.1:8645 serve --owner <owner> --node queen=http://localhost:1733 \
+  --node worker1=http://localhost:1735 [--tailscale]
 ```
 
 Read from the queen (1733), not the node you uploaded through, so that a lookup also proves
