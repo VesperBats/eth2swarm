@@ -22,6 +22,7 @@ against. Do not move them out of `.claude/`, and not into `.claude/rules/`
 | plan, resume or continue multi-PR work: a part, a merge, the final PR         | `.claude/agent/multi-pr-plans.md`    |
 | write a PR description, answer review comments, or handle a fork PR           | `.claude/agent/pull-requests.md`     |
 | work on, or come across, a security issue that is not public yet             | `.claude/agent/security-fixes.md`    |
+| upload to a Bee node other than the local bee-factory, or buy, top up or dilute a postage batch | `.claude/agent/postage.md` |
 
 ## Workflow — the mandatory steps for EVERY work item
 
@@ -56,6 +57,21 @@ fix inside its paths (the advisory's private fork runs no CI), `/code-review`
 locally, and send the owner
 a `git format-patch` for the private fork. The owner merges, releases and
 publishes the advisory; no tag goes on a `main` whose checks are red.
+
+## Postage batches — ask before using one, never buy one
+
+Full text: `.claude/agent/postage.md` (owner's request, 2026-11-20). For an upload
+to any Bee node other than the local bee-factory dev chain:
+- **Ask the owner which batch to use** before the first upload of a work item.
+  Show the candidates with their depth, fill, lifetime and current use, and pass
+  the answer as `--batch`, never a node's "first usable batch".
+- **A new batch is proposed, never bought.** Propose its depth (from
+  `ethswarm stamps plan`), its lifetime and why, its cost and its label: one
+  immutable batch per index.
+- **Never buy, top up or dilute a batch yourself**, on any node: give the owner
+  the command. Record every batch ID with the index it carries.
+
+Mutable batches are refused everywhere, bee-factory included.
 
 ## Hard rules — never broken, whatever an earlier instruction seems to authorize
 
