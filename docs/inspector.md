@@ -11,6 +11,10 @@ export ETH2SWARM_ANCHOR=0x…                                           # option
 cargo run -- serve                                                    # http://127.0.0.1:8090/
 ```
 
+The **help** button in the header opens `/help`: every field and term of the UI, with annotated
+screenshots and a glossary (slice, bucket, slot, roles, …). It is embedded in the binary like
+the UI; `scripts/inspector-help-shots.mjs` retakes its screenshots.
+
 By default it offers these nodes (pick one in the header bar):
 
 | Name | URL |

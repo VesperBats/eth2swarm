@@ -23,7 +23,7 @@ use alloy::primitives::{Address, B256, keccak256};
 use alloy::rlp::Decodable;
 use alloy::transports::http::reqwest::Url;
 use anyhow::{Context, Result, anyhow, bail};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -35,6 +35,29 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 const PAGE: &str = include_str!("inspect.html");
+
+/// The help page (`/help`) and its screenshots (`/help/<name>.webp`), embedded like the page.
+/// `scripts/inspector-help-shots.mjs` takes the screenshots from a running inspector.
+const HELP: &str = include_str!("help/help.html");
+/// One embedded screenshot: its file name and bytes.
+macro_rules! help_image {
+    ($name:literal) => {
+        ($name, include_bytes!(concat!("help/", $name)))
+    };
+}
+const HELP_IMAGES: &[(&str, &[u8])] = &[
+    help_image!("header.webp"),
+    help_image!("addr-lookup.webp"),
+    help_image!("addr-slice.webp"),
+    help_image!("addr-bucket.webp"),
+    help_image!("addr-spill.webp"),
+    help_image!("addr-examples.webp"),
+    help_image!("block-verify.webp"),
+    help_image!("block-record.webp"),
+    help_image!("epoch.webp"),
+    help_image!("soc.webp"),
+    help_image!("bytes.webp"),
+];
 
 /// A named Swarm node the UI can read from.
 #[derive(Clone)]
@@ -114,6 +137,8 @@ pub async fn serve(
     });
     let app = Router::new()
         .route("/", get(|| async { Html(PAGE) }))
+        .route("/help", get(|| async { Html(HELP) }))
+        .route("/help/{file}", get(help_image))
         .route("/api/config", get(config))
         .route("/api/soc", get(soc_handler))
         .route("/api/block", get(block_handler))
@@ -321,6 +346,20 @@ impl IntoResponse for ApiResult {
             Json(body),
         )
             .into_response()
+    }
+}
+
+async fn help_image(Path(file): Path<String>) -> Response {
+    match HELP_IMAGES.iter().find(|(name, _)| *name == file) {
+        Some((_, bytes)) => (
+            [
+                (header::CONTENT_TYPE, "image/webp"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            *bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -1513,6 +1552,100 @@ async fn bytes_inspect(st: &AppState, q: BytesQuery) -> Result<Value> {
 mod tests {
     use super::*;
     use alloy::consensus::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
+
+    #[test]
+    fn help_images_match_the_page() {
+        let referenced: std::collections::BTreeSet<&str> = HELP
+            .split("src=\"help/")
+            .skip(1)
+            .map(|s| &s[..s.find('"').unwrap()])
+            .collect();
+        let served: std::collections::BTreeSet<&str> =
+            HELP_IMAGES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(referenced, served, "help.html and HELP_IMAGES disagree");
+        for (name, bytes) in HELP_IMAGES {
+            assert!(
+                bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+                "{name} is not a WebP image"
+            );
+        }
+    }
+
+    #[test]
+    fn help_lists_match_the_callouts() {
+        // Each picture's numbered list explains its callouts by position: the list after
+        // `src="help/<name>.webp"` has exactly as many items as the shot has marks, numbered
+        // 1..n (scripts/inspector-help-shots.json).
+        let spec: Value =
+            serde_json::from_str(include_str!("../scripts/inspector-help-shots.json")).unwrap();
+        let shots = spec.as_array().unwrap();
+        let shot_files: std::collections::BTreeSet<String> = shots
+            .iter()
+            .map(|s| format!("{}.webp", s["name"].as_str().unwrap()))
+            .collect();
+        let served: std::collections::BTreeSet<String> =
+            HELP_IMAGES.iter().map(|(n, _)| n.to_string()).collect();
+        assert_eq!(shot_files, served, "one shot per help image");
+        assert_eq!(shots.len(), served.len(), "a shot listed twice");
+        for shot in shots {
+            let name = shot["name"].as_str().unwrap();
+            let file = format!("{name}.webp");
+            assert!(
+                HELP_IMAGES.iter().any(|(n, _)| *n == file),
+                "{file} is not served"
+            );
+            let marks = shot["marks"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name}: no marks"));
+            for (i, m) in marks.iter().enumerate() {
+                assert_eq!(
+                    m[0].as_u64(),
+                    Some(i as u64 + 1),
+                    "{name}: marks out of order"
+                );
+            }
+            let at = HELP
+                .find(&format!("src=\"help/{file}\""))
+                .unwrap_or_else(|| panic!("{file} is not on the page"));
+            // The picture's own section: up to the next picture or heading.
+            let section = &HELP[at + 1..];
+            let end = ["<figure", "<h2", "<h3"]
+                .iter()
+                .filter_map(|t| section.find(t))
+                .min()
+                .unwrap_or(section.len());
+            let section = &section[..end];
+            let start = section
+                .find("<ol class=\"callouts\">")
+                .unwrap_or_else(|| panic!("{name}: no callout list under the picture"));
+            let list = &section[start + 1..];
+            let list = &list[..list.find("</ol>").unwrap()];
+            // Callout items are plain list items: no nested lists, an item is `<li>` or
+            // `<li ` with attributes.
+            assert!(
+                !list.contains("<ol") && !list.contains("<ul"),
+                "{name}: a nested list in the callouts"
+            );
+            let items = list.matches("<li>").count() + list.matches("<li ").count();
+            assert_eq!(
+                items,
+                marks.len(),
+                "{name}: the list does not have one item per callout"
+            );
+        }
+    }
+
+    #[test]
+    fn help_page_anchors_exist() {
+        // Every in-page link (`href="#x"`) has its target (`id="x"`).
+        for link in HELP.split("href=\"#").skip(1) {
+            let id = &link[..link.find('"').unwrap()];
+            assert!(
+                HELP.contains(&format!("id=\"{id}\"")),
+                "help.html links to #{id}, which has no id"
+            );
+        }
+    }
 
     fn header() -> Header {
         Header {

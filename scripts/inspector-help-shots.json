@@ -1,0 +1,579 @@
+[
+ {
+  "name": "header",
+  "hash": "",
+  "from": "header",
+  "to": "header",
+  "marks": [
+   [
+    1,
+    "#node",
+    "",
+    0,
+    "in"
+   ],
+   [
+    2,
+    "#owner",
+    "",
+    0,
+    "in"
+   ],
+   [
+    3,
+    "#chain",
+    "",
+    0,
+    "in"
+   ],
+   [
+    4,
+    "#anchor",
+    "",
+    0,
+    "in"
+   ],
+   [
+    5,
+    "nav a",
+    "Block",
+    0,
+    "left"
+   ],
+   [
+    6,
+    "#reset",
+    "",
+    0,
+    "below"
+   ],
+   [
+    7,
+    "#help",
+    "",
+    0,
+    "below"
+   ]
+  ]
+ },
+ {
+  "name": "addr-lookup",
+  "hash": "addr/lookup:0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045::",
+  "wait": "out-addr",
+  "from": "#tab-addr",
+  "to": "#out-addr",
+  "before": "__trim([...document.querySelectorAll('#out-addr table')].pop(), [0,1,2,3,4,5,6])",
+  "marks": [
+   [
+    1,
+    "#addrA",
+    "",
+    0,
+    "in"
+   ],
+   [
+    2,
+    "#addrUnits",
+    "",
+    0,
+    "in"
+   ],
+   [
+    3,
+    "#addrSince",
+    "",
+    0,
+    "in"
+   ],
+   [
+    4,
+    "td.k",
+    "owner / chain"
+   ],
+   [
+    5,
+    "td.k",
+    "covers"
+   ],
+   [
+    6,
+    "td.k",
+    "head"
+   ],
+   [
+    7,
+    "td.k",
+    "probe stopped at"
+   ],
+   [
+    8,
+    "td.k",
+    "pending merges"
+   ],
+   [
+    9,
+    "td.k",
+    "origin"
+   ],
+   [
+    10,
+    "td.k",
+    "slices a lookup reads"
+   ],
+   [
+    11,
+    ".card h2",
+    "appearances of"
+   ],
+   [
+    12,
+    "td.k",
+    "blocks looked at"
+   ],
+   [
+    13,
+    "td.k",
+    "slices / files read"
+   ],
+   [
+    14,
+    "td.k",
+    "roles the index detects"
+   ],
+   [
+    15,
+    "th",
+    "slot"
+   ],
+   [
+    16,
+    "th",
+    "roles"
+   ]
+  ]
+ },
+ {
+  "name": "addr-slice",
+  "hash": "addr/slice:6:6456:0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+  "wait": "out-addr",
+  "from": "card:Slice",
+  "to": "card:Slice",
+  "marks": [
+   [
+    1,
+    "td.k",
+    "blocks"
+   ],
+   [
+    2,
+    "td.k",
+    "last block hash"
+   ],
+   [
+    3,
+    "td.k",
+    "buckets"
+   ],
+   [
+    4,
+    "td.k",
+    "addresses / appearances"
+   ],
+   [
+    5,
+    "td.k",
+    "buckets root"
+   ],
+   [
+    6,
+    "td.k",
+    "roles detected"
+   ],
+   [
+    7,
+    "input[name=k]",
+    "",
+    0,
+    "in"
+   ],
+   [
+    8,
+    "a.ref",
+    "bucket 242",
+    0,
+    "right"
+   ]
+  ]
+ },
+ {
+  "name": "addr-bucket",
+  "hash": "addr/bucket:6:6456:6027:0xdAC17F958D2ee523a2206206994597C13D831ec7",
+  "wait": "out-addr",
+  "from": "card:Bucket 6027",
+  "to": "card:Bucket 6027",
+  "before": "(() => { const t = [...document.querySelectorAll('#out-addr table')].pop(); const rows = [...t.rows]; const m = rows.findIndex(r => r.querySelector('.badge.ok')); const sp = rows.findIndex((r, i) => i !== m && r.textContent.includes('spill file')); __trim(t, [0,1,2,3,m,sp].filter(i => i >= 0)); })()",
+  "marks": [
+   [
+    1,
+    ".card h2",
+    "Bucket 6027"
+   ],
+   [
+    2,
+    "th",
+    "fingerprint"
+   ],
+   [
+    3,
+    "th",
+    "entries"
+   ],
+   [
+    4,
+    "th",
+    "block/slot"
+   ],
+   [
+    5,
+    ".badge.ok",
+    "address",
+    0,
+    "right"
+   ],
+   [
+    6,
+    "a.ref",
+    "spill file",
+    0,
+    "right"
+   ],
+   [
+    7,
+    "td",
+    "/tx",
+    0,
+    "left"
+   ]
+  ]
+ },
+ {
+  "name": "addr-spill",
+  "hash": "addr/spill:6:6456:0x35c95d6938aae892119e382b93d5aa51c19ffa4fdeb1cb9b8820d5be4ec1934c:238859",
+  "wait": "out-addr",
+  "from": "card:Spill file",
+  "to": "card:Spill file",
+  "before": "__trim([...document.querySelectorAll('#out-addr table')].pop(), [0,1,2,3,4,5,6,7,8])",
+  "marks": [
+   [
+    1,
+    ".card h2",
+    "Spill file"
+   ],
+   [
+    2,
+    "td.k",
+    "reference"
+   ],
+   [
+    3,
+    "th",
+    "block"
+   ]
+  ]
+ },
+ {
+  "name": "addr-examples",
+  "hash": "addr/examples:",
+  "wait": "out-addr",
+  "from": "#tab-addr",
+  "to": "#out-addr",
+  "marks": [
+   [
+    1,
+    "#addrExamples",
+    "",
+    0,
+    "right"
+   ],
+   [
+    2,
+    "a.ref",
+    "0xd8da",
+    0,
+    "left"
+   ],
+   [
+    3,
+    "th",
+    "entries"
+   ]
+  ]
+ },
+ {
+  "name": "block-verify",
+  "base": "http://127.0.0.1:8192",
+  "hash": "block/3",
+  "wait": "out-block",
+  "from": "#tab-block",
+  "to": "card:Verification",
+  "marks": [
+   [
+    1,
+    "#blockN",
+    "",
+    0,
+    "left"
+   ],
+   [
+    2,
+    "#prev",
+    "",
+    0,
+    "left"
+   ],
+   [
+    3,
+    ".verdict",
+    "",
+    0,
+    "left"
+   ],
+   [
+    4,
+    ".steps li",
+    "trust anchor"
+   ],
+   [
+    5,
+    ".steps li",
+    "fetch header SOC"
+   ],
+   [
+    6,
+    ".steps li",
+    "SOC signature"
+   ],
+   [
+    7,
+    ".steps li",
+    "accumulator proof"
+   ],
+   [
+    8,
+    ".steps li",
+    "body matches header roots"
+   ]
+  ]
+ },
+ {
+  "name": "block-record",
+  "base": "http://127.0.0.1:8192",
+  "hash": "block/3",
+  "wait": "out-block",
+  "from": "card:SOC location",
+  "to": "card:Decoded header",
+  "maxHeight": 1500,
+  "marks": [
+   [
+    1,
+    "td.k",
+    "identifier string"
+   ],
+   [
+    2,
+    "td.k",
+    "SOC address"
+   ],
+   [
+    3,
+    "td.k",
+    "geometry"
+   ],
+   [
+    4,
+    "td.k",
+    "block hash (keccak"
+   ],
+   [
+    5,
+    "td.k",
+    "body ref"
+   ],
+   [
+    6,
+    "td.k",
+    "epoch proof"
+   ],
+   [
+    7,
+    "td.k",
+    "master proof"
+   ],
+   [
+    8,
+    ".card h2",
+    "Decoded header"
+   ],
+   [
+    9,
+    "td.k",
+    "fields"
+   ]
+  ]
+ },
+ {
+  "name": "epoch",
+  "base": "http://127.0.0.1:8192",
+  "hash": "epoch/0",
+  "wait": "out-epoch",
+  "from": "#tab-epoch",
+  "to": "#out-epoch",
+  "before": "__trim([...document.querySelectorAll('#out-epoch table')].pop(), [0,1,2,3,4,5,6])",
+  "marks": [
+   [
+    1,
+    ".verdict",
+    "",
+    0,
+    "left"
+   ],
+   [
+    2,
+    ".badge",
+    "signed by owner",
+    0,
+    "right"
+   ],
+   [
+    3,
+    "td.k",
+    "epoch root"
+   ],
+   [
+    4,
+    "td.k",
+    "headers file"
+   ],
+   [
+    5,
+    "td.k",
+    "master proof"
+   ],
+   [
+    6,
+    "th",
+    "body"
+   ]
+  ]
+ },
+ {
+  "name": "soc",
+  "base": "http://127.0.0.1:8192",
+  "hash": "soc/idstr:eth:1337:0xbde220fa1b5d5130916fa22660d875788049e85cb01b1fd7a86ae4a243da5035:hdr:3",
+  "wait": "out-soc",
+  "from": "#tab-soc",
+  "to": "card:Chunk",
+  "marks": [
+   [
+    1,
+    ".radio label",
+    "identifier string",
+    0,
+    "left"
+   ],
+   [
+    2,
+    "#socInput",
+    "",
+    0,
+    "in"
+   ],
+   [
+    3,
+    "button.ref",
+    "hdr",
+    0,
+    "left"
+   ],
+   [
+    4,
+    "td.k",
+    "identifier",
+    1
+   ],
+   [
+    5,
+    "td.k",
+    "SOC address"
+   ],
+   [
+    6,
+    "td.k",
+    "signature"
+   ],
+   [
+    7,
+    "td.k",
+    "span"
+   ],
+   [
+    8,
+    "td.k",
+    "signed CAC address"
+   ],
+   [
+    9,
+    "td.k",
+    "recovered signer"
+   ],
+   [
+    10,
+    "td.k",
+    "address = keccak"
+   ],
+   [
+    11,
+    "td.k",
+    "signer = configured owner"
+   ],
+   [
+    12,
+    ".card h2",
+    "Payload"
+   ]
+  ]
+ },
+ {
+  "name": "bytes",
+  "base": "http://127.0.0.1:8192",
+  "hash": "bytes/0x142ccc558659f6e22d23f821fe40c9e0a6393ba0df7dc560742ab67459028d46",
+  "wait": "out-bytes",
+  "from": "#tab-bytes",
+  "to": "#out-bytes",
+  "maxHeight": 800,
+  "marks": [
+   [
+    1,
+    "#bytesRef",
+    "",
+    0,
+    "in"
+   ],
+   [
+    2,
+    "td.k",
+    "size"
+   ],
+   [
+    3,
+    "td.k",
+    "decoded as"
+   ],
+   [
+    4,
+    ".card h2",
+    "Body"
+   ]
+  ]
+ }
+]
