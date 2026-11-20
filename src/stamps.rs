@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use crate::addr::export;
 use crate::swarm::bee::{BatchInfo, Bee};
 use crate::swarm::postage::{
-    BucketLoad, GNOSIS_BLOCK_SECS, amount_for, bucket_capacity, cost_plur, format_bzz,
+    BucketLoad, GNOSIS_BLOCK_SECS, MAX_DEPTH, amount_for, bucket_capacity, cost_plur, format_bzz,
 };
 
 /// `n` with thousands separators.
@@ -80,6 +80,12 @@ pub async fn list(bee: &Bee, exports: &[PathBuf]) -> Result<()> {
                 u.chain_id
             );
         }
+    }
+    if !uses.is_empty() {
+        println!(
+            "(Only an export's permanent batch is recorded, in its uploaded.json: lower batches \
+             an upload used show no user here.)"
+        );
     }
     for u in &uses {
         match u.batch {
@@ -154,7 +160,9 @@ pub async fn plan(bee: &Bee, dir: &Path, opts: &PlanOptions) -> Result<()> {
     })?;
     println!(
         "The export {} (owner {}, chain {}, layout {}) stamps {} chunks: fullest bucket {}, mean \
-         {:.1}. A chunk written twice is counted twice, as addr-upload sends it twice.",
+         {:.1}. A chunk written more than once (a merge a stopped run wrote again, leaves two \
+         files share) is counted each time, so this is an upper bound: Bee may stamp a chunk \
+         it stamped before with the same batch into the same slot.",
         dir.display(),
         meta.owner,
         meta.chain_id,
@@ -163,12 +171,7 @@ pub async fn plan(bee: &Bee, dir: &Path, opts: &PlanOptions) -> Result<()> {
         group(all.fullest()),
         all.mean()
     );
-    let pct = opts.max_fill * 100.0;
-    let mut sizes = vec![(
-        "one batch for everything",
-        all.depth_for(opts.max_fill),
-        all.fullest(),
-    )];
+    let mut sizes = vec![("one batch for everything", &all)];
     if lower.chunks() > 0 {
         println!(
             "  permanent records (heads, the origin, top-level slices): {} chunks, fullest \
@@ -182,21 +185,39 @@ pub async fn plan(bee: &Bee, dir: &Path, opts: &PlanOptions) -> Result<()> {
             group(lower.fullest())
         );
         sizes.push((
-            "the permanent batch (--batch)",
-            permanent.depth_for(opts.max_fill),
-            permanent.fullest(),
+            "the permanent batch (--batch), lower slices all elsewhere",
+            &permanent,
         ));
         sizes.push((
             "one lower batch taking every lower slice (--lower-batch)",
-            lower.depth_for(opts.max_fill),
-            lower.fullest(),
+            &lower,
         ));
     }
-    println!("Depth, with the fullest bucket at most {pct:.0} % full (--max-fill):");
+    let sizes: Vec<(&str, u8, u64)> = sizes
+        .into_iter()
+        .map(|(what, load)| {
+            let depth = load.depth_for(opts.max_fill).with_context(|| {
+                format!("no batch up to depth {MAX_DEPTH} holds {what} at --max-fill")
+            })?;
+            Ok((what, depth, load.fullest()))
+        })
+        .collect::<Result<_>>()?;
+    println!(
+        "Depth, with the fullest bucket at most {:.0} % full (--max-fill):",
+        opts.max_fill * 100.0
+    );
     for (what, depth, fullest) in &sizes {
         println!(
             "  {what}: {depth} (fullest bucket {})",
             fill(*fullest, bucket_capacity(*depth))
+        );
+    }
+    if lower.chunks() > 0 {
+        println!(
+            "A lower slice that no --lower-batch outlives, or whose batch is not usable yet, \
+             goes to the permanent batch. Size --batch like the first line unless the lower \
+             batches surely cover every lower slice, or an immutable --batch refuses chunks \
+             once its fullest bucket is full."
         );
     }
     let Some(days) = opts.days else {
@@ -204,6 +225,9 @@ pub async fn plan(bee: &Bee, dir: &Path, opts: &PlanOptions) -> Result<()> {
         return Ok(());
     };
     ensure!(days >= 1, "--days must be at least 1");
+    let secs = days
+        .checked_mul(86_400)
+        .with_context(|| format!("--days {days} is too long"))?;
     let state = bee
         .chain_state()
         .await
@@ -212,7 +236,7 @@ pub async fn plan(bee: &Bee, dir: &Path, opts: &PlanOptions) -> Result<()> {
         state.current_price > 0,
         "the Bee node reports a storage price of 0"
     );
-    let amount = amount_for(state.current_price, days * 86_400, opts.block_secs);
+    let amount = amount_for(state.current_price, secs, opts.block_secs);
     println!(
         "{days} days at the current price ({} PLUR per chunk per block, block {}, {} s per \
          block): a balance of {amount} PLUR per chunk. The price moves; this is an estimate.",
@@ -224,21 +248,45 @@ pub async fn plan(bee: &Bee, dir: &Path, opts: &PlanOptions) -> Result<()> {
             format_bzz(cost_plur(amount, *depth))
         );
     }
-    let label = opts
-        .label
-        .as_deref()
-        .unwrap_or("<label: owner, chain, first block>");
     println!(
         "To buy one (the owner's action; nothing here buys, and the importer refuses a \
          mutable batch):"
     );
     for (what, depth, _) in &sizes {
         println!(
-            "  {what}: curl -X POST -H 'immutable: true' '{}stamps/{amount}/{depth}?label={label}'",
-            bee.base_url()
+            "  {what}: {}",
+            buy_command(bee.base_url(), amount, *depth, opts.label.as_deref())?
         );
     }
+    if opts.label.is_none() {
+        println!("  (--label names the batch: owner, chain and first block of the index.)");
+    }
     Ok(())
+}
+
+/// `s` as one shell word in single quotes (a `'` inside closes, escapes and reopens).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The command that buys an immutable batch of `depth` with `amount` per chunk on the node at
+/// `base`: the label percent-encoded in the URL, the URL shell-quoted.
+fn buy_command(
+    base: &alloy::transports::http::reqwest::Url,
+    amount: u128,
+    depth: u8,
+    label: Option<&str>,
+) -> Result<String> {
+    let mut url = base
+        .join(&format!("stamps/{amount}/{depth}"))
+        .context("building the purchase URL")?;
+    if let Some(label) = label {
+        url.query_pairs_mut().append_pair("label", label);
+    }
+    Ok(format!(
+        "curl -X POST -H 'immutable: true' {}",
+        shell_quote(url.as_str())
+    ))
 }
 
 /// The default seconds per block for `--block-secs`.
@@ -258,5 +306,20 @@ mod tests {
         assert_eq!(fill(32, bucket_capacity(23)), "32/128 (25 %)");
         assert_eq!(ttl(-1), "unknown");
         assert_eq!(ttl(86_400 * 3 / 2), "1.5 days");
+    }
+
+    #[test]
+    fn the_buy_command_survives_any_label() {
+        let base: alloy::transports::http::reqwest::Url = "http://localhost:1635/".parse().unwrap();
+        assert_eq!(
+            buy_command(&base, 1200, 22, None).unwrap(),
+            "curl -X POST -H 'immutable: true' 'http://localhost:1635/stamps/1200/22'"
+        );
+        assert_eq!(
+            buy_command(&base, 1200, 22, Some("0xabc, chain 1 & owner's <x>")).unwrap(),
+            "curl -X POST -H 'immutable: true' \
+             'http://localhost:1635/stamps/1200/22?label=0xabc%2C+chain+1+%26+owner%27s+%3Cx%3E'"
+        );
+        assert_eq!(shell_quote("a'b"), r"'a'\''b'");
     }
 }

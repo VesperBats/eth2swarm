@@ -476,7 +476,8 @@ echo "== postage batches by lifetime: lower slices go to the batch that expires 
 # units (19,968 s: the long batch); units 5 and 6 write (0, 4) and (1, 2), which live 1 and
 # 2 units (the short one); heads and the origin go to the permanent batch.
 buy_batch() {
-  curl -sf -X POST "$UPLOAD_BEE/stamps/$1/17" \
+  # Immutable by name, never by Bee's default (.claude/agent/postage.md, rules 3 and 5).
+  curl -sf -X POST -H 'immutable: true' "$UPLOAD_BEE/stamps/$1/17" \
     | python3 -c 'import json, sys; print("0x" + json.load(sys.stdin)["batchID"])'
 }
 batch_info() {

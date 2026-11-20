@@ -64,8 +64,8 @@ impl BucketLoad {
     }
 
     /// The smallest depth whose buckets hold the fullest one at no more than `max_fill`
-    /// (0 < max_fill ≤ 1) of their capacity, and at least [`MIN_DEPTH`].
-    pub fn depth_for(&self, max_fill: f64) -> u8 {
+    /// (0 < max_fill ≤ 1) of their capacity, and at least [`MIN_DEPTH`]; `None` if none does.
+    pub fn depth_for(&self, max_fill: f64) -> Option<u8> {
         depth_for(self.fullest(), max_fill)
     }
 }
@@ -75,13 +75,14 @@ pub fn bucket_capacity(depth: u8) -> u64 {
     1u64 << depth.saturating_sub(BUCKET_DEPTH).min(63)
 }
 
+/// The deepest batch [`depth_for`] proposes (2^48 chunks per bucket: far beyond any index).
+pub const MAX_DEPTH: u8 = 64;
+
 /// The smallest depth (at least [`MIN_DEPTH`]) whose buckets hold `fullest` chunks at no more
-/// than `max_fill` of their capacity.
-pub fn depth_for(fullest: u64, max_fill: f64) -> u8 {
+/// than `max_fill` of their capacity; `None` if none up to [`MAX_DEPTH`] does.
+pub fn depth_for(fullest: u64, max_fill: f64) -> Option<u8> {
     let max_fill = max_fill.clamp(f64::MIN_POSITIVE, 1.0);
-    (MIN_DEPTH..=63)
-        .find(|d| fullest as f64 <= bucket_capacity(*d) as f64 * max_fill)
-        .unwrap_or(63)
+    (MIN_DEPTH..=MAX_DEPTH).find(|d| fullest as f64 <= bucket_capacity(*d) as f64 * max_fill)
 }
 
 /// The balance per chunk (PLUR) that keeps a batch alive `secs` seconds at `price` PLUR per
@@ -132,12 +133,13 @@ mod tests {
         assert_eq!(bucket_capacity(23), 128);
         // The mainnet month index (2026-11-20): fullest bucket 32 chunks. Full at depth 21,
         // half full at 22.
-        assert_eq!(depth_for(32, 1.0), 21);
-        assert_eq!(depth_for(32, 0.5), 22);
-        assert_eq!(depth_for(33, 0.5), 23);
+        assert_eq!(depth_for(32, 1.0), Some(21));
+        assert_eq!(depth_for(32, 0.5), Some(22));
+        assert_eq!(depth_for(33, 0.5), Some(23));
         // Never below what Bee sells.
-        assert_eq!(depth_for(0, 0.5), MIN_DEPTH);
-        assert_eq!(depth_for(1, 1.0), MIN_DEPTH);
+        assert_eq!(depth_for(0, 0.5), Some(MIN_DEPTH));
+        assert_eq!(depth_for(1, 1.0), Some(MIN_DEPTH));
+        assert_eq!(depth_for(u64::MAX, 0.5), None, "nothing holds it");
     }
 
     #[test]

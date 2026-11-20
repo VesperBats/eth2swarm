@@ -670,6 +670,7 @@ pub async fn upload(
             bee.usable_batch().await?
         }
     };
+    let recorded_batch = progress.batch;
     if let Some(recorded) = progress.batch {
         ensure!(
             recorded == batch,
@@ -687,6 +688,7 @@ pub async fn upload(
             meta.format
         );
     }
+    let resumed = recorded_batch == Some(batch);
     let stamps = std::sync::Arc::new(
         Stamps::open(
             bee.clone(),
@@ -695,7 +697,18 @@ pub async fn upload(
             batches.grace_days,
             batches.slot_secs,
         )
-        .await?,
+        .await
+        .with_context(|| {
+            if resumed {
+                format!(
+                    "{} was uploaded with {batch} so far: to go on with another batch, upload \
+                     everything again with --from-start --batch <an immutable batch>",
+                    dir.display()
+                )
+            } else {
+                format!("the batches for {}", dir.display())
+            }
+        })?,
     );
     // The log must still hold the head the last upload ended with.
     if let Some(head) = progress.last_head {
