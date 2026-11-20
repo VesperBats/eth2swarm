@@ -44,3 +44,9 @@ bee-factory stop                               # tear down
 The rustc version is pinned in `rust-toolchain.toml`, every action by commit, and
 bee-factory by `ci/bee-factory/package-lock.json`; `.github/dependabot.yml` proposes
 updates to them as PRs (7-day cooldown).
+
+## License
+
+eth2swarm is licensed under the [Apache License, Version 2.0](LICENSE).
+
+Copyright 2026 Dirk Jäckel.

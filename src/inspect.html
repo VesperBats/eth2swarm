@@ -63,6 +63,7 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
 .radio { display: flex; gap: 14px; margin-bottom: 10px; font-size: 13px; }
 .radio label { flex-direction: row; text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--ink); align-items: center; }
 .hidden { display: none !important; }
+#owner:placeholder-shown { border-color: var(--warn); }
 .spinner { color: var(--muted); font-style: italic; }
 @media (max-width: 760px) { .settings { grid-template-columns: 1fr 1fr; } .steps li { grid-template-columns: 22px 1fr; } .steps li span:last-child { grid-column: 2; } }
 </style>
@@ -74,7 +75,7 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
     <a id="help" href="help" target="_blank" rel="noopener" class="ghost" style="float:right;margin-right:8px;font:600 12px var(--sans);padding:4px 10px;border:1px solid var(--line);border-radius:4px;color:var(--ink);text-decoration:none" title="What every field and term means, with annotated screenshots">help</a></h1>
   <div class="settings">
     <label>Node<select id="node"></select></label>
-    <label>SOC owner<input id="owner" placeholder="0x… importer address" spellcheck="false"></label>
+    <label>SOC owner<input id="owner" placeholder="required: 0x… importer address" spellcheck="false" title="Address of the importer's key. Every lookup except Bytes and a SOC lookup by address needs it; ethswarm serve fills it in from --owner / ETH2SWARM_OWNER"></label>
     <label>Chain ID<input id="chain" type="number" min="0"></label>
     <label>Trust anchor (blank = owner's published anchor)<input id="anchor" placeholder="0x… pinned anchor" spellcheck="false"></label>
   </div>
