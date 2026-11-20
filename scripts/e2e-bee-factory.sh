@@ -368,10 +368,10 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
           --chain-id "$CHAIN_ID" --units "$ACT_UNITS" --since "$U1" --limit 1)
         ENTRY=$(echo "$ENTRY" | head -1)
         echo "$ENTRY" | grep -qw to \
-          || { echo "FAIL: the failed creation's target has no TO role: $OUT"; exit 1; }
+          || { echo "FAIL: the failed creation's target has no TO role: $ENTRY"; exit 1; }
         if [ ${#TRACE_FLAG[@]} -gt 0 ]; then
           echo "$ENTRY" | grep -qw trace \
-            || { echo "FAIL: the failed creation's target has no TRACE role: $OUT"; exit 1; }
+            || { echo "FAIL: the failed creation's target has no TRACE role: $ENTRY"; exit 1; }
         fi ;;
     esac
   done

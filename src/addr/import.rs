@@ -735,12 +735,16 @@ async fn finalized_units(provider: &impl Provider) -> Result<(u64, u64)> {
 /// uncovered only when it is reached would end a backfill after days, and the next run would
 /// repeat it). `done` units are imported already: a smaller `--units` cannot help those.
 fn check_coverage(index: &TraceIndex, first_unit: u64, units: u64, done: u64) -> Result<()> {
-    let ranges: Vec<String> = index
-        .ranges()
-        .iter()
-        .map(|r| format!("{}..={}", r.start(), r.end()))
-        .collect();
-    info!(files = %ranges.join(", "), "trace index");
+    // Adjoining files as one run: a mainnet export has hundreds of files and few gaps.
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for r in index.ranges() {
+        match runs.last_mut() {
+            Some(last) if last.1.checked_add(1) == Some(*r.start()) => last.1 = *r.end(),
+            _ => runs.push((*r.start(), *r.end())),
+        }
+    }
+    let ranges: Vec<String> = runs.iter().map(|(a, b)| format!("{a}..={b}")).collect();
+    info!(blocks = %ranges.join(", "), files = index.ranges().len(), "trace index");
     if units <= first_unit {
         // Nothing to read; `backfill_slices` refuses an empty backfill.
         return Ok(());
@@ -834,12 +838,6 @@ where
         Some(d) => Traces::Index(std::sync::Arc::new(TraceIndex::open(d, chain_id)?)),
         None => Traces::rpc(opts.traces),
     };
-    if matches!(traces, Traces::Rpc) {
-        tracing::warn!(
-            "TRACE from trace_block misses the target of a failed internal creation, so this \
-             index is not exact under the TRACE rule; a frame index (--trace-index) is"
-        );
-    }
     let roles = role::mask(traces.detects());
     let existing = State::load(dir)?;
     ensure!(
@@ -892,6 +890,12 @@ where
             first_unit
         }
     };
+    if matches!(traces, Traces::Rpc) && existing.is_none() {
+        tracing::warn!(
+            "TRACE from trace_block misses the target of a failed internal creation, so this \
+             index is not exact under the TRACE rule; a frame index (--trace-index) is"
+        );
+    }
     if let Traces::Index(index) = &traces {
         // Every block the run can read: the backfill's (or a resumed one's), the new units',
         // and the ranges merges read again, all from the first unit on.

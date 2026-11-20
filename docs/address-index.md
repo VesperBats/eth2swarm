@@ -173,7 +173,8 @@ block-level pseudo-indexes 99995–99999 (withdrawal, rewards) are slot 0. The e
     among the block's frames unless they are never indexed, which rules out a block whose
     records are missing or cut short. The files must cover every block from the index's
     first one to the run's target without a gap, checked before anything is fetched (the
-    error names the first uncovered block and the largest `--units` the files allow);
+    error names the first uncovered block, and the largest `--units` the files allow where a
+    smaller `--units` would help);
     `--follow` is refused, since the files end where the export ended. Keep the files of
     blocks already imported: a merge reads its range again.
   - **Parity-style `trace_block`** (Erigon, Reth, Anvil; not geth, `--traces`): from every
