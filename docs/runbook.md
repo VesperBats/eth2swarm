@@ -4,8 +4,8 @@ The exact commands, in order, from Erigon's archive node to an index on Swarm, p
 checkpoint table Myotis bundles. Each step gives the **one-month** variant (an index from a
 later block, for testing) and the **full** variant (from genesis). The design behind the
 commands is in [address-index.md](address-index.md). The local Swarm is described in
-[bee-factory-setup.md](bee-factory-setup.md). Every flag here is in `ethswarm <command>
---help`.
+[bee-factory-setup.md](bee-factory-setup.md). Every `ethswarm` flag here is in `ethswarm
+<command> --help`, and those of `erigon-trace-export` in `erigon-trace-export -h`.
 
 The paths and hosts are the nuc's:
 - **Erigon** is the v3.8.1 archive node at `http://127.0.0.1:8645`, with its datadir at
@@ -31,13 +31,13 @@ Replace them elsewhere.
 **Postage:** `.claude/agent/postage.md` governs every upload to a real Bee node and every
 batch purchase. Ask before using a batch; propose a new one, never buy it yourself; use
 immutable batches only. bee-factory, which answers `GET /wallet` with `chainID` 1337, is
-exempt.
+exempt from asking and proposing, but not from the last rule: immutable batches there too.
 
 **Build the tools:**
 ```sh
 # ethswarm (from the repository root)
 systemd-run --user --scope -q -p MemoryHigh=4G -p MemoryMax=8G cargo build --release --locked -j 4
-cp target/release/ethswarm ~/bin/ethswarm      # a copy, so a rebuild never replaces a running binary
+install -m 755 target/release/ethswarm ~/bin/ethswarm   # a new file, so a running unit keeps its own
 
 # erigon-trace-export (Go 1.26+, gcc 10+; on the nuc /usr/local/go/bin/go and gcc-13)
 cd tools/erigon-trace-export
@@ -47,7 +47,8 @@ CC=gcc-13 CXX=g++-13 /usr/local/go/bin/go build -o ~/bin/erigon-trace-export .
 **A key for the index:** the SOC owner is the importer's key. One key is one index, and the
 key must never have published another one.
 ```sh
-umask 077; echo "0x$(openssl rand -hex 32)" > ~/addr1-<name>/key
+mkdir -p ~/addr1-<name>/state
+(umask 077; echo "0x$(openssl rand -hex 32)" > ~/addr1-<name>/key)
 ```
 Commands take it as `--key "$(cat key)"`, or via `ETH2SWARM_KEY`, which keeps it off the
 process list.
@@ -64,25 +65,37 @@ FINAL=$(curl -s -X POST -H 'content-type: application/json' \
   --data '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["finalized",false]}' \
   http://127.0.0.1:8645 | python3 -c 'import json,sys; print(int(json.load(sys.stdin)["result"]["number"],16))')
 
-# One month (≈ 217,000 blocks: ~10 min, ~7 GB)
+# One month (≈ 217,000 blocks: ~10 min, ~7 GB), into a directory of its own
 systemd-run --user --scope -q -p MemoryHigh=3G -p MemoryMax=6G \
   ~/bin/erigon-trace-export --datadir ~/erigon-data/mainnet-archive \
-  --from 26236928 --to "$FINAL" --out ~/erigon-data/a1tr/mainnet
+  --from 26236928 --to "$FINAL" --out ~/erigon-data/a1tr/mainnet-month
 
-# Full, from genesis (≈ 0.5–1 day, a few hundred GB)
-systemd-run --user --unit a1tr-export -p MemoryHigh=3G -p MemoryMax=6G \
-  sh -c "exec ~/bin/erigon-trace-export --datadir ~/erigon-data/mainnet-archive \
-         --from 0 --to $FINAL --out ~/erigon-data/a1tr/mainnet > ~/a1tr-export.log 2>&1"
+# Full, from genesis (≈ 0.5–1 day in all, a few hundred GB), in ranges of 2,000,000 blocks:
+# a run that stops loses its whole range (see below), so a range is the unit of retry
+for FROM in $(seq 0 2000000 "$FINAL"); do
+  TO=$(( FROM + 1999999 < FINAL ? FROM + 1999999 : FINAL ))
+  systemd-run --user --scope -q -p MemoryHigh=3G -p MemoryMax=6G \
+    ~/bin/erigon-trace-export --datadir ~/erigon-data/mainnet-archive \
+    --from "$FROM" --to "$TO" --out ~/erigon-data/a1tr/mainnet >> ~/a1tr-export.log 2>&1 \
+    || { echo "range $FROM..=$TO failed: rerun it"; break; }
+done
 ```
 
-- **Files:** one per 100,000 blocks (`--blocks-per-file`), named `trace-<first>-<last>.a1tr`.
-  A stopped run loses at most the file it was writing; rerun the same command.
-- **Finality:** `--to` may not be above the datadir's finalized block.
+- **Files:** one per 100,000 blocks (`--blocks-per-file`), named `trace-<first>-<last>.a1tr`,
+  aligned to multiples of 100,000 and clipped to `--from`/`--to`.
+- **A stopped run writes nothing.** The export first scans every index file of its range,
+  which is most of the time, and writes its files only at the end. A rerun of a range
+  replaces its files; it does not skip them.
+- **One directory per index.** The month's files have other boundaries than a full export's
+  (`trace-0026236928-0026299999` against `trace-0026200000-0026299999`), and an export refuses
+  a directory holding a file that overlaps its range with other boundaries.
+- **Finality:** `--to` may not be above the datadir's finalized block, unless
+  `--allow-unfinalized` is given.
 - **A sort buffer** of 128 MB by default (`--sort-buffer-mb`), in `<out>/.tmp`.
 - **Check the files** against `trace_block` on a few ranges before importing. Edge cases are
   self-destructs, failed creations, and pre-Byzantium blocks (which need `--receipts-rpc`):
   ```sh
-  ethswarm --rpc http://127.0.0.1:8645 trace-compare --trace-index ~/erigon-data/a1tr/mainnet \
+  ethswarm --rpc http://127.0.0.1:8645 trace-compare --trace-index ~/erigon-data/a1tr/mainnet-month \
     --from 26400000 --to 26400999
   ```
   An appearance only `trace_block` has is an error. One only the index has is listed: a
@@ -96,25 +109,31 @@ to an **export directory** (`--out`) that `addr-upload` sends later. Use `--out`
 long: it needs no Bee node and no postage while it runs.
 
 ```sh
-mkdir -p ~/addr1-<name>/state && cd ~/addr1-<name>
+cd ~/addr1-<name>
+# The target: every unit the frame index covers. LAST is the last block of the A1TR files
+# (the export's --to); a unit is 64 blocks.
+LAST=<the export's --to>
+UNITS=$(( (LAST + 1) / 64 ))
 
-# One month, from block 26,236,928 (a multiple of 64), up to what the frame index covers
-UNITS=$(( (26454000 + 1) / 64 ))     # the last block the A1TR files cover, + 1, / 64
+# One month, from block 26,236,928 (a multiple of 64)
 systemd-run --user --unit addr1-<name>-import -p MemoryHigh=3G -p MemoryMax=6G \
-  --working-directory="$PWD" sh -c 'ETH2SWARM_KEY=$(cat key) exec ~/bin/ethswarm \
+  --working-directory="$PWD" sh -c "ETH2SWARM_KEY=\$(cat key) exec ~/bin/ethswarm \
     --rpc http://127.0.0.1:8645 addr-import --state state --out export --init \
-    --from-block 26236928 --units '"$UNITS"' --trace-index ~/erigon-data/a1tr/mainnet \
-    --concurrency 4 --sort-memory-mb 128 >> import.log 2>&1'
+    --from-block 26236928 --units $UNITS --trace-index ~/erigon-data/a1tr/mainnet-month \
+    --concurrency 4 --sort-memory-mb 128 >> import.log 2>&1"
 
 # Full, from genesis: no --from-block. Receipts before Byzantium (block 4,370,000) come from
 # geth, since Erigon 3 serves them without the state root their receiptsRoot covers.
 systemd-run --user --unit addr1-full-import -p MemoryHigh=3G -p MemoryMax=6G \
-  --working-directory="$PWD" sh -c 'ETH2SWARM_KEY=$(cat key) exec ~/bin/ethswarm \
+  --working-directory="$PWD" sh -c "ETH2SWARM_KEY=\$(cat key) exec ~/bin/ethswarm \
     --rpc http://127.0.0.1:8645 --receipts-rpc http://zbox.tail2ab6c8.ts.net:8561 \
-    addr-import --state state --out export --init --units '"$UNITS"' \
+    addr-import --state state --out export --init --units $UNITS \
     --trace-index ~/erigon-data/a1tr/mainnet --concurrency 4 --sort-memory-mb 128 \
-    >> import.log 2>&1'
+    >> import.log 2>&1"
 ```
+
+`$UNITS` is expanded when the unit is started; `\$(cat key)` when it runs, so the key stays
+off the command line systemd records.
 
 - **`--init` only on the first run.** Later runs resume from `--state`, and pass the same
   `--out`.
@@ -197,8 +216,12 @@ systemd-run --user --unit addr1-<name>-upload -p MemoryHigh=1G -p MemoryMax=2G \
 ```
 
 `--follow` is refused with `--trace-index`: the files end where their export ended. A traced
-index can be extended in steps instead. Export the new blocks (step 1, `--from` the next file
-boundary), then run `addr-import --units <new target>`.
+index can be extended in steps instead:
+1. Export the new blocks into the same directory, `--from <the previous --to + 1>`. A file
+   boundary would leave a gap, and an earlier start overlaps a file with other boundaries.
+2. Run `addr-import --units <new target>` with the same `--state`, `--out` and
+   `--trace-index`. The files of blocks already imported must stay, since merges read them
+   again.
 
 ## 6. Check
 
