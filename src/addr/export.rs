@@ -45,8 +45,9 @@ use tracing::info;
 use super::io::{join_one, write_atomic};
 use super::layout::origin_id;
 use super::stamps::Stamps;
-use crate::swarm::bee::Bee;
+use crate::swarm::bee::{BEE_FACTORY_CHAIN, Bee, Buckets};
 use crate::swarm::file::file_reference;
+use crate::swarm::postage::BucketLoad;
 use crate::swarm::soc::{self, SignedSoc, soc_address};
 
 pub const FILE: u8 = 1;
@@ -427,6 +428,12 @@ pub struct Progress {
     /// The batch the records were stamped with: an upload with another batch (another node,
     /// or a new batch after the old one expired) starts from the beginning.
     pub batch: Option<B256>,
+    /// Every batch an upload of this directory stamped records with, permanent and lower,
+    /// kept across `--from-start`: what holds this index's chunks and must be topped up or
+    /// left to expire with it (`.claude/agent/postage.md`, rule 3). Empty in a file from
+    /// before they were recorded, which named only `batch`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batches: Vec<B256>,
 }
 
 impl Progress {
@@ -581,6 +588,10 @@ pub struct Batches {
     pub grace_days: u64,
     /// Seconds per block of the chain.
     pub slot_secs: u64,
+    /// Upload without checking that the batches can take it (`--no-capacity-check`): the
+    /// check counts a chunk listed twice twice, so a batch within a few chunks of full can
+    /// be refused though Bee would take it.
+    pub skip_capacity_check: bool,
 }
 
 /// Every chunk an upload of the export in `dir` stamps, up to its committed length, as
@@ -588,10 +599,22 @@ pub struct Batches {
 /// address, and every chunk of a spill or pages file's tree (the chunks Bee stores for
 /// `POST /bytes`). `life` is the record's ([`Record::life`]). A record written twice (a merge
 /// a stopped run wrote again) is listed twice, as `addr-upload` sends it twice.
-pub fn for_each_chunk(dir: &Path, mut f: impl FnMut(&B256, Option<u64>)) -> Result<ExportMeta> {
+pub fn for_each_chunk(dir: &Path, f: impl FnMut(&B256, Option<u64>)) -> Result<ExportMeta> {
     let meta = ExportMeta::read(dir)?;
     let committed = read_committed(dir)?.context("the export has no committed length")?;
-    let mut records = Records::open(dir, meta.format, 0, committed)?;
+    chunks_between(dir, meta.format, 0, committed, f)?;
+    Ok(meta)
+}
+
+/// [`for_each_chunk`] for the records from offset `from` to `to` of a layout-`format` log.
+fn chunks_between(
+    dir: &Path,
+    format: u32,
+    from: u64,
+    to: u64,
+    mut f: impl FnMut(&B256, Option<u64>),
+) -> Result<()> {
+    let mut records = Records::open(dir, format, from, to)?;
     while let Some(rec) = records.next_record()? {
         match rec.kind {
             SOC | HEAD | CHUNK => f(&rec.key, rec.life),
@@ -610,24 +633,116 @@ pub fn for_each_chunk(dir: &Path, mut f: impl FnMut(&B256, Option<u64>)) -> Resu
             k => bail!("record of unknown kind {k} at {}", rec.offset),
         }
     }
-    Ok(meta)
+    Ok(())
 }
 
-/// The export's owner, chain and the batch its uploads used so far (`uploaded.json`), for
-/// `ethswarm stamps`.
-pub fn upload_batch(dir: &Path) -> Result<(ExportMeta, Option<B256>)> {
+/// The export's owner, chain, the permanent batch its uploads use now, and every batch they
+/// recorded (`uploaded.json`), for `ethswarm stamps`.
+pub fn upload_batches(dir: &Path) -> Result<(ExportMeta, Option<B256>, Vec<B256>)> {
     let meta = ExportMeta::read(dir)?;
     let path = dir.join(PROGRESS_FILE);
-    let batch = match std::fs::read(&path) {
-        Ok(bytes) => {
-            serde_json::from_slice::<Progress>(&bytes)
-                .with_context(|| format!("reading {}", path.display()))?
-                .batch
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+    let progress = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<Progress>(&bytes)
+            .with_context(|| format!("reading {}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Progress::default(),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    Ok((meta, batch))
+    let mut all = progress.batches;
+    crate::addr::import::record_batches(&mut all, progress.batch);
+    Ok((meta, progress.batch, all))
+}
+
+/// Refuses an upload its batches cannot take (`.claude/agent/postage.md`): every chunk the
+/// records from `from` to `to` stamp, counted per bucket of the batch it goes to as of now
+/// ([`Stamps::plan`]), on top of what that batch holds already. Bee stamps a chunk it stamped
+/// before with the same batch into the same slot, so for a batch in `again` (one that holds
+/// this directory's chunks from earlier uploads, sent again from the start) the larger of the
+/// two counts is taken: right while a batch serves one index only.
+async fn check_capacity(
+    bee: &Bee,
+    stamps: &Stamps,
+    dir: &Path,
+    format: u32,
+    from: u64,
+    to: u64,
+    again: &[B256],
+) -> Result<()> {
+    let plan = stamps.plan().await;
+    if let Some(b) = plan.left_out.first() {
+        bail!(
+            "lower batch {b} is not usable now (not confirmed yet, expired, or Bee could not \
+             say): the upload would start using it once it is, so its load cannot be checked. \
+             Wait until Bee confirms it, or leave it out"
+        );
+    }
+    let mut loads: std::collections::BTreeMap<B256, BucketLoad> = Default::default();
+    chunks_between(dir, format, from, to, |address, life| {
+        loads.entry(plan.batch_for(life)).or_default().add(address)
+    })?;
+    for (batch, load) in &loads {
+        let have = bee
+            .buckets(batch)
+            .await
+            .with_context(|| format!("reading the fill of batch {batch}"))?;
+        let reuse = again.contains(batch);
+        if let Some(o) = overflow(load.counts(), &have, reuse) {
+            bail!(
+                "batch {batch} cannot take this upload of {}: its bucket {:#06x} would hold {} \
+                 chunks, and holds at most {} ({} there now, {} from this upload{}). Nothing \
+                 is uploaded. `ethswarm stamps plan {}` sizes a batch that fits. The count is \
+                 an upper bound: a chunk the export lists twice, or one a stopped upload sent \
+                 already, is counted twice; for a batch that close to full, \
+                 --no-capacity-check uploads anyway",
+                dir.display(),
+                o.bucket,
+                o.total,
+                have.upper_bound,
+                o.have,
+                o.new,
+                if reuse {
+                    ", which counts the larger: the batch holds this export's chunks already"
+                } else {
+                    ""
+                },
+                dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The fullest bucket that would overflow, if any.
+#[derive(Debug, PartialEq, Eq)]
+struct Overflow {
+    bucket: usize,
+    have: u32,
+    new: u32,
+    total: u64,
+}
+
+/// Whether `new` chunks per bucket fit a batch filled as `have` says: the bucket that would
+/// overflow it by most, if any. With `reuse`, the batch's chunks are counted among `new`
+/// (sent again into their slots), so a bucket ends with the larger of the two.
+fn overflow(new: &[u32], have: &Buckets, reuse: bool) -> Option<Overflow> {
+    new.iter()
+        .enumerate()
+        .filter(|(_, n)| **n > 0)
+        .map(|(bucket, &n)| {
+            let h = have.counts.get(bucket).copied().unwrap_or(0);
+            let total = if reuse {
+                u64::from(h.max(n))
+            } else {
+                u64::from(h) + u64::from(n)
+            };
+            Overflow {
+                bucket,
+                have: h,
+                new: n,
+                total,
+            }
+        })
+        .filter(|o| o.total > u64::from(have.upper_bound))
+        .max_by_key(|o| (o.total, std::cmp::Reverse(o.bucket)))
 }
 
 /// Uploads the export in `dir` through `bee`, from where the last upload of this directory
@@ -646,15 +761,54 @@ pub async fn upload(
     let _lock = DirLock::acquire(dir, UPLOAD_LOCK, "addr-upload")?;
     let committed = read_committed(dir)?.context("the export has no committed length")?;
     let progress_path = dir.join(PROGRESS_FILE);
-    let mut progress: Progress = match (from_start, std::fs::read(&progress_path)) {
-        (false, Ok(bytes)) => serde_json::from_slice(&bytes)?,
-        (false, Err(e)) if e.kind() != std::io::ErrorKind::NotFound => {
-            return Err(e).with_context(|| format!("reading {}", progress_path.display()));
+    let earlier: Option<Progress> = match std::fs::read(&progress_path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(p) => Some(p),
+            Err(e) if !from_start => {
+                return Err(e).with_context(|| format!("reading {}", progress_path.display()));
+            }
+            // Starting over needs nothing from it but the batches it names.
+            Err(e) => {
+                tracing::warn!(
+                    "{}: {e}; starting over without the batches it names",
+                    progress_path.display()
+                );
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) if from_start => {
+            tracing::warn!(
+                "{}: {e}; starting over without the batches it names",
+                progress_path.display()
+            );
+            None
         }
-        _ => Progress::default(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", progress_path.display())),
+    };
+    // Every batch that holds chunks of this directory already, from the uploads so far.
+    let held: Vec<B256> = earlier.as_ref().map_or_else(Vec::new, |p| {
+        let mut held = p.batches.clone();
+        crate::addr::import::record_batches(&mut held, p.batch);
+        held
+    });
+    let mut progress = match earlier {
+        Some(p) if !from_start => p,
+        _ => Progress {
+            batches: held.clone(),
+            ..Progress::default()
+        },
     };
     let batch = match (batches.permanent, progress.batch) {
-        (Some(b), _) | (None, Some(b)) => b,
+        (Some(b), _) => b,
+        // On bee-factory only, the batch of the earlier uploads goes on by default.
+        (None, Some(b)) if bee.wallet_chain().await.ok() == Some(BEE_FACTORY_CHAIN) => b,
+        (None, Some(b)) => bail!(
+            "{} was uploaded with batch {b} so far: pass --batch {b} to continue. Only a node \
+             that reports bee-factory's chain in GET /wallet takes a batch by default \
+             (`.claude/agent/postage.md`, rule 1)",
+            dir.display()
+        ),
         (None, None) => {
             // With lower batches, the node's "first usable batch" may well be a short one:
             // the permanent records must not land there by accident.
@@ -662,7 +816,7 @@ pub async fn upload(
                 batches.lower.is_empty(),
                 "--lower-batch needs the permanent batch named with --batch"
             );
-            bee.usable_batch().await?
+            bee.default_batch("addr-upload needs --batch").await?
         }
     };
     let recorded_batch = progress.batch;
@@ -732,6 +886,21 @@ pub async fn upload(
     if progress.last_head.is_none() {
         check_origin(bee, dir, &meta, committed).await?;
     }
+    if committed > progress.offset && !batches.skip_capacity_check {
+        // A batch that already holds this directory's chunks, sent again from the start,
+        // takes them into the slots they have.
+        let again: &[B256] = if from_start { &held } else { &[] };
+        check_capacity(
+            bee,
+            &stamps,
+            dir,
+            meta.format,
+            progress.offset,
+            committed,
+            again,
+        )
+        .await?;
+    }
     let mut summary = UploadSummary {
         owner: meta.owner,
         chain_id: meta.chain_id,
@@ -753,12 +922,11 @@ pub async fn upload(
             let b = stamps.batch_for(None).await?;
             upload_one(bee.clone(), b, meta.owner, rec, soc).await?;
             summary.heads += 1;
-            progress = Progress {
-                offset: end,
-                last_head: Some(key),
-                last_head_at: offset,
-                batch: Some(batch),
-            };
+            progress.offset = end;
+            progress.last_head = Some(key);
+            progress.last_head_at = offset;
+            progress.batch = Some(batch);
+            crate::addr::import::record_batches(&mut progress.batches, stamps.used().into_keys());
             progress.save(&progress_path)?;
             since_save = 0;
         } else {
@@ -782,6 +950,7 @@ pub async fn upload(
                 join_one(&mut set).await?;
             }
             progress.offset = summary.offset;
+            crate::addr::import::record_batches(&mut progress.batches, stamps.used().into_keys());
             progress.save(&progress_path)?;
             since_save = 0;
         }
@@ -792,6 +961,7 @@ pub async fn upload(
     // Records after the last head (a merge built after it) are uploaded too.
     if summary.offset > progress.offset {
         progress.offset = summary.offset;
+        crate::addr::import::record_batches(&mut progress.batches, stamps.used().into_keys());
         progress.save(&progress_path)?;
     }
     summary.batches = stamps.used();
@@ -936,6 +1106,7 @@ mod tests {
                     lower,
                     grace_days: 7,
                     slot_secs: 12,
+                    skip_capacity_check: false,
                 };
                 format!(
                     "{:#}",
@@ -966,6 +1137,158 @@ mod tests {
         // The node cannot be asked: no --from-start either.
         let e = run(vec![Some("500")], vec![]).await;
         assert!(!e.contains("--from-start"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bucket_overflows_by_the_sum_or_with_reuse_the_larger() {
+        let have = Buckets {
+            upper_bound: 4,
+            counts: vec![0, 3, 4, 1],
+        };
+        // Fresh chunks add to what the batch holds.
+        assert_eq!(overflow(&[4, 1, 0, 3], &have, false), None);
+        assert_eq!(
+            overflow(&[4, 2, 1, 0], &have, false),
+            Some(Overflow {
+                bucket: 1,
+                have: 3,
+                new: 2,
+                total: 5
+            }),
+            "the bucket over by most, the lowest of a tie"
+        );
+        // Sent again into their slots: the larger count stays.
+        assert_eq!(overflow(&[4, 2, 1, 0], &have, true), None);
+        assert_eq!(
+            overflow(&[5, 0, 0, 0], &have, true).map(|o| o.bucket),
+            Some(0)
+        );
+        // A bucket this upload does not touch is never blamed, however full.
+        let full = Buckets {
+            upper_bound: 2,
+            counts: vec![9, 0],
+        };
+        assert_eq!(overflow(&[0, 2], &full, false), None);
+    }
+
+    #[test]
+    fn a_progress_file_from_before_the_batches_were_recorded_reads() {
+        let old = r#"{"offset":10,"last_head":null,"last_head_at":0,"batch":null}"#;
+        let p: Progress = serde_json::from_str(old).unwrap();
+        assert!(p.batches.is_empty());
+        let mut b = vec![B256::repeat_byte(5)];
+        crate::addr::import::record_batches(&mut b, [B256::repeat_byte(1), B256::repeat_byte(5)]);
+        assert_eq!(b, [B256::repeat_byte(1), B256::repeat_byte(5)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_its_batch_cannot_take_is_refused() {
+        use crate::addr::stamps::tests::serve;
+        let dir = tmp("capacity");
+        let signer = PrivateKeySigner::random();
+        let meta = ExportMeta::new(1, signer.address());
+        let mut log = ExportLog::open(&dir, &meta, None).unwrap();
+        let head = soc::sign(&signer, B256::repeat_byte(2), b"head".to_vec()).unwrap();
+        log.append_soc(HEAD, &meta.owner, None, &head).unwrap();
+        let end = log.checkpoint().unwrap();
+        log.commit(end).unwrap();
+        drop(log);
+        let perm = B256::repeat_byte(9);
+        let k = crate::swarm::postage::bucket(&soc_address(&B256::repeat_byte(2), &meta.owner));
+        let ok: &'static str = r#"{"usable":true,"batchTTL":1000,"immutableFlag":true}"#;
+        let fill = |n: u32| -> &'static str {
+            Box::leak(
+                format!(
+                    r#"{{"depth":17,"bucketDepth":16,"bucketUpperBound":2,"buckets":[{{"bucketID":{k},"collisions":{n}}}]}}"#
+                )
+                .into_boxed_str(),
+            )
+        };
+        let run = |fill: &'static str, from_start: bool| {
+            let dir = dir.clone();
+            async move {
+                // The batch, the origin (none yet: asked twice), the batch's buckets; then
+                // nothing answers.
+                let bee = Bee::new(serve(vec![Some(ok), None, None, Some(fill)]))
+                    .unwrap()
+                    .with_retries(1);
+                let batches = Batches {
+                    permanent: Some(perm),
+                    lower: vec![],
+                    grace_days: 7,
+                    slot_secs: 12,
+                    skip_capacity_check: false,
+                };
+                format!(
+                    "{:#}",
+                    upload(&bee, batches, &dir, 1, from_start)
+                        .await
+                        .err()
+                        .unwrap()
+                )
+            }
+        };
+        // The head's bucket is full: refused before anything is sent, and why.
+        let e = run(fill(2), false).await;
+        assert!(
+            e.contains("cannot take this upload")
+                && e.contains("would hold 3 chunks, and holds at most 2")
+                && e.contains("stamps plan"),
+            "{e}"
+        );
+        // One slot left: it goes on to upload (and then finds no node).
+        let e = run(fill(1), false).await;
+        assert!(!e.contains("cannot take"), "{e}");
+        // --no-capacity-check: the fill is never asked.
+        let bee = Bee::new(serve(vec![Some(ok), None, None]))
+            .unwrap()
+            .with_retries(1);
+        let skip = Batches {
+            permanent: Some(perm),
+            skip_capacity_check: true,
+            ..Default::default()
+        };
+        let e = format!(
+            "{:#}",
+            upload(&bee, skip, &dir, 1, false).await.unwrap_err()
+        );
+        assert!(!e.contains("cannot take") && !e.contains("fill"), "{e}");
+        // A lower batch not usable yet: what would go there cannot be counted.
+        let lower = B256::repeat_byte(1);
+        let pending: &'static str = r#"{"usable":false,"batchTTL":0,"immutableFlag":true}"#;
+        let bee = Bee::new(serve(vec![
+            Some(ok),
+            Some(pending),
+            None,
+            None,
+            Some(pending),
+        ]))
+        .unwrap()
+        .with_retries(1);
+        let with_lower = Batches {
+            permanent: Some(perm),
+            lower: vec![lower],
+            ..Default::default()
+        };
+        let e = format!(
+            "{:#}",
+            upload(&bee, with_lower, &dir, 1, false).await.unwrap_err()
+        );
+        assert!(
+            e.contains(&format!("lower batch {lower} is not usable now")),
+            "{e}"
+        );
+        // Sent again from the start with the batch the directory recorded: the head's chunk
+        // takes its old slot.
+        Progress {
+            batch: Some(perm),
+            ..Default::default()
+        }
+        .save(&dir.join(PROGRESS_FILE))
+        .unwrap();
+        let e = run(fill(2), true).await;
+        assert!(!e.contains("cannot take"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

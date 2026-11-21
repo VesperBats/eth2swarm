@@ -45,71 +45,100 @@ fn ttl(secs: i64) -> String {
     }
 }
 
-/// An export and the batch its uploads used.
-struct ExportUse {
-    dir: PathBuf,
+/// An index (an export, or the state of one uploaded straight to Bee) and the batches it
+/// recorded.
+struct IndexUse {
+    what: String,
     owner: alloy::primitives::Address,
     chain_id: u64,
-    batch: Option<B256>,
+    /// The permanent batch an export's uploads use now.
+    current: Option<B256>,
+    /// Every batch it recorded.
+    batches: Vec<B256>,
 }
 
-/// `ethswarm stamps`: one line per batch of the node, then which export uses which.
-pub async fn list(bee: &Bee, exports: &[PathBuf]) -> Result<()> {
+/// `ethswarm stamps`: one line per batch of the node, then which index uses which.
+pub async fn list(bee: &Bee, exports: &[PathBuf], states: &[PathBuf]) -> Result<()> {
     let batches = bee.stamps().await.context("reading the node's batches")?;
-    let uses: Vec<ExportUse> = exports
+    let mut uses: Vec<IndexUse> = exports
         .iter()
         .map(|dir| {
-            let (meta, batch) = export::upload_batch(dir)?;
-            Ok(ExportUse {
-                dir: dir.clone(),
+            let (meta, current, batches) = export::upload_batches(dir)?;
+            Ok(IndexUse {
+                what: format!("the export {}", dir.display()),
                 owner: meta.owner,
                 chain_id: meta.chain_id,
-                batch,
+                current,
+                batches,
             })
         })
         .collect::<Result<_>>()?;
+    for dir in states {
+        let state = crate::addr::import::State::load(dir)?
+            .with_context(|| format!("no importer state in {}", dir.display()))?;
+        ensure!(
+            state.export_len.is_none(),
+            "{} is the state of an index exported to a directory: its batches are in the \
+             export's uploaded.json, so pass the export with --export",
+            dir.display()
+        );
+        uses.push(IndexUse {
+            what: format!("the index state {}", dir.display()),
+            owner: state.owner,
+            chain_id: state.chain_id,
+            current: None,
+            batches: state.batches,
+        });
+    }
     if batches.is_empty() {
         println!("The Bee node holds no postage batch.");
     }
     for b in &batches {
         print_batch(b);
         let mut named = false;
-        for u in uses.iter().filter(|u| u.batch == Some(b.batch_id)) {
+        for u in uses.iter().filter(|u| u.batches.contains(&b.batch_id)) {
             named = true;
             println!(
-                "    used by the export {} (owner {}, chain {})",
-                u.dir.display(),
+                "    used by {} (owner {}, chain {}){}",
+                u.what,
                 u.owner,
-                u.chain_id
+                u.chain_id,
+                if u.current == Some(b.batch_id) {
+                    ", its permanent batch"
+                } else {
+                    ""
+                }
             );
         }
         if !named {
             println!(
-                "    use unknown: no given export names it (its label, or the work item's \
-                 records, may)"
+                "    use unknown: no given export or state names it (its label, or the work \
+                 item's records, may)"
             );
         }
     }
     println!(
-        "(Only an export's permanent batch is recorded, in its uploaded.json: a lower batch an \
-         upload used shows as unknown here.)"
+        "(Uploads before this build recorded only an export's permanent batch, and an index \
+         uploaded straight to Bee none: a batch they used shows as unknown here.)"
     );
     for u in &uses {
-        match u.batch {
-            None => println!(
-                "The export {} (owner {}, chain {}) has not been uploaded yet.",
-                u.dir.display(),
-                u.owner,
-                u.chain_id
-            ),
-            Some(id) if !batches.iter().any(|b| b.batch_id == id) => println!(
-                "The export {} (owner {}, chain {}) was uploaded with batch {id}, which this \
-                 node does not hold (another node's, or expired).",
-                u.dir.display(),
-                u.owner,
-                u.chain_id
-            ),
-            Some(_) => {}
+        if u.batches.is_empty() {
+            println!(
+                "{} (owner {}, chain {}) records no batch: not uploaded yet, or before batches \
+                 were recorded.",
+                u.what, u.owner, u.chain_id
+            );
+        }
+        for id in u
+            .batches
+            .iter()
+            .filter(|id| !batches.iter().any(|b| b.batch_id == **id))
+        {
+            println!(
+                "{} (owner {}, chain {}) used batch {id}, which this node does not hold \
+                 (another node's, or expired).",
+                u.what, u.owner, u.chain_id
+            );
         }
     }
     Ok(())

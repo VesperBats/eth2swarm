@@ -486,13 +486,35 @@ How the importer stamps (`addr-import` and `addr-upload`, `--batch` and `--lower
   chosen for, or the upload fails when it is full. A batch of depth `d` holds 2^(d−16)
   chunks in each of its 65,536 buckets (a chunk address's first 16 bits), and it is full
   when its fullest bucket is: the depth follows that bucket, not the total.
+- `addr-upload` refuses an upload its batches cannot take, before it sends anything. It
+  counts every chunk the records still to upload stamp, per bucket of the batch each goes
+  to as of now, and adds what that batch holds already (`GET /stamps/{id}/buckets`). Bee
+  stamps a chunk it stamped before with the same batch into the same slot, so for a batch
+  the directory's earlier uploads used, sent again with `--from-start`, the larger of the
+  two counts is taken. That is right while a batch serves one index only. Otherwise the
+  count is an upper bound: a chunk the export lists twice (a merge a stopped run wrote
+  again), or one a stopped upload sent already, counts twice, so `--no-capacity-check`
+  uploads to a batch the check refuses by a few chunks. A lower batch not usable yet is
+  refused too: the upload would start using it once Bee confirms it, uncounted. An import
+  straight to Bee cannot know its load in advance: Bee refuses the chunk once an immutable
+  batch's bucket is full, and the run stops there.
+- `--batch` is required unless the Bee node is bee-factory: the node whose `GET /wallet`
+  reports chain 1337. There an upload without it takes the batch of the directory's
+  earlier uploads, else the node's first usable immutable batch. On any other node no
+  batch is taken by default: one batch per index is a choice, never a default.
+- Every batch an index is stamped with is recorded, the permanent ones and the lower ones:
+  by `addr-upload` in the export's `uploaded.json` (`batches`, kept across
+  `--from-start`), and by `addr-import` without `--out` in its state (`batches`). Anyone
+  holding a batch ID can top it up, and the batches an index needs to stay retrievable
+  are the ones to top up.
 - Every batch must be immutable: `addr-import`, `addr-upload` and `import` refuse a mutable
   batch, and one whose mutability Bee does not report. A full bucket of a mutable batch
   overwrites its oldest chunk, which loses write-once records without an error.
 - **Choosing and sizing batches** (`.claude/agent/postage.md` for agents working here):
-  - `ethswarm stamps [--export <dir>]...` lists the node's batches. For each it shows the
-    depth, the fullest bucket against capacity, whether it is immutable and usable, and the
-    remaining lifetime, plus which of the given exports was uploaded with it.
+  - `ethswarm stamps [--export <dir>]... [--state <dir>]...` lists the node's batches. For
+    each it shows the depth, the fullest bucket against capacity, whether it is immutable
+    and usable, and the remaining lifetime, plus which of the given exports and importer
+    states recorded it.
   - `ethswarm stamps plan <dir> [--days N]` counts every chunk an export's upload stamps,
     per bucket. It gives the smallest depth that keeps the fullest bucket at most
     `--max-fill` full (default half), for one batch taking everything, and for the

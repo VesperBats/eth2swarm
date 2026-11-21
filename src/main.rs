@@ -59,9 +59,10 @@ struct Cli {
 #[derive(clap::Args, Debug, Clone)]
 struct Stamping {
     /// Postage batch ID for the permanent records: heads, the origin, top-level slices, and
-    /// everything without --lower-batch. Defaults to the batch of the earlier uploads of the
-    /// directory (addr-upload), else the Bee node's first usable immutable batch; required with
-    /// --lower-batch.
+    /// everything without --lower-batch. Required unless the Bee node is bee-factory (its
+    /// GET /wallet reports chain 1337), where it defaults to the batch of the earlier uploads
+    /// of the directory (addr-upload), else the node's first usable immutable batch; required
+    /// with --lower-batch everywhere.
     #[arg(long)]
     batch: Option<B256>,
     /// A batch for the lower slices, which die once the head has passed them (repeatable).
@@ -266,20 +267,30 @@ enum Command {
         /// Upload everything again, ignoring the progress of earlier uploads.
         #[arg(long)]
         from_start: bool,
+        /// Skip the check that the batches can take the upload. The check counts a chunk the
+        /// export lists twice, or one a stopped upload already sent, twice: for a batch within
+        /// a few chunks of full it can refuse what Bee would take.
+        #[arg(long)]
+        no_capacity_check: bool,
     },
     /// The Bee node's postage batches: depth, the fill of the fullest bucket against its
     /// capacity, the immutable flag and the remaining lifetime (docs/address-index.md,
     /// "Lifetime").
-    /// With `--export`, which batch each of those exports was uploaded with. `stamps plan`
+    /// With `--export` and `--state`, which batches each of those indexes recorded. `stamps plan`
     /// sizes and prices a new batch for an export. Nothing is bought, topped up or diluted:
     /// that is the owner's action.
     #[command(args_conflicts_with_subcommands = true)]
     Stamps {
         #[command(subcommand)]
         plan: Option<StampsCommand>,
-        /// An export directory (`addr-import --out`) to name the upload batch of (repeatable).
+        /// An export directory (`addr-import --out`) to name the batches of: the ones its
+        /// uploads recorded (repeatable).
         #[arg(long = "export")]
         exports: Vec<std::path::PathBuf>,
+        /// An importer state directory (`addr-import --state`) of an index uploaded straight
+        /// to Bee, to name the batches of (repeatable).
+        #[arg(long = "state")]
+        states: Vec<std::path::PathBuf>,
     },
     /// Look an address up in the published address index (newest first).
     AddrLookup {
@@ -403,8 +414,9 @@ enum Command {
         /// Number of epochs to import, starting at block 0.
         #[arg(long, default_value_t = 4)]
         epochs: u32,
-        /// Postage batch ID (immutable). Defaults to the Bee node's first usable immutable
-        /// batch.
+        /// Postage batch ID (immutable). Required unless the Bee node is bee-factory (its
+        /// GET /wallet reports chain 1337), where it defaults to the node's first usable
+        /// immutable batch.
         #[arg(long)]
         batch: Option<B256>,
     },
@@ -618,7 +630,8 @@ async fn main() -> Result<()> {
         Command::Stamps {
             plan: None,
             exports,
-        } => stamps::list(&bee, &exports).await?,
+            states,
+        } => stamps::list(&bee, &exports, &states).await?,
         Command::Stamps {
             plan:
                 Some(StampsCommand::Plan {
@@ -647,12 +660,14 @@ async fn main() -> Result<()> {
             stamping,
             concurrency,
             from_start,
+            no_capacity_check,
         } => {
             let batches = addr::export::Batches {
                 permanent: stamping.batch,
                 lower: stamping.lower_batches,
                 grace_days: stamping.grace_days.unwrap_or(addr::stamps::GRACE_DAYS),
                 slot_secs: stamping.slot_secs.unwrap_or(addr::stamps::SLOT_SECS),
+                skip_capacity_check: no_capacity_check,
             };
             let s = addr::export::upload(&bee, batches, &dir, concurrency, from_start).await?;
             println!(

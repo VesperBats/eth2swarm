@@ -37,6 +37,19 @@ struct Stamps {
     stamps: Vec<BatchInfo>,
 }
 
+/// The chain bee-factory's Anvil runs, which its nodes report in `GET /wallet`: the one chain
+/// where an upload may fall back to the node's first batch (`.claude/agent/postage.md`).
+pub const BEE_FACTORY_CHAIN: u64 = 1337;
+
+/// The fill of a batch's buckets (`GET /stamps/{id}/buckets`).
+#[derive(Debug, Clone)]
+pub struct Buckets {
+    /// Chunks one bucket holds.
+    pub upper_bound: u32,
+    /// Chunks in each bucket, by its index (a chunk address's first 16 bits).
+    pub counts: Vec<u32>,
+}
+
 /// What Bee says about one postage batch of this node (`GET /stamps`, `/stamps/{id}`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,6 +181,88 @@ impl Bee {
             minimum_validity_blocks: big_number(&v["minimumValidityBlocks"], "")
                 .ok()
                 .map(|b| b as u64),
+        })
+    }
+
+    /// The chain this node buys batches on (`GET /wallet`, `chainID`). Transport and server
+    /// errors are retried.
+    pub async fn wallet_chain(&self) -> Result<u64> {
+        let v: serde_json::Value = self.get_json("wallet").await?;
+        v["chainID"]
+            .as_u64()
+            .context("GET /wallet answered without a chainID")
+    }
+
+    /// `GET path` as JSON, retrying transport and server errors as [`Bee::batch`] does.
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let url = self.url(path)?;
+        let mut last = None;
+        for attempt in 0..self.retries {
+            backoff(attempt).await;
+            match self.http.get(url.clone()).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    return resp
+                        .json()
+                        .await
+                        .with_context(|| format!("parsing GET {url}"));
+                }
+                Ok(resp) if !resp.status().is_server_error() => return Err(error_from(resp).await),
+                Ok(resp) => last = Some(error_from(resp).await),
+                Err(e) => last = Some(e.into()),
+            }
+        }
+        Err(last.unwrap()).with_context(|| format!("GET {url} failed"))
+    }
+
+    /// The batch an upload uses when none is named. Only on bee-factory, the node whose
+    /// `GET /wallet` reports chain 1337: the node's first usable immutable batch. Anywhere else
+    /// the batch must be named (`.claude/agent/postage.md`, rule 1); `hint` says how.
+    pub async fn default_batch(&self, hint: &str) -> Result<B256> {
+        let why = match self.wallet_chain().await {
+            Ok(BEE_FACTORY_CHAIN) => return self.usable_batch().await,
+            Ok(chain) => format!(
+                "{} is not bee-factory (GET /wallet chainID: {chain})",
+                self.base
+            ),
+            Err(e) => format!(
+                "{} could not be asked whether it is bee-factory ({e:#})",
+                self.base
+            ),
+        };
+        anyhow::bail!(
+            "{hint}: {why}, so no batch is taken by default. Name it; `ethswarm stamps` lists \
+             the node's batches, `stamps plan` sizes a new one"
+        )
+    }
+
+    /// The chunks in each bucket of batch `id` (`GET /stamps/{id}/buckets`), and how many one
+    /// bucket holds.
+    pub async fn buckets(&self, id: &B256) -> Result<Buckets> {
+        #[derive(serde::Deserialize)]
+        struct Bucket {
+            #[serde(rename = "bucketID")]
+            id: usize,
+            collisions: u32,
+        }
+        #[derive(serde::Deserialize)]
+        struct Answer {
+            #[serde(rename = "bucketUpperBound")]
+            upper_bound: u32,
+            buckets: Vec<Bucket>,
+        }
+        let a: Answer = self
+            .get_json(&format!("stamps/{}/buckets", hex::encode(id)))
+            .await?;
+        let mut counts = vec![0u32; 1 << crate::swarm::postage::BUCKET_DEPTH];
+        for b in a.buckets {
+            *counts
+                .get_mut(b.id)
+                .with_context(|| format!("batch {id}: bucket {} out of range", b.id))? =
+                b.collisions;
+        }
+        Ok(Buckets {
+            upper_bound: a.upper_bound,
+            counts,
         })
     }
 
@@ -415,6 +510,40 @@ async fn error_from(resp: reqwest::Response) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn only_bee_factory_has_a_default_batch() {
+        use crate::addr::stamps::tests::serve;
+        let id = B256::repeat_byte(4);
+        let list: &'static str = Box::leak(
+            format!(
+                r#"{{"stamps":[{{"batchID":"{}","usable":true,"batchTTL":5,"immutableFlag":true}}]}}"#,
+                hex::encode(id)
+            )
+            .into_boxed_str(),
+        );
+        let bee = Bee::new(serve(vec![Some(r#"{"chainID":1337}"#), Some(list)])).unwrap();
+        assert_eq!(bee.default_batch("x").await.unwrap(), id);
+        for (answer, says) in [
+            (
+                Some(r#"{"chainID":100}"#),
+                "not bee-factory (GET /wallet chainID: 100)",
+            ),
+            (
+                Some(r#"{"chainID":31337}"#),
+                "not bee-factory (GET /wallet chainID: 31337)",
+            ),
+            (None, "could not be asked whether it is bee-factory"),
+            (Some("500"), "could not be asked whether it is bee-factory"),
+        ] {
+            let bee = Bee::new(serve(vec![answer])).unwrap().with_retries(1);
+            let e = format!(
+                "{:#}",
+                bee.default_batch("x needs --batch").await.unwrap_err()
+            );
+            assert!(e.starts_with("x needs --batch") && e.contains(says), "{e}");
+        }
+    }
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
