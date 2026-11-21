@@ -13,7 +13,8 @@ a dev chain. The client reads every slice, whole pages files, and spill files wh
 limit, in the inspector's spill view); the page search of a paged bucket, stopping a lookup
 when the screen is full, and the time-based head estimate are not implemented. Slices of any level are built with bounded
 memory (*Building large slices*), and stamped with postage batches by lifetime
-(`--lower-batch`, *Lifetime*). Still open: re-measuring with traces. Design issue: #5.
+(`--lower-batch`, *Lifetime*), and measured with traces under the current rules
+(*Measurements*). Design issue: #5.
 
 An index from an **address** to the transactions it **appears in**, stored on Swarm next to
 the [SOC block store](soc-block-store.md). A mobile wallet uses it to list an address's
@@ -41,9 +42,9 @@ These follow from how Swarm and the block store work; the discussion is in #5.
 - **Do not probe for chunks that may not exist.** A retrieval miss in Swarm ends in a
   timeout, not a fast "not found". Every identifier a client computes must exist, or the
   client must have a way to know it does not.
-- **No chunk per address.** Mainnet has hundreds of millions of distinct addresses (3.8
+- **No chunk per address.** Mainnet has hundreds of millions of distinct addresses (4.4
   million in the last 16,384 blocks alone), most with a handful of appearances. A stamped
-  4 KB chunk each would cost terabytes of postage for about 70 GB of data.
+  4 KB chunk each would cost terabytes of postage for about 80 GB of data.
 - **Some privacy.** An identifier derived from a single address tells the storer
   neighbourhood which address someone looks up. A bucket hides the address among the other
   addresses in it: about 180 in 64-block slices, 127 in 16,384-block slices (measured),
@@ -216,10 +217,9 @@ node will not do.
 
 A wallet that only wants transfers it took part in filters on `FROM | TO | TOPIC | TRACE |
 BLOCK | AUTH`. `WORD` keeps the index close to TrueBlocks' (all but the words inside internal
-calls) and gives spam filters something to work with. Without traces it was 1–10 % of all
-appearances (measured with the earlier, stricter heuristic); its share under the current
-heuristic, and the share traces add, are still to be measured with `addr-stats` on a
-tracing node (#8).
+calls) and gives spam filters something to work with. Under the current heuristic, with
+traces, `WORD` alone is 0.4–8.9 % of all appearances per era, and traces alone add under
+1 % (2016) to 12–18 % (since block 13,000,000) (*Measurements*).
 
 The appearances of one address at one (block, slot) are merged into one entry whose role
 is the OR of all roles.
@@ -232,7 +232,7 @@ Namespace `addr1` fixes these values. A change of any of them is a new namespace
 |---|---|---|
 | `U` (unit length) | 64 blocks | ≈ the finality delay; small units keep the index fresh |
 | `L_max` (top level) | 16 | top slices of 2^16 units = 4,194,304 blocks are never merged again |
-| bucket target `T` | 2816 bytes | average bucket payload; about 1 bucket in 3,000 exceeds a chunk and is paged |
+| bucket target `T` | 2816 bytes | average bucket payload; 1 bucket in 1,750 to 10,000 exceeds a chunk and is paged |
 | spill threshold | 256 bytes | inline entries of one address above this go to a spill file |
 | fingerprint | 8 bytes | collision handling below |
 
@@ -330,8 +330,8 @@ reads up to 16 more buckets while a top-level merge runs. If that expansion cont
 pending slice (a merge was deferred before the previous one finished), it is expanded the
 same way.
 
-The importer needs a sustained upload rate of only about 4 chunks per second
-(≈ 10 M chunks per month at today's activity, see *Full history and cost*), but merges come
+The importer needs a sustained upload rate of only about 4.4 chunks per second
+(≈ 11 M chunks per month at today's activity, see *Full history and cost*), but merges come
 in bursts: a top-level merge at 200 chunks per second takes about a day. The block-store
 importer in this repository uploads one chunk per request, sequentially; the index importer
 must upload in parallel.
@@ -662,7 +662,7 @@ record order, zero-padded except the last; page `p` is the `p`-th data chunk of 
 client binary-searches the pages by the fingerprint of their first record, paying a path
 through the file's tree per probe.
 
-Paging is rare by chance (0–0.03 % of buckets at `T = 2816`, measured) but can be forced:
+Paging is rare by chance (0.01–0.06 % of buckets at `T = 2816`, measured) but can be forced:
 addresses that share `h[0..4]` share a bucket for every `B`, and 340 single-entry records
 (12 bytes each) already overflow a chunk. Grinding 340 such values costs about 1.5 × 10^12
 hashes, and a single transaction can put them on chain as `WORD`s. Paging keeps every slice
@@ -780,88 +780,97 @@ Oldest first is the same in the opposite order.
 
 ## Measurements
 
-**These figures predate the current detection rules.** They were measured with the earlier
-rule set: the 2^128 word bound, no init code, no `topic0`, no traces. The current rules
-(TrueBlocks' heuristic and sources, with the exceptions above) find more appearances, so the totals, sizes and costs below are lower
-bounds until they are measured again with `addr-stats`, with traces once a tracing node is
-available.
+The index tables below were measured on 2026-11-20 and 21 with `addr-stats`, under the
+current detection rules and with traces. The block-store table (*Verification data*) is
+older, see there. The source was nuc's Erigon v3.8.1 archive node (`--rpc`, `--traces`: `TRACE` from
+`trace_block`), plus zbox's geth for receipts before Byzantium (`--receipts-rpc`). Every
+block's receipts were checked against its header, and every slice was built with the real
+encoder. `trace_block` misses the target of a failed internal creation (*Roles*), which the
+frame index has. The difference is far below the precision of these tables.
 
 **Reproducing them:** `ethswarm addr-stats --level L --at <block> [--at …] [--traces]`
-builds every slice of levels `0..=L` in the level-`L` window around each block with the real
-encoder and prints one table per window: the per-level columns below (addresses,
-appearances, bytes per appearance, buckets, paged buckets, spilled addresses, chunks
-including every chunk of the spill and pages files, chunks per 1000 appearances, largest
-bucket) and each window's `WORD`, `TRACE` and `TRACE`-only shares. A window is the aligned
-slice that contains the `--at` block; it does not start there. The `Level 0` row of a
-`--level 5` window (2,048 blocks, the default) gives a per-era row below, `--level 8` the
-slice-length table.
+builds every slice of levels `0..=L` in the level-`L` window around each block, and prints
+one table per window:
+- the per-level columns below: addresses, appearances, bytes per appearance, buckets,
+  paged buckets, spilled addresses, chunks (every chunk of the spill and pages files
+  included), chunks per 1000 appearances, and the largest bucket;
+- each window's `WORD`, `TRACE` and `TRACE`-only shares.
 
-Measured on 2026-11-16 against mainnet (the zbox geth node: full history, no traces, so no
-`TRACE` role) with throwaway scripts that encode the sampled appearances in the record formats above.
-Simplifications: the address-shaped test was applied to all topics (no known-event rule),
-`AUTH` and uncle beneficiaries were not detected, a created contract's address was taken from
-the RPC receipt, the bucket header was counted as 18 bytes (19 with `paged`), and an
-overflowing bucket was counted as a two-chunk file (as a paged bucket it is three: the
-bucket SOC, the file root and one page). Each changes the totals by a fraction of a
-percent. Bucket assignment used sha256 instead of keccak256, which gives the
-same size distribution for a uniform hash. `addr-stats` replaces the scripts.
+A window is the aligned slice that contains the `--at` block; it does not start there. The
+`Level 0` row of a `--level 5` window (2,048 blocks) gives a per-era row below, and
+`--level 8` the slice-length table. The commands are in [runbook.md](runbook.md), step 7.
+Two runs of the six later windows, one of them paused and resumed many times while Erigon
+caught up, gave byte-identical tables.
 
-Sampled: 2,048 consecutive blocks at each of 1M, 4M, …, 22M; the 16,384 blocks from
-26,400,000; one block in 5,000 over the whole chain for block sizes; 8 consecutive blocks in
-100,000 for receipt sizes.
+**Sampled:**
+- the 2,048 blocks of the level-5 window around each of 1M, 4M, …, 22M and 26.4M;
+- the 16,384 blocks 26,394,624 to 26,411,007 (level 8).
+
+The earlier figures (2026-11-16, throwaway scripts on zbox's geth, no traces, an older and
+stricter heuristic) are in this file's history.
 
 ### Per era (64-block slices, `T = 2816`)
 
-| From block | Txs / block | Appearances / block | `WORD` only | Addresses / slice | Bytes / appearance | Buckets / slice | Chunks / slice |
-|---|---|---|---|---|---|---|---|
-| 1,000,000 | 3 | 8 | 1 % | 172 | 6.37 | 1.4 | 2.5 |
-| 4,000,000 | 61 | 142 | 5 % | 3,272 | 6.42 | 18 | 31 |
-| 7,000,000 | 105 | 284 | 3 % | 7,413 | 6.85 | 41 | 61 |
-| 10,000,000 | 115 | 379 | 8 % | 11,400 | 7.45 | 60 | 82 |
-| 13,000,000 | 186 | 608 | 9 % | 13,735 | 6.69 | 77 | 130 |
-| 16,000,000 | 116 | 418 | 7 % | 11,022 | 6.84 | 59 | 84 |
-| 19,000,000 | 165 | 599 | 10 % | 14,620 | 6.70 | 80 | 121 |
-| 22,000,000 | 147 | 641 | 6 % | 17,243 | 7.01 | 94 | 128 |
-| 26,400,000 | 289 | 1,505 | 6 % | 42,366 | 7.33 | 232 | 315 |
-
-Bytes per appearance include spill files. Chunks per slice count buckets, overflow chunks and
-spill-file chunks (one root chunk per spill file).
-
-### Slice length (16,384 blocks from 26,400,000, `T = 2816`)
-
-| Slice | Level | Addresses | Appearances | Bytes / appearance | Buckets | Spilled addresses | Chunks | Chunks / 1000 appearances | Buckets > 4096 B |
+| Window around block | Txs / block | Appearances / block | `WORD` only | With `TRACE` | `TRACE` only | Addresses / slice | Bytes / appearance | Buckets / slice | Chunks / slice |
 |---|---|---|---|---|---|---|---|---|---|
-| 64 blocks | 0 | 42,366 | 96,332 | 7.33 | 232 | 65 | 315 | 3.27 | 0 % |
-| 256 | 2 | 131,369 | 385,330 | 6.65 | 778 | 369 | 1,255 | 3.26 | 0.008 % |
-| 1,024 | 4 | 412,775 | 1,541,318 | 6.15 | 2,657 | 1,384 | 4,578 | 2.97 | 0.014 % |
-| 4,096 | 6 | 1,325,267 | 6,165,273 | 5.79 | 9,124 | 5,016 | 16,649 | 2.70 | 0.03 % |
-| 16,384 | 8 | 3,774,184 | 24,661,091 | 5.28 | 29,680 | 19,292 | 60,366 | 2.45 | 0.03 % |
+| 1,000,000 | 3.8 | 10.5 | 0.4 % | 80 % | 0.8 % | 234 | 6.20 | 1.7 | 3.8 |
+| 4,000,000 | 58 | 141 | 3.6 % | 91 % | 4.4 % | 3,231 | 6.43 | 18 | 30 |
+| 7,000,000 | 90 | 270 | 3.0 % | 82 % | 7.1 % | 7,061 | 6.88 | 39 | 56 |
+| 10,000,000 | 132 | 468 | 4.2 % | 73 % | 9.8 % | 13,169 | 7.23 | 71 | 95 |
+| 13,000,000 | 179 | 692 | 6.6 % | 85 % | 13.8 % | 14,618 | 6.51 | 83 | 137 |
+| 16,000,000 | 129 | 540 | 3.9 % | 85 % | 13.7 % | 12,905 | 6.57 | 72 | 101 |
+| 19,000,000 | 169 | 709 | 8.9 % | 80 % | 12.3 % | 16,626 | 6.63 | 93 | 136 |
+| 22,000,000 | 136 | 720 | 3.4 % | 76 % | 15.0 % | 18,354 | 6.80 | 102 | 137 |
+| 26,400,000 | 315 | 1,622 | 5.5 % | 76 % | 18.0 % | 30,495 | 6.28 | 188 | 314 |
+
+- **With `TRACE`:** the share of appearances that traces find, alone or with another role.
+- **`TRACE` only:** the share found by traces alone. Those are the internal transfers and
+  calls an index without traces misses: under 1 % in 2016, 12–18 % from block 13,000,000
+  on (13.9 % over the larger 16,384-block sample of today).
+- **Bytes per appearance** include spill files.
+- **Chunks per slice** count the slice record, buckets, pages and spill-file chunks.
+
+### Slice length (16,384 blocks from 26,394,624, `T = 2816`)
+
+1,900.6 appearances per block (280.6 transactions), `WORD` only 4.3 %, with `TRACE`
+58.9 %, `TRACE` only 13.9 %. Per slice of each level, on average:
+
+| Slice | Level | Addresses | Appearances | Bytes / appearance | Buckets | Spilled addresses | Chunks | Chunks / 1000 appearances | Paged buckets |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 blocks | 0 | 50,175 | 121,636 | 7.33 | 281 | 92 | 386 | 3.17 | 0.014 % |
+| 256 | 2 | 155,463 | 486,546 | 6.64 | 936 | 518 | 1,510 | 3.10 | 0.010 % |
+| 1,024 | 4 | 485,966 | 1,946,184 | 6.11 | 3,175 | 1,865 | 5,411 | 2.78 | 0.018 % |
+| 4,096 | 6 | 1,545,865 | 7,784,734 | 5.67 | 10,780 | 6,736 | 19,790 | 2.54 | 0.021 % |
+| 16,384 | 8 | 4,414,354 | 31,138,936 | 5.16 | 34,906 | 25,544 | 71,759 | 2.30 | 0.057 % |
 
 Longer slices are denser: the per-address overhead (fingerprint and count) is shared by more
 entries. Top-level slices are 256 times longer than the longest one sampled, so the
 full-history figures below, which use the 16,384-block values, should be on the high side.
+The largest bucket, at 4,076–4,093 B on every level, nearly fills its chunk; a fuller one
+would be paged.
 
-`T` was chosen from the same sample: `T = 3072` saves 4 % of the chunks but overflows 0.4 %
-of the buckets of the longest slice; `T = 2560` costs 5 % more chunks than `T = 2816` and
-leaves one overflow in 32,648 buckets.
+`T` was chosen from the earlier sample: `T = 3072` saved 4 % of the chunks but overflowed
+0.4 % of the buckets of the longest slice; `T = 2560` cost 5 % more chunks than `T = 2816`.
 
 ### Full history and cost
 
 | | Value |
 |---|---|
-| Appearances, genesis to block 26,428,827 (linear between the samples) | ≈ 13.0 billion |
-| One copy of the index (5.28 B and 2.45 chunks per 1000 appearances) | ≈ 69 GB, ≈ 32 M chunks |
-| Growth at the current rate (1,505 appearances per block) | ≈ 0.8 M chunks per month |
-| Postage batch | depth 26: 55.7 M chunks effective, about 2 years of headroom |
+| Appearances, genesis to block 26,460,000 (linear between the per-era samples, ending at the 16,384-block sample's 1,901 per block) | ≈ 15.4 billion |
+| One copy of the index (5.16 B and 2.30 chunks per 1000 appearances) | ≈ 80 GB, ≈ 35.5 M chunks |
+| Growth at the current rate (1,901 appearances per block, 216,000 blocks a month) | ≈ 0.94 M chunks per month |
+| Postage batch | depth 26: 55.7 M chunks effective, about 21 months of headroom |
 | Postage price on 2026-11-16 | 205,492 PLUR per chunk per Gnosis block (`lastPrice()` of the PostageStamp contract) |
 | Monthly cost of the depth-26 batch | 2^26 × 205,492 × 518,400 blocks ≈ 715 BZZ ≈ $48 at $0.067 per BZZ |
-| Lower levels, live | data of 2^15 units on average (≈ 2.1 M blocks × 1,505 × 3.0 per 1000 ≈ 10 M chunks), up to twice that just before a top slice is written |
-| Lower levels, written | each block about 8 times: ≈ 8.5 M chunks per month |
-| Lower levels, postage | stamps cover written chunks until their batch expires; with batches grouped by lifetime, about 20–30 M slots at any time, one more depth-25 batch: ≈ 357 BZZ ≈ $24 per month, up to twice that if lifetimes are matched poorly |
-| **Total** | **≈ $72–96 per month** at today's prices |
+| Lower levels, live | data of 2^15 units on average (≈ 2.1 M blocks × 1,901 × 3.0 per 1000 ≈ 12 M chunks), up to twice that just before a top slice is written |
+| Lower levels, written | each block about 8 times: ≈ 10.4 M chunks per month (3.17 per 1000 at level 0) |
+| Lower levels, postage | stamps cover written chunks until their batch expires; with batches grouped by lifetime, about 25–37 M slots at any time: one depth-25 batch (≈ 25.8 M effective) only just at the low end, two at the high end, ≈ 357–715 BZZ ≈ $24–48 per month, more if lifetimes are matched poorly |
+| **Total** | **≈ $72–96 per month** at the prices of 2026-11-16 |
 
 Postage prices and the BZZ exchange rate move; the chunk counts are what to recompute
-against. A lower `L_max` makes the lower levels cheaper (they hold up to one top slice) and
+against. Traces and the current rules raise the appearances by about 18 % over the earlier
+estimate taken to the same block. The denser encoding takes back part of that: the index is
+about 11 % more chunks. A lower `L_max` makes the lower levels cheaper (they hold up to one top slice) and
 cold lookups more expensive (one bucket per top slice): `L_max = 14` would cut the lower
 levels to a quarter and need 25 top slices today instead of 6.
 
@@ -876,6 +885,10 @@ levels to a quarter and need 25 top slices today instead of 6.
 | Storage on the phone | the results for its own addresses; descriptors are cached forever |
 
 ### Verification data (block store, per block)
+
+Measured on 2026-11-16 against zbox's geth with throwaway scripts, not `addr-stats`: one
+block in 5,000 over the whole chain for the body sizes, and 8 consecutive blocks in 100,000
+for the receipt sizes.
 
 | From block | Tx-trie inner nodes | Tx proof, avg / max | Body | Receipts |
 |---|---|---|---|---|
