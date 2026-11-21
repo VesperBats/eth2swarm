@@ -7,10 +7,14 @@ commands is in [address-index.md](address-index.md). The local Swarm is describe
 [bee-factory-setup.md](bee-factory-setup.md). Every `ethswarm` flag here is in `ethswarm
 <command> --help`, and those of `erigon-trace-export` in `erigon-trace-export -h`.
 
-The paths and hosts are the nuc's:
-- **Erigon** is the v3.8.1 archive node at `http://127.0.0.1:8645`, with its datadir at
-  `~/erigon-data/mainnet-archive`.
-- **geth** is zbox's, at `http://zbox.tail2ab6c8.ts.net:8561`, over Tailscale.
+The paths and hosts are the nuc's ([README, *Ethereum mainnet nodes*](../README.md#ethereum-mainnet-nodes)):
+- **Erigon, the main mainnet node,** is the v3.8.1 archive node at `http://127.0.0.1:8645`,
+  with its datadir at `~/erigon-data/mainnet-archive`. Every command below that reads the
+  chain passes it as `--rpc`: without the flag (or `ETH2SWARM_RPC`), a command reads from
+  zbox, the built-in default.
+- **geth, the fallback and second opinion,** is zbox's, at `http://zbox.tail2ab6c8.ts.net:8561`,
+  over Tailscale: the cross-check of the checkpoint table, the receipts before Byzantium,
+  and the node to fall back to when Erigon is down or behind.
 - **bee-factory** runs patched: API on 1733–1742, Anvil on 8546.
 
 Replace them elsewhere.
@@ -254,10 +258,14 @@ index can be extended in steps instead:
 
 ```sh
 # The published index: every slice, bucket and spill file of the head (default: the origin)
-ethswarm --bee http://localhost:1733 addr-verify --owner <owner> --chain-id 1 [--units <n>]
+# (checks each slice's last block hash and the head's timestamp against --rpc)
+ethswarm --bee http://localhost:1733 --rpc http://127.0.0.1:8645 addr-verify --owner <owner> \
+  --chain-id 1 [--units <n>]
 
-# An address, newest first, from the queen (1733)
-ethswarm --bee http://localhost:1733 addr-lookup <address> --owner <owner> --chain-id 1 --limit 20
+# An address, newest first, from the queen (1733); the head it reads aims at --rpc's finalized
+# block
+ethswarm --bee http://localhost:1733 --rpc http://127.0.0.1:8645 addr-lookup <address> \
+  --owner <owner> --chain-id 1 --limit 20
 
 # The same, compared with the chain itself: every block of the range is detected again from
 # --rpc (TRACE from the index's own frame-index directory, else trace_block). Check a recent

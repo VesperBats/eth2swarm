@@ -59,22 +59,37 @@ field names.
 
 ```sh
 bee-factory start --tag v2.8.3
-scripts/e2e-bee-factory.sh            # mainnet blocks from zbox → local Swarm, verify via queen
+scripts/e2e-bee-factory.sh            # mainnet blocks (default: zbox) → local Swarm, verify via queen
 ETH2SWARM_RPC=http://localhost:8545 scripts/e2e-bee-factory.sh   # same against local Anvil
+# On the nuc: bee-factory is patched (API 1733–1742, Anvil 8546; 8545 is another node there)
+UPLOAD_BEE=http://localhost:1735 READ_BEE=http://localhost:1733 \
+  ETH2SWARM_RPC=http://localhost:8546 scripts/e2e-bee-factory.sh
 ```
 
-Blocks are read from Ethereum mainnet (zbox, the default `--rpc`); only the storage side is
-the local bee-factory Swarm. Verified on 2026-11-16: mainnet blocks 0–255 (genesis
-`0xd4e5…8fa3`, 59 blocks with uncles) imported and verified through the queen.
+Mainnet blocks come from the nuc's Erigon on the nuc (`--rpc http://127.0.0.1:8645`, for the
+script `ETH2SWARM_RPC=http://127.0.0.1:8645`), and from zbox, the built-in default `--rpc`,
+elsewhere ([README, *Ethereum mainnet nodes*](../README.md#ethereum-mainnet-nodes)); with
+them, only the storage side is the local bee-factory Swarm. An import against Erigon counts
+towards its one heavy client at a time ([runbook](runbook.md), step 0): while a long import
+or export runs there, use zbox or Anvil. Verified on 2026-11-16: mainnet blocks 0–255
+(genesis `0xd4e5…8fa3`, 59 blocks with uncles) imported and verified through the queen.
 
 Manual use:
 
 ```sh
-# import mainnet blocks (default --rpc = zbox) (via worker 1, which owns the postage batch); prints the trust anchor
+# import mainnet blocks via worker 1, which owns the postage batch; prints the trust anchor
+# (default --rpc: zbox)
 cargo run -- --bee http://localhost:1635 import --key <hex key> --epoch-size 64 --epochs 4
 # verify (via the queen → proves p2p retrieval)
 cargo run -- --bee http://localhost:1633 get 3 --owner <owner> --anchor <anchor>
 cargo run -- --bee http://localhost:1633 verify-epoch 0 --owner <owner> --anchor <anchor>
+
+# The same on the nuc: Erigon, and the patched bee-factory ports (the default ones belong to
+# the DAppNode Bee there)
+cargo run -- --rpc http://127.0.0.1:8645 --bee http://localhost:1735 import --key <hex key> \
+  --epoch-size 64 --epochs 4
+cargo run -- --bee http://localhost:1733 get 3 --owner <owner> --anchor <anchor>
+cargo run -- --bee http://localhost:1733 verify-epoch 0 --owner <owner> --anchor <anchor>
 ```
 
 The client's `--chain-id` defaults to 1 (mainnet); pass `--chain-id 1337` for data
