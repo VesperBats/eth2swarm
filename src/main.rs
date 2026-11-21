@@ -980,8 +980,8 @@ where
     use addr::layout::{UNIT_BLOCKS, first_block, last_block};
 
     // A window is held in memory with all its appearances: a level-8 window at the tip is
-    // ~25 M appearances (about 1 GB), and building a slice holds a map per address on top,
-    // so a few GB at peak. Larger slices are built by merging, in the importer.
+    // ~31 M appearances (about 1.2 GB; docs/address-index.md, *Measurements*), and building
+    // a slice holds a map per address on top, so a few GB at peak. Larger slices are built by merging, in the importer.
     const MAX_WINDOW_LEVEL: u8 = 8;
     ensure!(
         level <= MAX_WINDOW_LEVEL,
