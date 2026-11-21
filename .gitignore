@@ -6,3 +6,6 @@
 
 # Installed by the integration workflow (npm ci in ci/bee-factory)
 /ci/bee-factory/node_modules/
+
+# Built by tools/erigon-trace-export's README
+/tools/erigon-trace-export/erigon-trace-export

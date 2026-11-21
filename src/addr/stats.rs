@@ -1,0 +1,334 @@
+//! `addr-stats`: what the address index costs, measured with the real encoder.
+//!
+//! A window is one slice of level `L`. Every slice of every level `0..=L` inside it is built
+//! in memory (nothing is uploaded) and summed up per level: the figures behind the
+//! measurement tables of `docs/address-index.md`.
+
+use anyhow::{Result, ensure};
+
+use super::detect::{Appearance, role};
+use super::layout::{first_block, last_block};
+use super::slice::{SliceId, build_slice};
+use crate::swarm::file::file_chunks;
+
+/// Sums over the slices of one level in a window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LevelStats {
+    pub level: u8,
+    pub slices: u64,
+    pub addresses: u64,
+    pub appearances: u64,
+    pub buckets: u64,
+    pub paged_buckets: u64,
+    pub spilled_addresses: u64,
+    /// Bucket payloads plus spill and pages files.
+    pub bytes: u64,
+    /// Descriptor, bucket SOCs, and every chunk of the spill and pages files.
+    pub chunks: u64,
+    pub largest_bucket: u64,
+}
+
+/// One window: its appearance mix and the per-level sums.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowStats {
+    pub first_block: u64,
+    pub last_block: u64,
+    pub txs: u64,
+    pub appearances: u64,
+    /// Appearances whose only role is `WORD`.
+    pub word_only: u64,
+    /// Appearances with the `TRACE` role (every transaction's sender and recipient get it
+    /// from the root frame), and those whose only role is `TRACE` (what traces add), if traces
+    /// were read.
+    pub with_trace: Option<u64>,
+    pub trace_only: Option<u64>,
+    pub levels: Vec<LevelStats>,
+}
+
+/// Builds every slice of levels `0..=window.0` inside `window` from its appearances
+/// (`appearances` sorted by block) and sums them up per level.
+pub fn window_stats(
+    window: SliceId,
+    appearances: &[Appearance],
+    txs: u64,
+    roles: u8,
+) -> Result<WindowStats> {
+    let (top, index) = window;
+    let (first, last) = (first_block(top, index), last_block(top, index));
+    ensure!(
+        appearances.windows(2).all(|w| w[0].block <= w[1].block),
+        "appearances not sorted by block"
+    );
+    ensure!(
+        appearances
+            .iter()
+            .all(|a| (first..=last).contains(&a.block)),
+        "appearance outside window blocks {first}..={last}"
+    );
+    let mut out = WindowStats {
+        first_block: first,
+        last_block: last,
+        txs,
+        appearances: appearances.len() as u64,
+        word_only: appearances.iter().filter(|a| a.roles == role::WORD).count() as u64,
+        with_trace: (roles & role::TRACE != 0).then(|| {
+            appearances
+                .iter()
+                .filter(|a| a.roles & role::TRACE != 0)
+                .count() as u64
+        }),
+        trace_only: (roles & role::TRACE != 0).then(|| {
+            appearances
+                .iter()
+                .filter(|a| a.roles == role::TRACE)
+                .count() as u64
+        }),
+        levels: Vec::new(),
+    };
+    for level in 0..=top {
+        let mut s = LevelStats {
+            level,
+            ..Default::default()
+        };
+        let per_window = 1u32 << (top - level);
+        for k in 0..per_window {
+            let slice = (level, index * per_window + k);
+            let (a, b) = (first_block(slice.0, slice.1), last_block(slice.0, slice.1));
+            let lo = appearances.partition_point(|x| x.block < a);
+            let hi = appearances.partition_point(|x| x.block <= b);
+            // The hash of the last block is not needed for sizes.
+            let built = build_slice(slice, 0, &appearances[lo..hi], Default::default(), roles)?;
+            s.slices += 1;
+            s.addresses += built.record.addresses as u64;
+            s.appearances += built.record.appearances;
+            s.buckets += built.buckets.len() as u64;
+            s.paged_buckets += built.paged as u64;
+            s.spilled_addresses += built.spilled as u64;
+            s.bytes += built.buckets.iter().map(|b| b.len() as u64).sum::<u64>()
+                + built.files.iter().map(|(_, f)| f.len() as u64).sum::<u64>();
+            s.chunks += 1
+                + built.buckets.len() as u64
+                + built
+                    .files
+                    .iter()
+                    .map(|(_, f)| file_chunks(f.len()) as u64)
+                    .sum::<u64>();
+            s.largest_bucket = s.largest_bucket.max(
+                built
+                    .buckets
+                    .iter()
+                    .map(|b| b.len() as u64)
+                    .max()
+                    .unwrap_or(0),
+            );
+        }
+        out.levels.push(s);
+    }
+    Ok(out)
+}
+
+/// Progress of an `addr-stats` run, for a line every [`Progress::EVERY`]: blocks done of the
+/// total, the rate since the start, and the time left at that rate.
+pub struct Progress {
+    total: u64,
+    done: u64,
+    started: std::time::Instant,
+    last: std::time::Instant,
+}
+
+impl Progress {
+    /// How often a line is written.
+    pub const EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+    pub fn new(total: u64, now: std::time::Instant) -> Self {
+        Self {
+            total,
+            done: 0,
+            started: now,
+            last: now,
+        }
+    }
+
+    /// Counts one block without reporting (a line is asked for with [`Self::line`]).
+    pub fn count(&mut self) {
+        self.done += 1;
+    }
+
+    /// Counts one block; a line when [`Self::EVERY`] has passed since the last one.
+    pub fn block(&mut self, now: std::time::Instant) -> Option<String> {
+        self.done += 1;
+        (now.duration_since(self.last) >= Self::EVERY).then(|| {
+            self.last = now;
+            self.line(now)
+        })
+    }
+
+    /// Where the run is: blocks done, the rate, the time left.
+    pub fn line(&self, now: std::time::Instant) -> String {
+        let secs = now.duration_since(self.started).as_secs_f64();
+        let rate = if secs > 0.0 {
+            self.done as f64 / secs
+        } else {
+            0.0
+        };
+        let left = if rate > 0.0 {
+            let s = (self.total.saturating_sub(self.done) as f64 / rate).round() as u64;
+            format!("about {}h{:02}m left", s / 3600, s % 3600 / 60)
+        } else {
+            "time left unknown".into()
+        };
+        format!(
+            "{}/{} blocks ({:.1} %), {rate:.2} blocks/s, {left}",
+            self.done,
+            self.total,
+            self.done as f64 * 100.0 / self.total.max(1) as f64
+        )
+    }
+}
+
+/// The window as a Markdown table, one row per level, averages per slice.
+pub fn render(w: &WindowStats) -> String {
+    let blocks = w.last_block - w.first_block + 1;
+    let pct = |n: u64| 100.0 * n as f64 / w.appearances.max(1) as f64;
+    let trace = match (w.with_trace, w.trace_only) {
+        (Some(with), Some(only)) => {
+            format!("{:.1} %, `TRACE` only {:.1} %", pct(with), pct(only))
+        }
+        _ => "n/a (no traces read)".to_string(),
+    };
+    let mut out = format!(
+        "Blocks {}..={}: {:.1} txs and {:.1} appearances per block, `WORD` only {:.1} %, \
+         with `TRACE` {trace}\n\n",
+        w.first_block,
+        w.last_block,
+        w.txs as f64 / blocks as f64,
+        w.appearances as f64 / blocks as f64,
+        pct(w.word_only),
+    );
+    out.push_str(
+        "| Level | Blocks / slice | Slices | Addresses / slice | Appearances / slice | \
+         Bytes / appearance | Buckets / slice | Paged / slice | Spilled / slice | Chunks / slice | \
+         Chunks / 1000 appearances | Largest bucket |\n",
+    );
+    out.push_str("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    for s in &w.levels {
+        let n = s.slices.max(1) as f64;
+        out.push_str(&format!(
+            "| {} | {} | {} | {:.0} | {:.0} | {:.2} | {:.1} | {:.2} | {:.1} | {:.1} | {:.2} | {} |\n",
+            s.level,
+            blocks / s.slices.max(1),
+            s.slices,
+            s.addresses as f64 / n,
+            s.appearances as f64 / n,
+            s.bytes as f64 / s.appearances.max(1) as f64,
+            s.buckets as f64 / n,
+            s.paged_buckets as f64 / n,
+            s.spilled_addresses as f64 / n,
+            s.chunks as f64 / n,
+            1000.0 * s.chunks as f64 / s.appearances.max(1) as f64,
+            s.largest_bucket,
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::Address;
+
+    fn apps(window: SliceId) -> Vec<Appearance> {
+        let (first, last) = (
+            first_block(window.0, window.1),
+            last_block(window.0, window.1),
+        );
+        let mut v = Vec::new();
+        for b in first..=last {
+            // A busy address in every block, and a fresh one per block.
+            v.push(Appearance {
+                block: b,
+                slot: 1,
+                address: Address::repeat_byte(0xaa),
+                roles: role::FROM,
+            });
+            v.push(Appearance {
+                block: b,
+                slot: 1,
+                address: Address::left_padding_from(&(b + 100_000).to_be_bytes()),
+                roles: role::WORD,
+            });
+        }
+        v
+    }
+
+    #[test]
+    fn progress_lines() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut p = Progress::new(1_000, t0);
+        assert_eq!(p.block(t0 + Duration::from_secs(1)), None, "not yet");
+        // 2 blocks in 40 s: 0.05 blocks/s, 998 left take 19,960 s (5h32m40s).
+        assert_eq!(
+            p.block(t0 + Duration::from_secs(40)).unwrap(),
+            "2/1000 blocks (0.2 %), 0.05 blocks/s, about 5h32m left"
+        );
+        assert_eq!(p.block(t0 + Duration::from_secs(41)), None, "30 s apart");
+        assert_eq!(
+            Progress::new(10, t0).line(t0),
+            "0/10 blocks (0.0 %), 0.00 blocks/s, time left unknown"
+        );
+    }
+
+    #[test]
+    fn levels_cover_the_window() {
+        let window = (2, 5); // 4 units, 256 blocks
+        let a = apps(window);
+        let w = window_stats(window, &a, 300, 0xff).unwrap();
+        assert_eq!(w.appearances, 512);
+        assert_eq!(w.word_only, 256);
+        assert_eq!(w.with_trace, Some(0));
+        assert_eq!(w.trace_only, Some(0));
+        let no_traces = window_stats(window, &a, 300, !role::TRACE).unwrap();
+        assert_eq!(no_traces.with_trace, None);
+        assert!(render(&no_traces).contains("`TRACE` n/a"));
+        assert_eq!(w.levels.len(), 3);
+        for (s, slices) in w.levels.iter().zip([4u64, 2, 1]) {
+            assert_eq!(s.slices, slices);
+            // Every level holds the same appearances, grouped differently.
+            assert_eq!(s.appearances, 512);
+            assert!(
+                s.chunks >= s.slices * 2,
+                "descriptor and at least one bucket"
+            );
+        }
+        // The busy address has 64 entries per unit: inline at level 0 is at most 256 bytes,
+        // so whether it spills depends on the slice length.
+        assert_eq!(w.levels[0].addresses, 4 * 65);
+        assert_eq!(w.levels[2].addresses, 257);
+        assert_eq!(w.levels[2].spilled_addresses, 1);
+        // Known answers for the level-2 slice, computed by hand: the busy address spills
+        // (256 entries of 3 bytes, one 774-byte page: 6 + 256 × 3) and its record is 42 bytes
+        // (fp 8, varint 513 in 2, reference 32); the 256 fresh addresses take 12 bytes (block
+        // offset below 128) or 13 (from 128 on). Record bytes 128 × 12 + 128 × 13 + 42 = 3,242,
+        // so two buckets of 19-byte headers.
+        let top = &w.levels[2];
+        assert_eq!(top.buckets, 2);
+        assert_eq!(top.bytes, 2 * 19 + 3_242 + 774);
+        assert_eq!(
+            top.chunks,
+            1 + 2 + 1,
+            "descriptor, two buckets, one spill page"
+        );
+        let table = render(&w);
+        assert!(table.contains("| 2 | 256 | 1 | 257 | 512 |"), "{table}");
+    }
+
+    #[test]
+    fn rejects_unsorted_or_outside() {
+        let window = (0, 1);
+        let mut a = apps(window);
+        a.swap(0, 5);
+        assert!(window_stats(window, &a, 0, 0xff).is_err());
+        assert!(window_stats((0, 0), &apps(window), 0, 0xff).is_err());
+    }
+}

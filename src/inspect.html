@@ -71,7 +71,8 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
 <body>
 <header>
   <h1>Swarm <span>Inspector</span> <small class="muted" style="font-weight:400">eth2swarm</small>
-    <button type="button" class="ghost" id="reset" style="float:right;font-size:12px;padding:3px 8px" title="Reset node, owner, chain ID and anchor to the values ethswarm serve was started with">reset settings</button></h1>
+    <button type="button" class="ghost" id="reset" style="float:right;font-size:12px;padding:3px 8px" title="Reset node, owner, chain ID and anchor to the values ethswarm serve was started with">reset settings</button>
+    <a id="help" href="help" target="_blank" rel="noopener" class="ghost" style="float:right;margin-right:8px;font:600 12px var(--sans);padding:4px 10px;border:1px solid var(--line);border-radius:4px;color:var(--ink);text-decoration:none" title="What every field and term means, with annotated screenshots">help</a></h1>
   <div class="settings">
     <label>Node<select id="node"></select></label>
     <label>SOC owner<input id="owner" placeholder="required: 0x… importer address" spellcheck="false" title="Address of the importer's key. Every lookup except Bytes and a SOC lookup by address needs it; ethswarm serve fills it in from --owner / ETH2SWARM_OWNER"></label>
@@ -79,7 +80,7 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
     <label>Trust anchor (blank = owner's published anchor)<input id="anchor" placeholder="0x… pinned anchor" spellcheck="false"></label>
   </div>
   <nav>
-    <a href="#block" data-tab="block">Block</a><a href="#epoch" data-tab="epoch">Epoch</a><a href="#soc" data-tab="soc">SOC</a><a href="#bytes" data-tab="bytes">Bytes</a>
+    <a href="#block" data-tab="block">Block</a><a href="#epoch" data-tab="epoch">Epoch</a><a href="#soc" data-tab="soc">SOC</a><a href="#bytes" data-tab="bytes">Bytes</a><a href="#addr" data-tab="addr">Address index</a>
   </nav>
 </header>
 <main>
@@ -112,9 +113,25 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
     <div class="muted" style="margin:-8px 0 14px;font-size:12px">Templates:
       <button type="button" class="ref" data-tpl="hdr">hdr:&lt;n&gt;</button> ·
       <button type="button" class="ref" data-tpl="epoch">epoch:&lt;k&gt;</button> ·
-      <button type="button" class="ref" data-tpl="accumulator">accumulator</button>
+      <button type="button" class="ref" data-tpl="accumulator">accumulator</button> ·
+      <button type="button" class="ref" data-tpl="addr1:origin">addr1:origin</button> ·
+      <button type="button" class="ref" data-tpl="addr1:slice">addr1:slice:&lt;L&gt;:&lt;i&gt;</button>
       — identifier = keccak256(string), address = keccak256(identifier ‖ owner)</div>
     <div id="out-soc"></div>
+  </section>
+  <section id="tab-addr" class="hidden">
+    <form class="query" data-run="addr">
+      <label>Address<input id="addrA" spellcheck="false" placeholder="0x… address to look up (blank: the index only)"></label>
+      <label class="small">Head units<input id="addrUnits" type="number" min="1" placeholder="newest"></label>
+      <label class="small">Since unit<input id="addrSince" type="number" min="0" placeholder="all"></label>
+      <button>Look up</button>
+    </form>
+    <div class="muted" style="margin:-8px 0 14px;font-size:12px">The addr1 address index of the SOC owner above on the chain ID above
+      (eth2swarm <code>docs/address-index.md</code>). Every SOC signature, chunk and file reference is checked with the code
+      <code>ethswarm addr-lookup</code> uses. Don't know an address with entries?
+      <button type="button" class="ref" id="addrExamples">Show example addresses</button> (well-known addresses of the chain, counted against the index).
+      <a class="ref" href="help#addr" target="_blank" rel="noopener">What do slice, bucket, slot and roles mean?</a></div>
+    <div id="out-addr"></div>
   </section>
   <section id="tab-bytes" class="hidden">
     <form class="query" data-run="bytes">
@@ -219,6 +236,21 @@ function recordCard(r, verified) {
       ['geometry', `${r.geometry.numEpochs} epochs × ${r.geometry.epochSize} = ${r.geometry.blocks} blocks`],
       ['anchor', hash(r.anchor) + ' <button type="button" class="ref" data-pin="' + esc(r.anchor) + '">pin as trust anchor</button>'],
     ]));
+  if (r.kind === 'addrHead') return cardB('Record: address-index head', badge, kv([
+      ['covers', `blocks ${r.head.firstBlock} – ${r.head.lastBlock} (${r.head.units} units)`],
+      ['last block hash', hash(r.head.lastBlockHash)],
+      ['pending merges', r.head.pending.length ? esc(r.head.pending.map(p => `(${p[0]}, ${p[1]})`).join(' ')) : 'none'],
+    ]));
+  if (r.kind === 'addrSlice') return cardB(`Record: address-index slice (${r.slice.level}, ${r.slice.index})`, badge, kv([
+      ['blocks', `${r.slice.firstBlock} – ${r.slice.lastBlock}`],
+      ['buckets / addresses / appearances', `${r.slice.bucketCount} / ${r.slice.addresses} / ${r.slice.appearances}`],
+      ['buckets root', hash(r.slice.bucketsRoot)],
+      ['open', addrLink(slicePath(r.slice.level, r.slice.index), 'in the Address index tab')],
+    ]));
+  if (r.kind === 'addrBucket') return cardB(`Record: address-index bucket ${r.bucket.bucket} of (${r.bucket.level}, ${r.bucket.index})`, badge,
+      kv([['records', r.bucket.paged ? `paged: ${r.bucket.count} records in ${r.bucket.pages} pages` : `${r.bucket.records.length}`],
+          ['note', esc(r.note)],
+          ['open', addrLink(`bucket:${r.bucket.level}:${r.bucket.index}:${r.bucket.bucket}`, 'in the Address index tab')]]));
   return card('Record', '<span class="muted">Payload is not an eth2swarm record.</span>');
 }
 function socCard(soc) {
@@ -249,7 +281,128 @@ function busy(out) { $(out).innerHTML = '<div class="spinner">fetching…</div>'
 // switching the node afterwards cannot pass an old result off as the new node's.
 function source(node) { return `<div class="muted" style="margin-bottom:8px">from node ${esc(node)}</div>`; }
 
+// ---- address index ----
+let addrView = '';
+function examplesCard(list, units) {
+  if (!list.length) return card('Example addresses', '<div class="muted">No example addresses for this chain ID.</div>');
+  // A click looks the address up as of the head the count was made at.
+  const cell = e => e.error ? `<span class="badge warn">not counted</span> <span class="muted">${esc(e.error)}</span>`
+    : e.entries ? e.entries : '<span class="muted">none in this period</span>';
+  return card('Example addresses', '<table><tr><th>address</th><th></th><th>entries</th></tr>' + list.map(e =>
+      `<tr><td>${e.entries ? addrLink(`lookup:${e.address}:${units}:`, e.address) : `<span class="mono muted">${esc(e.address)}</span>`}</td>` +
+      `<td>${esc(e.label)}</td><td>${cell(e)}</td></tr>`).join('') + '</table>' +
+    '<div class="muted" style="margin-top:8px">Counted from the buckets alone (no spill files): a click looks the address up.</div>');
+}
+// A slice or bucket view carries the address it highlights, so a shared link shows it too.
+function withAddr(view, a) { return a ? `${view}:${a}` : view; }
+function slicePath(l, i, a) { return withAddr(`slice:${l}:${i}`, a); }
+function addrLink(view, text) { return `<a class="ref mono" href="#addr/${esc(encodeURIComponent(view))}">${esc(text)}</a>`; }
+function tsIso(t) { return t ? new Date(t * 1000).toISOString().replace('.000', '') : ''; }
+function txCell(e) { return e.tx == null ? '<span class="muted">block</span>' : `tx ${e.tx}`; }
+function entriesTable(list) {
+  if (!list || !list.length) return '<div class="muted">No entries.</div>';
+  return '<table><tr><th>block</th><th>slot</th><th>roles</th></tr>' +
+    list.map(e => `<tr><td class="mono">${e.block}</td><td>${txCell(e)}</td><td class="mono">${esc(e.roles)}</td></tr>`).join('') + '</table>';
+}
+function indexCard(ix, a) {
+  if (!ix) return '';
+  const h = ix.head, o = ix.origin;
+  // The slice, bucket and spill views read only the origin.
+  if (!h) return card('Address index', kv([
+    ['owner / chain', `${esc(ix.owner)} <span class="muted">on chain ${ix.chainId}</span>`],
+    ['origin', `${o.units} units, from block ${o.firstBlock}` + (o.firstBlock > 0 ? ' <span class="badge warn">earlier blocks are not covered</span>' : '')],
+  ]));
+  return card('Address index', kv([
+    ['owner / chain', `${esc(ix.owner)} <span class="muted">on chain ${ix.chainId}</span>`],
+    ['covers', `blocks ${h.firstBlock} – ${h.lastBlock}` + (h.firstBlock > 0 ? ` <span class="badge warn">starts at block ${h.firstBlock}: earlier blocks are not covered</span>` : '')],
+    ['head', `update ${ix.headUpdate}: ${h.units} units <span class="muted">(${esc(ix.headFound)})</span>`],
+    ix.lastMiss && ['probe stopped at', `<span class="muted">${esc(ix.lastMiss)} — usually the next update is not published yet; Bee answers a missing and an unretrievable chunk alike</span>`],
+    ['last block hash', hash(h.lastBlockHash)],
+    ['last block time', `${h.lastBlockTimestamp} <span class="muted">(${tsIso(h.lastBlockTimestamp)})</span>`],
+    ['pending merges', h.pending.length ? esc(h.pending.map(p => `(${p[0]}, ${p[1]})`).join(' ')) : '<span class="muted">none</span>'],
+    ['origin', `${o.units} units, from block ${o.firstBlock}`],
+    ['slices a lookup reads (newest first)', ix.slices.map(([l, i]) => addrLink(slicePath(l, i, a), `(${l}, ${i})`)).join(' ')],
+  ]));
+}
+function sliceCard(sl, extra) {
+  return card(`Slice (${sl.level}, ${sl.index})`, kv([
+    ['blocks', `${sl.firstBlock} – ${sl.lastBlock}`],
+    ['last block hash', hash(sl.lastBlockHash)],
+    ['buckets', `${sl.bucketCount}`],
+    ['addresses / appearances', `${sl.addresses} / ${sl.appearances}`],
+    ['buckets root', hash(sl.bucketsRoot)],
+    ['roles detected', esc(sl.roles)],
+  ]) + (extra || ''));
+}
+
 const runners = {
+  async addr(stale, node) {
+    const a = $('addrA').value.trim();
+    // A slice, bucket or spill view opened by a link or the URL; a lookup from the form
+    // clears it.
+    const sub = /^((slice|bucket|spill):|examples(:|$))/.test(addrView) ? addrView
+      : a ? `lookup:${a}:${$('addrUnits').value}:${$('addrSince').value}` : `index:${$('addrUnits').value}:${$('addrSince').value}`;
+    setHash('addr', sub); busy('out-addr');
+    const parts = sub.split(':');
+    // A slice or bucket view highlights the address its fragment names, not the box's.
+    const va = parts[0] === 'slice' ? parts[3] : parts[0] === 'bucket' ? parts[4] : a;
+    const base = { owner: $('owner').value.trim(), chain: $('chain').value, units: $('addrUnits').value, address: va || '' };
+    let d, html = source(node);
+    if (parts[0] === 'examples') {
+      d = await api('addr/examples', params({ owner: base.owner, chain: base.chain, units: parts[1] || '' }, node));
+      if (stale()) return;
+      if (d.error) html += errCard(d.error);
+      html += indexCard(d.index);
+      if (d.examples) html += examplesCard(d.examples, d.index ? d.index.head.units : '');
+    } else if (parts[0] === 'slice') {
+      d = await api('addr/slice', params({ ...base, level: parts[1], index: parts[2] }, node));
+      if (stale()) return;
+      if (d.error) html += errCard(d.error);
+      html += indexCard(d.index, va);
+      if (d.slice) {
+        const pick = `<form class="query" style="margin-top:12px" data-a="${esc(va || '')}" onsubmit="event.preventDefault();location.hash='#addr/'+encodeURIComponent('bucket:${d.slice.level}:${d.slice.index}:'+this.k.value+(this.dataset.a ? ':'+this.dataset.a : ''))">
+          <label class="small">Bucket<input name="k" type="number" min="0" max="${d.slice.bucketCount - 1}" value="${d.addressBucket ?? 0}"></label><button>Open bucket</button></form>` +
+          (d.addressBucket != null ? `<div>The address's bucket: ${addrLink(withAddr(`bucket:${d.slice.level}:${d.slice.index}:${d.addressBucket}`, va), 'bucket ' + d.addressBucket)}</div>` : '');
+        html += sliceCard(d.slice, pick);
+      }
+    } else if (parts[0] === 'bucket') {
+      d = await api('addr/bucket', params({ ...base, level: parts[1], index: parts[2], k: parts[3] }, node));
+      if (stale()) return;
+      if (d.error) html += errCard(d.error);
+      if (d.slice) html += sliceCard(d.slice);
+      if (d.bucket) {
+        const b = d.bucket;
+        const recs = b.paged ? d.pagedRecords : b.records;
+        const rows = (recs || []).map(r => `<tr${r.match ? ' style="background:var(--code)"' : ''}><td class="mono">${esc(r.fp)}${r.match ? ' <span class="badge ok">address</span>' : ''}</td><td>${r.entries}</td><td>${r.spillRef
+          ? addrLink(`spill:${b.level}:${b.index}:${r.spillRef}:${r.entries}`, 'spill file')
+          : r.inline.map(e => `${e.block}/${e.tx == null ? 'blk' : 'tx' + e.tx} <span class="muted">${esc(e.roles)}</span>`).join('<br>')}</td></tr>`).join('');
+        html += card(`Bucket ${b.bucket} of slice (${b.level}, ${b.index})` + (b.paged ? ` — paged, ${b.pages} pages` : ''),
+          (b.paged ? kv([['pages file', hash(b.pagesRef)]]) : '') +
+          `<table><tr><th>fingerprint</th><th>entries</th><th>block/slot · roles</th></tr>${rows}</table>`);
+      }
+    } else if (parts[0] === 'spill') {
+      d = await api('addr/spill', params({ ...base, level: parts[1], index: parts[2], ref: parts[3], count: parts[4] }, node));
+      if (stale()) return;
+      if (d.error) html += errCard(d.error);
+      if (d.slice) html += sliceCard(d.slice);
+      if (d.entries) html += card(`Spill file — ${d.count} entries` + (d.shown < d.count ? ` (the newest ${d.shown}, newest first)` : ', newest first'), kv([['reference', hash(d.spillRef)],
+        ['read', d.readWhole ? 'whole, every entry checked against the count' : '<span class="badge warn">newest pages only</span> <span class="muted">a file too large to read whole: read from its last page backwards, as a client would</span>']]) + entriesTable(d.entries));
+    } else {
+      d = await api('addr/lookup', params({ ...base, since: $('addrSince').value }, node));
+      if (stale()) return;
+      if (d.error) html += errCard(d.error);
+      html += indexCard(d.index, a);
+      if (d.lookup) {
+        const l = d.lookup;
+        html += card(`${l.count} appearances of ${d.address}`, kv([
+          ['blocks looked at', `${l.fromBlock} – ${l.toBlock}`],
+          ['slices / files read', `${l.slices} / ${l.files}`],
+          ['roles the index detects', esc(l.roles) + (l.roles.includes('trace') ? '' : ' <span class="muted">(no trace: internal calls are not in this index)</span>')],
+        ]) + `<h2 style="margin-top:12px">Entries, newest first${l.shown < l.count ? ` (the newest ${l.shown} of ${l.count})` : ''}</h2>` + entriesTable(l.entries));
+      }
+    }
+    $('out-addr').innerHTML = html;
+  },
   async block(stale, node) {
     const n = $('blockN').value; setHash('block', n); busy('out-block');
     const d = await api('block', params({ ...common(), n }, node));
@@ -366,6 +519,17 @@ function fromHash() {
   if (tab === 'block') $('blockN').value = val || 0;
   if (tab === 'epoch') $('epochK').value = val || 0;
   if (tab === 'bytes') $('bytesRef').value = val;
+  if (tab === 'addr') {
+    // lookup:<address>:<units>:<since>, index:<units>:<since>, slice:<L>:<i>[:<address>],
+    // bucket:<L>:<i>:<k>[:<address>] or spill:<L>:<i>:<ref>:<count>.
+    addrView = val;
+    const p = val.split(':');
+    if (p[0] === 'lookup') { $('addrA').value = p[1] || ''; $('addrUnits').value = p[2] || ''; $('addrSince').value = p[3] || ''; }
+    if (p[0] === 'index') { $('addrA').value = ''; $('addrUnits').value = p[1] || ''; $('addrSince').value = p[2] || ''; }
+    if (p[0] === 'slice') $('addrA').value = p[3] || '';
+    if (p[0] === 'bucket') $('addrA').value = p[4] || '';
+    if (p[0] === 'examples') { $('addrA').value = ''; $('addrUnits').value = p[1] || ''; }
+  }
   if (tab === 'soc') {
     const i = val.indexOf(':');
     const mode = i > 0 ? val.slice(0, i) : '';
@@ -390,7 +554,10 @@ document.addEventListener('click', (e) => {
   if (t.dataset.tpl) {
     const c = $('chain').value || 1, a = $('anchor').value.trim().toLowerCase() || '<anchor>';
     document.querySelector('input[name=socmode][value=idstr]').checked = true; socMode();
-    $('socInput').value = t.dataset.tpl === 'accumulator' ? `eth:${c}:accumulator` : `eth:${c}:${a}:${t.dataset.tpl}:0`;
+    $('socInput').value = t.dataset.tpl === 'accumulator' ? `eth:${c}:accumulator`
+      : t.dataset.tpl === 'addr1:origin' ? `eth:${c}:addr1:origin`
+      : t.dataset.tpl === 'addr1:slice' ? `eth:${c}:addr1:slice:0:0`
+      : `eth:${c}:${a}:${t.dataset.tpl}:0`;
     $('socInput').focus(); return;
   }
   if (t.classList.contains('copy')) { navigator.clipboard?.writeText(t.textContent.trim()); }
@@ -399,8 +566,11 @@ document.addEventListener('keydown', (e) => {
   const t = e.target.closest?.('.copy');
   if (t && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); navigator.clipboard?.writeText(t.textContent.trim()); }
 });
-document.querySelectorAll('form[data-run]').forEach(f => f.addEventListener('submit', (e) => { e.preventDefault(); run(f.dataset.run); }));
+document.querySelectorAll('form[data-run]').forEach(f => f.addEventListener('submit', (e) => {
+  e.preventDefault(); if (f.dataset.run === 'addr') addrView = ''; run(f.dataset.run);
+}));
 document.querySelectorAll('input[name=socmode]').forEach(r => r.addEventListener('change', socMode));
+$('addrExamples').onclick = () => { addrView = `examples:${$('addrUnits').value}`; run('addr'); };
 $('prev').onclick = () => { $('blockN').value = Math.max(0, +$('blockN').value - 1); run('block'); };
 $('next').onclick = () => { $('blockN').value = +$('blockN').value + 1; run('block'); };
 // hashchange covers link clicks, edits of the URL fragment and Back/Forward between

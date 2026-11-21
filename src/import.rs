@@ -43,8 +43,9 @@ pub async fn run(
     );
     let batch = match opts.batch {
         Some(b) => b,
-        None => bee.usable_batch().await?,
+        None => bee.default_batch("import needs --batch").await?,
     };
+    bee.immutable_batch(&batch, "the batch (--batch)").await?;
     let owner = signer.address();
     info!(%chain_id, %owner, %batch, total, "importing");
 
