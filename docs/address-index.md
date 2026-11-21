@@ -47,7 +47,7 @@ These follow from how Swarm and the block store work; the discussion is in #5.
   4 KB chunk each would cost terabytes of postage for about 80 GB of data.
 - **Some privacy.** An identifier derived from a single address tells the storer
   neighbourhood which address someone looks up. A bucket hides the address among the other
-  addresses in it: about 180 in 64-block slices, 127 in 16,384-block slices (measured),
+  addresses in it: about 180 in 64-block slices, 126 in 16,384-block slices (measured),
   fewer in top-level slices. Whoever sees a client's whole lookup (the Bee node or gateway
   the wallet uses) can intersect the hash ranges of the buckets it asks for across slices,
   which differ because `B` differs, and is left with a fraction of one bucket. This is much
@@ -312,8 +312,8 @@ synthetic data: 100 M appearances (about a week of mainnet) in one slice with a 
 peaked at 91 MiB and took 95 s, against about 10 GB in memory before.
 
 **Large merges in the background.** The new slice cannot be prepared ahead (its buckets
-depend on the last unit), and it can be large: about 60 K chunks at level 8, 1 M at level 12,
-15.5 M at level 16 (extrapolated from the measurements). Publishing the head only after
+depend on the last unit), and it can be large: about 72 K chunks at level 8, 1.1 M at level 12,
+18 M at level 16 (extrapolated from the measurements). Publishing the head only after
 such a slice is uploaded would leave the index hours or days behind. So the importer may
 **defer** the merge:
 
@@ -785,7 +785,7 @@ current detection rules and with traces. The block-store table (*Verification da
 older, see there. The source was nuc's Erigon v3.8.1 archive node (`--rpc`, `--traces`: `TRACE` from
 `trace_block`), plus zbox's geth for receipts before Byzantium (`--receipts-rpc`). Every
 block's receipts were checked against its header, and every slice was built with the real
-encoder. `trace_block` misses the target of a failed internal creation (*Roles*), which the
+encoder. `trace_block` misses the target of a failed internal creation (*Detection rules*), which the
 frame index has. The difference is far below the precision of these tables.
 
 **Reproducing them:** `ethswarm addr-stats --level L --at <block> [--at …] [--traces]`
@@ -846,8 +846,14 @@ stricter heuristic) are in this file's history.
 Longer slices are denser: the per-address overhead (fingerprint and count) is shared by more
 entries. Top-level slices are 256 times longer than the longest one sampled, so the
 full-history figures below, which use the 16,384-block values, should be on the high side.
-The largest bucket, at 4,076–4,093 B on every level, nearly fills its chunk; a fuller one
-would be paged.
+The largest inline bucket, at 4,076–4,093 B on every level, nearly fills its chunk; fuller
+ones were paged (the last column).
+
+The two samples of today differ: the 2,048-block window at 26.4M has 1,622 appearances per
+block and 76 % with `TRACE`, the 16,384-block window around it 1,901 and 59 %. The rest of
+the larger window holds a burst of addresses without `TRACE` (about 53 K per 64-block slice,
+probably event recipients). The rows below use the larger sample's 1,901, so they lean high:
+it is not the steady state.
 
 `T` was chosen from the earlier sample: `T = 3072` saved 4 % of the chunks but overflowed
 0.4 % of the buckets of the longest slice; `T = 2560` cost 5 % more chunks than `T = 2816`.
@@ -856,20 +862,21 @@ would be paged.
 
 | | Value |
 |---|---|
-| Appearances, genesis to block 26,460,000 (linear between the per-era samples, ending at the 16,384-block sample's 1,901 per block) | ≈ 15.4 billion |
+| Appearances, genesis to block 26,460,000 (linear between the per-era samples up to 22,000,000, then to the 16,384-block sample's 1,901 per block at 26,400,000, in place of the 2,048-block window's 1,622) | ≈ 15.4 billion |
 | One copy of the index (5.16 B and 2.30 chunks per 1000 appearances) | ≈ 80 GB, ≈ 35.5 M chunks |
 | Growth at the current rate (1,901 appearances per block, 216,000 blocks a month) | ≈ 0.94 M chunks per month |
-| Postage batch | depth 26: 55.7 M chunks effective, about 21 months of headroom |
+| Postage batch, as `stamps plan` sizes it (fullest bucket at most half full, `--max-fill 0.5`) | depth 27: the fullest bucket ≈ 31 % full today (≈ 645 of 2,048 chunks, for a uniform hash), half full at ≈ 58 M chunks: about 2 years of headroom |
+| Postage batch, filled to Bee's effective volume (the fullest bucket about full) | depth 26: 55.7 M chunks effective, about 21 months; its fullest bucket is ≈ 63 % full today |
 | Postage price on 2026-11-16 | 205,492 PLUR per chunk per Gnosis block (`lastPrice()` of the PostageStamp contract) |
-| Monthly cost of the depth-26 batch | 2^26 × 205,492 × 518,400 blocks ≈ 715 BZZ ≈ $48 at $0.067 per BZZ |
+| Monthly cost | depth 27: 2^27 × 205,492 × 518,400 blocks ≈ 1,430 BZZ ≈ $96; depth 26 half that, ≈ 715 BZZ ≈ $48, at $0.067 per BZZ |
 | Lower levels, live | data of 2^15 units on average (≈ 2.1 M blocks × 1,901 × 3.0 per 1000 ≈ 12 M chunks), up to twice that just before a top slice is written |
 | Lower levels, written | each block about 8 times: ≈ 10.4 M chunks per month (3.17 per 1000 at level 0) |
-| Lower levels, postage | stamps cover written chunks until their batch expires; with batches grouped by lifetime, about 25–37 M slots at any time: one depth-25 batch (≈ 25.8 M effective) only just at the low end, two at the high end, ≈ 357–715 BZZ ≈ $24–48 per month, more if lifetimes are matched poorly |
-| **Total** | **≈ $72–96 per month** at the prices of 2026-11-16 |
+| Lower levels, postage | stamps cover written chunks until their batch expires; with batches grouped by lifetime, about 25–37 M slots at any time. Half full (`stamps plan`): depth 26 at the low end, 27 at the high end, ≈ 715–1,430 BZZ ≈ $48–96 per month. Filled to Bee's effective volume: one depth-25 batch (≈ 25.8 M effective) only just at the low end, two at the high end, ≈ $24–48. More if lifetimes are matched poorly |
+| **Total** | **≈ $144–192 per month** as `stamps plan` sizes the batches, **≈ $72–96** filled to Bee's effective volume, at the prices of 2026-11-16 |
 
 Postage prices and the BZZ exchange rate move; the chunk counts are what to recompute
 against. Traces and the current rules raise the appearances by about 18 % over the earlier
-estimate taken to the same block. The denser encoding takes back part of that: the index is
+estimate taken to the same block. Denser slices (more entries per address) take back part of that: the index is
 about 11 % more chunks. A lower `L_max` makes the lower levels cheaper (they hold up to one top slice) and
 cold lookups more expensive (one bucket per top slice): `L_max = 14` would cut the lower
 levels to a quarter and need 25 top slices today instead of 6.
