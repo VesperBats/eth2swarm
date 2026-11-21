@@ -287,6 +287,13 @@ func run(ctx context.Context, cfg config, logger log.Logger) error {
 	if err := os.MkdirAll(cfg.out, 0o755); err != nil {
 		return err
 	}
+	// One export per output directory: two would share the sort directory
+	// and replace each other's files of the same range.
+	unlock, err := lockDir(cfg.out)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := checkNoOverlap(cfg.out, cfg.from, cfg.to, cfg.blocksPerFile); err != nil {
 		return err
 	}

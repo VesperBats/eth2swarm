@@ -94,9 +94,18 @@ func createA1TR(dir string, chainID, first, last uint64, source string, blocks [
 		return nil, errors.New("a1tr: source string longer than 255 bytes")
 	}
 	path := filepath.Join(dir, fileName(first, last))
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	// A name of its own (<file>.<random>.tmp), so that no other writer can
+	// hold the file this one renames into place. Readers match only
+	// trace-*.a1tr.
+	f, err := os.CreateTemp(dir, fileName(first, last)+".*.tmp")
 	if err != nil {
+		return nil, err
+	}
+	tmp := f.Name()
+	// CreateTemp makes it 0600; the published file stays readable as before.
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return nil, err
 	}
 	w := &a1trWriter{first: first, last: last, blocks: blocks, path: path, tmp: tmp, f: f, w: bufio.NewWriterSize(f, 1<<20)}

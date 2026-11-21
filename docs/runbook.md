@@ -108,6 +108,7 @@ systemd-run --user --unit a1tr-export -p MemoryHigh=3G -p MemoryMax=6G \
 - **Finality:** `--to` may not be above the datadir's finalized block, unless
   `--allow-unfinalized` is given.
 - **A sort buffer** of 128 MB by default (`--sort-buffer-mb`), in `<out>/.tmp`.
+- **One export per directory:** a second export into the same `--out` is refused while the first runs.
 - **Check the files** against `trace_block` on a few ranges before importing. Edge cases are
   self-destructs, failed creations, and pre-Byzantium blocks (which need `--receipts-rpc`):
   ```sh

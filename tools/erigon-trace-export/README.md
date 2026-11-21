@@ -90,6 +90,9 @@ go test ./...
 - Each run scans every index file that overlaps the range once, whatever the
   range's size, and spends about 40 s opening the datadir; export large
   ranges per run rather than many small ones.
+- One export per output directory: a second one is refused while the first
+  holds `<out>/.export.lock`. Each file is written under a temporary name of
+  its own and renamed into place.
 - The external sort writes to `--tmpdir` (default `<out>/.tmp`);
   `--sort-buffer-mb` (default 128) is its memory per sorted run.
 - On a machine where the node runs close to its memory limit, start the

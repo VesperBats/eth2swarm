@@ -270,9 +270,12 @@ impl Stamps {
             }
             ttls.refreshed = Some(Instant::now());
         }
+        // Counted down since it was asked: one at zero has expired, and is left out as a
+        // fresh answer of zero is (a record that needs 0 s more must not go to it).
         ttls.known
             .iter()
             .map(|(b, k)| (*b, k.ttl.saturating_sub(k.at.elapsed().as_secs())))
+            .filter(|(_, ttl)| *ttl > 0)
             .collect()
     }
 
@@ -362,6 +365,32 @@ pub(crate) mod tests {
         );
         assert_eq!(plan.batch_for(Some(100)), b);
         assert_eq!(plan.batch_for(Some(10_000)), perm, "none lives long enough");
+    }
+
+    #[tokio::test]
+    async fn a_lower_batch_counted_down_to_zero_is_left_out() {
+        let (perm, a) = (B256::repeat_byte(9), B256::repeat_byte(1));
+        let ok = Some(r#"{"usable":true,"batchTTL":5,"immutableFlag":true}"#);
+        // open: the permanent batch, then the lower one.
+        let bee = Bee::new(serve(vec![ok, ok])).unwrap().with_retries(1);
+        // No grace: a record whose slice is dead now needs 0 s more.
+        let mut s = Stamps::open(bee, perm, vec![a], 0, 1).await.unwrap();
+        s.refresh = Duration::from_secs(3600);
+        {
+            let mut ttls = s.ttls.lock().await;
+            ttls.refreshed = Some(Instant::now());
+            ttls.known.insert(
+                a,
+                Known {
+                    at: Instant::now() - Duration::from_secs(10),
+                    ttl: 5,
+                    failures: 0,
+                },
+            );
+        }
+        assert!(s.lower_ttls().await.is_empty(), "5 s, asked 10 s ago");
+        assert_eq!(s.batch_for(Some(0)).await.unwrap(), perm);
+        assert!(s.plan().await.left_out.contains(&a));
     }
 
     #[tokio::test]
