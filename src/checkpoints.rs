@@ -530,13 +530,6 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
         &format!("nothing is written, and {} keeps the walk", work.display()),
     )
     .await?;
-    let tmp = suffixed(&opts.out, ".tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&table)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &opts.out)?;
     let meta = TableMeta {
         chain_id,
         k: K,
@@ -553,12 +546,66 @@ pub async fn build(opts: &Options) -> Result<TableMeta> {
             .as_secs(),
         extended_from: Vec::new(),
     };
-    std::fs::write(
-        suffixed(&opts.out, ".json"),
-        serde_json::to_vec_pretty(&meta)?,
-    )?;
-    let _ = std::fs::remove_file(&work);
+    finish_build(&opts.out, &work, &table, &meta)?;
     Ok(meta)
+}
+
+/// The end of `build`: writes the pair, and only then removes the work file. A failed write
+/// keeps it, so a re-run writes the pair again without a new walk.
+fn finish_build(out: &Path, work: &Path, table: &[u8], meta: &TableMeta) -> Result<()> {
+    write_pair(out, table, meta).with_context(|| {
+        format!(
+            "writing {} and its sidecar; {} keeps the walk, so a re-run writes them again",
+            out.display(),
+            work.display()
+        )
+    })?;
+    // Only now that both files are on disk: the walk is no longer needed. A work file left
+    // behind would make the next run without --top resume this one's top.
+    if let Err(e) = std::fs::remove_file(work) {
+        tracing::warn!(
+            "{}: {e}; remove it by hand, or the next run without --top resumes this top",
+            work.display()
+        );
+    }
+    Ok(())
+}
+
+/// Writes a table and its sidecar: both under temporary names, synced, then renamed, and the
+/// directory synced. Neither file is ever empty or partial, but the two renames are not atomic
+/// together: a crash between them leaves the new table with no sidecar, or with the previous
+/// one, which the keccak256 check refuses. `build` keeps its work file until this returns, so a
+/// re-run writes the pair again without a new walk; `extend` never writes over the old pair.
+fn write_pair(out: &Path, table: &[u8], meta: &TableMeta) -> Result<()> {
+    let [_, side, tmp, tmp_side] = out_paths(out);
+    for (path, bytes) in [
+        (&tmp, table.to_vec()),
+        (&tmp_side, serde_json::to_vec_pretty(meta)?),
+    ] {
+        let mut f =
+            std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        f.write_all(&bytes)
+            .and_then(|()| f.sync_all())
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    for (from, to) in [(&tmp, out), (&tmp_side, side.as_path())] {
+        std::fs::rename(from, to)
+            .with_context(|| format!("renaming {} to {}", from.display(), to.display()))?;
+    }
+    // Best effort, as SQLite does: some directories cannot be opened for reading (mode 0300)
+    // or synced (some mounts), and Windows cannot open one at all. Both renames are done by
+    // now; only their durability is at stake.
+    let dir = match out.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::warn!(
+            "syncing {}: {e}; the table and its sidecar are in place",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// Options of an extension.
@@ -697,23 +744,13 @@ pub async fn extend(opts: &ExtendOptions) -> Result<TableMeta> {
             history
         },
     };
-    // Both files written and synced under temporary names, then renamed: no path here is one
-    // of the old pair, so a stop in between never costs it.
-    let [_, _, tmp, tmp_side] = out_paths(&opts.out);
-    for (path, bytes) in [
-        (&tmp, table.clone()),
-        (&tmp_side, serde_json::to_vec_pretty(&meta)?),
-    ] {
-        let mut f = std::fs::File::create(path)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &opts.out)?;
-    std::fs::rename(&tmp_side, suffixed(&opts.out, ".json"))?;
+    // No path write_pair touches is one of the old pair, so a stop in between never costs it.
+    write_pair(&opts.out, &table, &meta)?;
     Ok(meta)
 }
 
-/// The paths an extension to `out` writes: the table, its sidecar, and their temporary names.
+/// The paths a build or an extension to `out` writes: the table, its sidecar, and their
+/// temporary names.
 fn out_paths(out: &Path) -> [PathBuf; 4] {
     [
         out.to_path_buf(),
@@ -1349,6 +1386,81 @@ mod tests {
             "--extend t.tmp --out t would truncate the old table"
         );
         assert!(same_file(Path::new("/tmp"), Path::new("/tmp/")));
+    }
+
+    #[test]
+    fn a_table_and_its_sidecar_are_written_as_a_pair() {
+        let dir = std::env::temp_dir().join(format!("ckpt-pair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("t.hashes");
+        let table = MAINNET_GENESIS.0.to_vec();
+        let meta = TableMeta {
+            chain_id: 1,
+            k: K,
+            entries: 1,
+            last_entry_block: 0,
+            top_block: 5,
+            top_hash: B256::ZERO,
+            top_pinned_by: "x".into(),
+            genesis_hash: MAINNET_GENESIS,
+            table_keccak256: keccak256(&table),
+            source_client: "y".into(),
+            generated_unix: 0,
+            extended_from: Vec::new(),
+        };
+        write_pair(&out, &table, &meta).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), table);
+        let back: TableMeta =
+            serde_json::from_slice(&std::fs::read(suffixed(&out, ".json")).unwrap()).unwrap();
+        assert_eq!(back.table_keccak256, meta.table_keccak256);
+        // No temporary file is left behind.
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["t.hashes", "t.hashes.json"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_work_file() {
+        let dir = std::env::temp_dir().join(format!("ckpt-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("t.hashes");
+        let work = work_path(&out);
+        std::fs::write(&work, b"walk").unwrap();
+        // A directory where the sidecar goes: the table's rename succeeds, the sidecar's
+        // fails. This is the window between the two renames that `write_pair` documents.
+        std::fs::create_dir(suffixed(&out, ".json")).unwrap();
+        std::fs::write(suffixed(&out, ".json").join("x"), b"x").unwrap();
+        let table = MAINNET_GENESIS.0.to_vec();
+        let meta = TableMeta {
+            chain_id: 1,
+            k: K,
+            entries: 1,
+            last_entry_block: 0,
+            top_block: 5,
+            top_hash: B256::ZERO,
+            top_pinned_by: "x".into(),
+            genesis_hash: MAINNET_GENESIS,
+            table_keccak256: keccak256(&table),
+            source_client: "y".into(),
+            generated_unix: 0,
+            extended_from: Vec::new(),
+        };
+        let err = finish_build(&out, &work, &table, &meta).unwrap_err();
+        assert!(format!("{err:#}").contains("keeps the walk"), "{err:#}");
+        assert_eq!(std::fs::read(&work).unwrap(), b"walk");
+        assert_eq!(std::fs::read(&out).unwrap(), table);
+        // A re-run, once the obstacle is gone, writes the pair and removes the work file.
+        std::fs::remove_dir_all(suffixed(&out, ".json")).unwrap();
+        finish_build(&out, &work, &table, &meta).unwrap();
+        assert!(!work.exists());
+        assert!(suffixed(&out, ".json").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
