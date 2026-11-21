@@ -10,8 +10,9 @@ Importer of Ethereum blocks into Ethereum Swarm.
 ## Ethereum mainnet nodes
 
 - **The nuc's Erigon is the main mainnet node:** the v3.8.1 archive node at
-  `http://127.0.0.1:8645` on the nuc, listening on loopback only. Everything that runs
-  on the nuc reads from it (`--rpc http://127.0.0.1:8645`, or `ETH2SWARM_RPC`): imports,
+  `http://127.0.0.1:8645` on the nuc, listening on loopback only. On the nuc, pass it
+  explicitly (`--rpc http://127.0.0.1:8645`, or `ETH2SWARM_RPC`), since the built-in
+  default is zbox. It is the source for imports,
   traces (`trace_block` and the frame index, neither of which zbox's geth has), measurements and the
   checkpoint table. Its load rules are in [docs/runbook.md](docs/runbook.md), step 0.
 - **zbox's geth is the fallback and the second opinion:** `http://zbox.tail2ab6c8.ts.net:8561`,
