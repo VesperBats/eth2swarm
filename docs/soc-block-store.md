@@ -59,18 +59,19 @@ field names.
 
 ```sh
 bee-factory start --tag v2.8.3
-scripts/e2e-bee-factory.sh            # mainnet blocks from zbox → local Swarm, verify via queen
+scripts/e2e-bee-factory.sh            # mainnet blocks (default: zbox) → local Swarm, verify via queen
 ETH2SWARM_RPC=http://localhost:8545 scripts/e2e-bee-factory.sh   # same against local Anvil
 ```
 
-Blocks are read from Ethereum mainnet (zbox, the default `--rpc`); only the storage side is
-the local bee-factory Swarm. Verified on 2026-11-16: mainnet blocks 0–255 (genesis
+Blocks are read from Ethereum mainnet: on the nuc from its Erigon
+(`ETH2SWARM_RPC=http://127.0.0.1:8645`), elsewhere from zbox, the built-in default `--rpc`
+(README, *Ethereum mainnet nodes*); only the storage side is the local bee-factory Swarm. Verified on 2026-11-16: mainnet blocks 0–255 (genesis
 `0xd4e5…8fa3`, 59 blocks with uncles) imported and verified through the queen.
 
 Manual use:
 
 ```sh
-# import mainnet blocks (default --rpc = zbox) (via worker 1, which owns the postage batch); prints the trust anchor
+# import mainnet blocks (on the nuc add --rpc http://127.0.0.1:8645; the default is zbox) (via worker 1, which owns the postage batch); prints the trust anchor
 cargo run -- --bee http://localhost:1635 import --key <hex key> --epoch-size 64 --epochs 4
 # verify (via the queen → proves p2p retrieval)
 cargo run -- --bee http://localhost:1633 get 3 --owner <owner> --anchor <anchor>

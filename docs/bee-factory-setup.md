@@ -151,8 +151,10 @@ bee-factory stop   # removes containers + docker network (bee-factory-net)
 
 ## ethswarm configuration
 
-`ethswarm` defaults to the zbox mainnet node (`http://zbox.tail2ab6c8.ts.net:8561`).
-Against the bee-factory stack point it at Anvil instead:
+Mainnet blocks come from the nuc's Erigon (`--rpc http://127.0.0.1:8645` on the nuc), with
+zbox's geth (`http://zbox.tail2ab6c8.ts.net:8561`, `ethswarm`'s built-in default) as the
+fallback (README, *Ethereum mainnet nodes*). Against the bee-factory stack point it at Anvil
+instead:
 
 ```sh
 export ETH2SWARM_RPC=http://localhost:8546

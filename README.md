@@ -3,9 +3,23 @@
 Importer of Ethereum blocks into Ethereum Swarm.
 
 - `ethswarm` — Rust CLI (binary). Talks to an execution-layer JSON-RPC endpoint to read
-  block data. Default: `http://zbox.tail2ab6c8.ts.net:8561` (zbox mainnet node, reachable
-  over Tailscale); override with `$ETH2SWARM_RPC` or `--rpc`
-  (e.g. `http://localhost:8546` for the patched bee-factory Anvil).
+  block data, set with `--rpc` or `$ETH2SWARM_RPC` (e.g. `http://localhost:8546` for the
+  patched bee-factory Anvil). Without either it falls back to zbox's node, the one
+  reachable from every machine over Tailscale.
+
+## Ethereum mainnet nodes
+
+- **The nuc's Erigon is the main mainnet node:** the v3.8.1 archive node at
+  `http://127.0.0.1:8645` on the nuc, listening on loopback only. Everything that runs
+  on the nuc reads from it (`--rpc http://127.0.0.1:8645`, or `ETH2SWARM_RPC`): imports,
+  traces (`trace_block` and the frame index, neither of which zbox's geth has), measurements and the
+  checkpoint table. Its load rules are in [docs/runbook.md](docs/runbook.md), step 0.
+- **zbox's geth is the fallback and the second opinion:** `http://zbox.tail2ab6c8.ts.net:8561`,
+  over Tailscale, full history without archive state and without traces. It is the
+  independent cross-check (`checkpoint-table --cross-check`), the source of receipts
+  before Byzantium (`--receipts-rpc`: Erigon 3 drops their state root), and the node to
+  use where the nuc's is not reachable or is behind. It is also `ethswarm`'s built-in
+  `--rpc` default.
 
 - Blocks are stored as Single Owner Chunks with a header accumulator, so a client can
   verify any block from a single trust anchor — see

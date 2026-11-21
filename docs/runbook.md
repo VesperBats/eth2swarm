@@ -7,10 +7,14 @@ commands is in [address-index.md](address-index.md). The local Swarm is describe
 [bee-factory-setup.md](bee-factory-setup.md). Every `ethswarm` flag here is in `ethswarm
 <command> --help`, and those of `erigon-trace-export` in `erigon-trace-export -h`.
 
-The paths and hosts are the nuc's:
-- **Erigon** is the v3.8.1 archive node at `http://127.0.0.1:8645`, with its datadir at
-  `~/erigon-data/mainnet-archive`.
-- **geth** is zbox's, at `http://zbox.tail2ab6c8.ts.net:8561`, over Tailscale.
+The paths and hosts are the nuc's (README, *Ethereum mainnet nodes*):
+- **Erigon, the main mainnet node,** is the v3.8.1 archive node at `http://127.0.0.1:8645`,
+  with its datadir at `~/erigon-data/mainnet-archive`. Every command below passes it as
+  `--rpc`.
+- **geth, the fallback and second opinion,** is zbox's, at `http://zbox.tail2ab6c8.ts.net:8561`,
+  over Tailscale: the cross-check of the checkpoint table, the receipts before Byzantium,
+  and the node to fall back to when Erigon is down or behind. It is also `ethswarm`'s
+  built-in `--rpc` default, so a command without `--rpc` reads from zbox.
 - **bee-factory** runs patched: API on 1733–1742, Anvil on 8546.
 
 Replace them elsewhere.
