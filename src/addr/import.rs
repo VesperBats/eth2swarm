@@ -32,7 +32,7 @@ use super::layout::{
     last_block, origin_id, slice_id,
 };
 use super::slice::{SliceId, cover, held, held_level, new_slice, resolve_after, units};
-use super::stamps::{self, Stamps};
+use super::stamps::{self, Stamps, record_batches};
 use super::trace_index::TraceIndex;
 use crate::swarm::{bee::Bee, soc};
 
@@ -150,6 +150,12 @@ pub struct State {
     /// left out failed creations) must not be mixed in one index.
     #[serde(default)]
     pub trace_source: Option<String>,
+    /// For an index uploaded straight to Bee: every batch its records were stamped with, the
+    /// permanent ones and the lower ones (`.claude/agent/postage.md`, rule 3). Empty in a
+    /// state from before they were recorded, and for an export (its `addr-upload` records
+    /// them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batches: Vec<B256>,
 }
 
 /// The name a state records for a `TRACE` source: `None` without traces.
@@ -556,7 +562,10 @@ impl<P: Provider + Clone + 'static> Ctx<P> {
     /// the state; only after the state is saved may the uploader read that far.
     fn save(&self, state: &mut State, dir: &Path) -> Result<()> {
         match &self.sink {
-            Sink::Bee { .. } => state.save(dir),
+            Sink::Bee { stamps, .. } => {
+                record_batches(&mut state.batches, stamps.used().into_keys());
+                state.save(dir)
+            }
             Sink::Dir(log) => {
                 let mut log = lock(log)?;
                 let len = log.checkpoint()?;
@@ -929,7 +938,8 @@ where
                         opts.lower_batches.is_empty(),
                         "--lower-batch needs the permanent batch named with --batch"
                     );
-                    bee.usable_batch().await?
+                    bee.default_batch("addr-import without --out needs --batch")
+                        .await?
                 }
             };
             Sink::Bee {
@@ -997,7 +1007,7 @@ where
                     first_block = s.first_unit * UNIT_BLOCKS,
                     "resuming the unfinished backfill as it started"
                 );
-                backfill(&ctx, s.n0, roles, dir).await?
+                backfill(&ctx, s.n0, roles, dir, s.batches.clone()).await?
             } else {
                 s
             }
@@ -1010,7 +1020,7 @@ where
                  this key has not published another one",
                 signer.address()
             );
-            backfill(&ctx, target, roles, dir).await?
+            backfill(&ctx, target, roles, dir, Vec::new()).await?
         }
         None => {
             // An origin under this key means an index exists: a second backfill would write
@@ -1040,7 +1050,7 @@ where
                     signer.address()
                 ),
             }
-            backfill(&ctx, target, roles, dir).await?
+            backfill(&ctx, target, roles, dir, Vec::new()).await?
         }
     };
     // A head saved but perhaps not uploaded (the previous run stopped in between).
@@ -1154,12 +1164,14 @@ fn backfill_slices(target: u64, first_unit: u64, max_level: u8) -> Result<Vec<Sl
 /// First run: publishes the slices of the cover of `[0, target)` that hold units from the
 /// index's start on (every other past slice would never be read), then head update 0 and the
 /// origin, written ahead like every head. The start and `target` are saved before the first
-/// upload, and a run after a failure resumes with them ([`State::backfilling`]).
+/// upload, and a run after a failure resumes with them ([`State::backfilling`]), keeping the
+/// `batches` the failed run recorded.
 async fn backfill<P: Provider + Clone + 'static>(
     ctx: &Ctx<P>,
     target: u64,
     roles: u8,
     dir: &Path,
+    batches: Vec<B256>,
 ) -> Result<State> {
     let slices = backfill_slices(target, ctx.first_unit, ctx.max_level)?;
     let mut state = State {
@@ -1175,6 +1187,7 @@ async fn backfill<P: Provider + Clone + 'static>(
         export_len: None,
         backfilling: true,
         trace_source: trace_source(&ctx.traces),
+        batches,
     };
     ctx.save(&mut state, dir)?;
     let (mut parent, mut last) = (None, None);
@@ -1185,6 +1198,13 @@ async fn backfill<P: Provider + Clone + 'static>(
         parent = Some(f.last_hash);
         state.unit_hashes.insert(units(s).end - 1, f.last_hash);
         last = Some(f);
+        if let Sink::Bee { stamps, .. } = &ctx.sink {
+            // The batches this slice was stamped with survive a failure: a resumed backfill
+            // starts again from the state's start and target, and keeps its batches. (An
+            // export is saved only at the end: saving commits its log.)
+            record_batches(&mut state.batches, stamps.used().into_keys());
+            state.save(dir)?;
+        }
     }
     let last = last.expect("a cover of at least one unit");
     state.prepared = Some(HeadRecord {
@@ -1368,6 +1388,7 @@ mod tests {
             export_len: None,
             backfilling: false,
             trace_source: None,
+            batches: vec![B256::repeat_byte(3)],
         };
         s.save(&dir).unwrap();
         assert_eq!(State::load(&dir).unwrap(), Some(s.clone()));

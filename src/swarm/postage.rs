@@ -48,6 +48,11 @@ impl BucketLoad {
         self.chunks += 1;
     }
 
+    /// Chunks in each bucket, by its index.
+    pub fn counts(&self) -> &[u32] {
+        &self.counts
+    }
+
     /// Chunks counted.
     pub fn chunks(&self) -> u64 {
         self.chunks

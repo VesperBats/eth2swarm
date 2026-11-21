@@ -192,8 +192,9 @@ ethswarm --bee <bee> stamps plan ~/addr1-<name>/export --days 30 \
   Chain) the default of 5 s is right.
 - **Buying, topping up and diluting are the owner's.** `plan` prints the command and buys
   nothing. Bee refuses a balance of 24 hours or less, and `plan` refuses to print one.
-- **Record every batch ID an index uses** in its PR or issue. `addr-upload` keeps only the
-  permanent one, in `export/uploaded.json`.
+- **Record every batch ID an index uses** in its PR or issue. The tools record them too:
+  `addr-upload` in `export/uploaded.json`, `addr-import` without `--out` in its state.
+  `stamps --export <dir> --state <dir>` lists them.
 
 ## 4. Upload
 
@@ -209,6 +210,13 @@ ethswarm --bee <bee> addr-upload ~/addr1-<name>/export --batch <permanent batch>
 
 - **Resumable:** an upload resumes where the last one of the directory stopped.
   `--from-start` sends everything again, which another batch requires.
+- **`--batch` is required** on every node but bee-factory, even to resume.
+- **Capacity check:** before sending anything, the upload counts its chunks per bucket of
+  each batch and refuses a batch that cannot take them. `stamps plan` sizes one that can.
+  The counts add up, an upper bound as of the start. The one exception is `--from-start`
+  into the single batch every earlier upload used, with no lower batch: there the chunks
+  take their old slots. `--no-capacity-check` skips the check. A lower batch must be usable
+  (confirmed by Bee) before the upload starts.
 - **Origin check:** the upload checks the index's origin first, and refuses an export whose
   key already published another index.
 - **Mainnet Swarm** takes the same command, with `--bee` pointed at a Bee node on Swarm
@@ -340,9 +348,4 @@ curl -s localhost:1735/wallet | python3 -c 'import json,sys; print(json.load(sys
 - **Per-slice resume for the backfill,** so a multi-day import survives an interruption.
 - **`--follow` with a frame index** (an export that keeps up, and an import that re-reads
   its files).
-- **Postage 14b:**
-  - `--batch` required on every node but bee-factory, with no fallback to a node's first
-    usable batch;
-  - an upload refused when it does not fit its batch;
-  - every batch an index uses recorded.
 - **A Bee node on Swarm mainnet,** and its funding, for publishing the full index.

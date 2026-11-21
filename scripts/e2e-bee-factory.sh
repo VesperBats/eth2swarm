@@ -526,6 +526,11 @@ lt_import() {
   $BIN --bee "$UPLOAD_BEE" addr-import --key "$LT_KEY" --state "$LT_STATE" --batch "$PERM" \
     --lower-batch "$SHORT" --lower-batch "$LONG" --grace-days 0 --slot-secs 78 "${TRACE_FLAG[@]}" "$@"
 }
+# The batches a JSON file records under "batches", lower-case, sorted, as one line.
+recorded() {
+  python3 -c 'import json, sys; print(" ".join(sorted(b.lower() for b in json.load(open(sys.argv[1])).get("batches", []))))' "$1"
+}
+EXPECT_BATCHES=$(printf '%s\n' "$PERM" "$SHORT" "$LONG" | tr 'A-F' 'a-f' | sort | tr '\n' ' ' | sed 's/ $//')
 # "<batch>: <count>" per batch the run stamped, sorted, as one line.
 stamped() {
   awk -v p="$PERM" -v s="$SHORT" -v l="$LONG" '$1 == "batch" {
@@ -545,6 +550,14 @@ GOT=$(echo "$OUT" | stamped)
   || { echo "FAIL: units 5 and 6 stamped '$GOT', expected two short-lived slices and two heads"; echo "$OUT"; exit 1; }
 $BIN --bee "$READ_BEE" addr-verify --owner "$LT_OWNER" --chain-id "$CHAIN_ID" --units 6 >/dev/null \
   || { echo "FAIL: addr-verify of the index stamped by lifetime"; exit 1; }
+# The state records every batch the index was stamped with (.claude/agent/postage.md, rule 3),
+# and `stamps --state` names them.
+GOT=$(recorded "$LT_STATE/addr-import.json")
+[ "$GOT" = "$EXPECT_BATCHES" ] \
+  || { echo "FAIL: the state records the batches '$GOT', expected '$EXPECT_BATCHES'"; exit 1; }
+OUT=$($BIN --bee "$UPLOAD_BEE" stamps --state "$LT_STATE") || { echo "FAIL: stamps --state"; echo "$OUT"; exit 1; }
+echo "$OUT" | grep -A1 "^${SHORT}" | grep -q "used by the index state $LT_STATE" \
+  || { echo "FAIL: stamps --state does not name the lower batch $SHORT: $OUT"; exit 1; }
 # The same through an export: the log carries each record's lifetime, addr-upload chooses.
 LT_EXP_STATE=$(mktemp -d)
 LT_EXP=$(mktemp -d)/export
@@ -563,8 +576,11 @@ case "$GOT" in
   "long="[1-9]*" permanent=4 short="[1-9]*" ") ;;
   *) echo "FAIL: the export's upload stamped '$GOT', expected (2, 0) long, units 5 and 6 short, four heads permanent"; echo "$OUT"; exit 1 ;;
 esac
+GOT=$(recorded "$LT_EXP/uploaded.json")
+[ "$GOT" = "$EXPECT_BATCHES" ] \
+  || { echo "FAIL: uploaded.json records the batches '$GOT', expected '$EXPECT_BATCHES'"; exit 1; }
 rm -rf "$LT_STATE" "$LT_EXP_STATE" "$(dirname "$LT_EXP")"
-echo "ok: lower slices stamped by lifetime (short batch TTL ${SHORT_TTL} s, long ${LONG_TTL} s), directly and through an export; heads and the origin on the permanent batch"
+echo "ok: lower slices stamped by lifetime (short batch TTL ${SHORT_TTL} s, long ${LONG_TTL} s), directly and through an export; heads and the origin on the permanent batch; every batch recorded"
 
 echo "== inspector (ethswarm serve) verifies a block via $READ_BEE"
 # INSPECTOR_ADDR is an IP:port (a socket address, not a host name). Refuse a port that

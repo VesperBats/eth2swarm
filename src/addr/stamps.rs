@@ -52,6 +52,45 @@ pub fn choose(batches: &[(B256, u64)], need: u64) -> Option<B256> {
         .map(|(id, _)| *id)
 }
 
+/// Seconds a lower batch must still live for a record that must live `units` more units.
+fn need_secs(units: u64, unit_secs: u64, grace_secs: u64) -> u64 {
+    units.saturating_mul(unit_secs).saturating_add(grace_secs)
+}
+
+/// The batches of a run as of one moment: the permanent one, and the lower ones with their
+/// remaining TTLs ([`Stamps::plan`]).
+pub struct Plan {
+    permanent: B256,
+    lower: Vec<(B256, u64)>,
+    /// Lower batches left out at this moment (not usable yet, expired, or Bee could not
+    /// say): a run starts using one once it is usable, so what goes there is not counted.
+    pub left_out: Vec<B256>,
+    unit_secs: u64,
+    grace_secs: u64,
+}
+
+impl Plan {
+    /// The batch a record that must live `life` more units goes to: the lower batch that
+    /// expires soonest after it, else the permanent one.
+    pub fn batch_for(&self, life: Option<u64>) -> B256 {
+        life.and_then(|units| {
+            choose(
+                &self.lower,
+                need_secs(units, self.unit_secs, self.grace_secs),
+            )
+        })
+        .unwrap_or(self.permanent)
+    }
+}
+
+/// Adds `used` to the batches a state or an upload records (`.claude/agent/postage.md`, rule
+/// 3), keeping them sorted and unique.
+pub fn record_batches(batches: &mut Vec<B256>, used: impl IntoIterator<Item = B256>) {
+    batches.extend(used);
+    batches.sort();
+    batches.dedup();
+}
+
 /// Default days a lower batch must outlive the slices it stamps.
 pub const GRACE_DAYS: u64 = 7;
 
@@ -140,15 +179,37 @@ impl Stamps {
         Ok(stamps)
     }
 
+    /// Where records would go as of now, without asking Bee again while it is used: for
+    /// counting an upload's chunks per batch before it starts ([`Plan::batch_for`] chooses
+    /// as [`Stamps::batch_for`] does).
+    pub async fn plan(&self) -> Plan {
+        let lower = if self.lower.is_empty() {
+            Vec::new()
+        } else {
+            self.lower_ttls().await
+        };
+        let left_out = self
+            .lower
+            .iter()
+            .filter(|b| !lower.iter().any(|(l, _)| l == *b))
+            .copied()
+            .collect();
+        Plan {
+            permanent: self.permanent,
+            lower,
+            left_out,
+            unit_secs: self.unit_secs,
+            grace_secs: self.grace_secs,
+        }
+    }
+
     /// The batch for a record that must live `life` more units (`None`: permanently).
     pub async fn batch_for(&self, life: Option<u64>) -> Result<B256> {
         let batch = match life {
             None => self.permanent,
             Some(_) if self.lower.is_empty() => self.permanent,
             Some(units) => {
-                let need = units
-                    .saturating_mul(self.unit_secs)
-                    .saturating_add(self.grace_secs);
+                let need = need_secs(units, self.unit_secs, self.grace_secs);
                 match choose(&self.lower_ttls().await, need) {
                     Some(b) => b,
                     None => {
@@ -277,6 +338,30 @@ pub(crate) mod tests {
             }
         });
         url
+    }
+
+    #[test]
+    fn a_plan_chooses_as_the_run_does() {
+        let (perm, a, b) = (
+            B256::repeat_byte(9),
+            B256::repeat_byte(1),
+            B256::repeat_byte(2),
+        );
+        let plan = Plan {
+            permanent: perm,
+            lower: vec![(a, 1_000), (b, 100_000)],
+            left_out: vec![],
+            unit_secs: 64,
+            grace_secs: 0,
+        };
+        assert_eq!(plan.batch_for(None), perm);
+        assert_eq!(
+            plan.batch_for(Some(10)),
+            a,
+            "640 s: the one expiring soonest after"
+        );
+        assert_eq!(plan.batch_for(Some(100)), b);
+        assert_eq!(plan.batch_for(Some(10_000)), perm, "none lives long enough");
     }
 
     #[tokio::test]
