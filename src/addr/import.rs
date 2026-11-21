@@ -32,7 +32,7 @@ use super::layout::{
     last_block, origin_id, slice_id,
 };
 use super::slice::{SliceId, cover, held, held_level, new_slice, resolve_after, units};
-use super::stamps::{self, Stamps};
+use super::stamps::{self, Stamps, record_batches};
 use super::trace_index::TraceIndex;
 use crate::swarm::{bee::Bee, soc};
 
@@ -156,13 +156,6 @@ pub struct State {
     /// them).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub batches: Vec<B256>,
-}
-
-/// Adds `used` to the batches a state or an upload records, keeping them sorted and unique.
-pub fn record_batches(batches: &mut Vec<B256>, used: impl IntoIterator<Item = B256>) {
-    batches.extend(used);
-    batches.sort();
-    batches.dedup();
 }
 
 /// The name a state records for a `TRACE` source: `None` without traces.

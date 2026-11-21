@@ -488,16 +488,23 @@ How the importer stamps (`addr-import` and `addr-upload`, `--batch` and `--lower
   when its fullest bucket is: the depth follows that bucket, not the total.
 - `addr-upload` refuses an upload its batches cannot take, before it sends anything. It
   counts every chunk the records still to upload stamp, per bucket of the batch each goes
-  to as of now, and adds what that batch holds already (`GET /stamps/{id}/buckets`). Bee
-  stamps a chunk it stamped before with the same batch into the same slot, so for a batch
-  the directory's earlier uploads used, sent again with `--from-start`, the larger of the
-  two counts is taken. That is right while a batch serves one index only. Otherwise the
-  count is an upper bound: a chunk the export lists twice (a merge a stopped run wrote
-  again), or one a stopped upload sent already, counts twice, so `--no-capacity-check`
-  uploads to a batch the check refuses by a few chunks. A lower batch not usable yet is
-  refused too: the upload would start using it once Bee confirms it, uncounted. An import
-  straight to Bee cannot know its load in advance: Bee refuses the chunk once an immutable
-  batch's bucket is full, and the run stops there.
+  to as of now, and adds what that batch holds already (`GET /stamps/{id}/buckets`).
+  - **One exception:** Bee stamps a chunk it stamped before with the same batch into the
+    same slot. So when `uploaded.json` shows that every earlier upload sent everything to
+    one batch, and that batch is used again with `--from-start` and no lower batch, the
+    larger of the two counts is taken. That assumes the batch serves this index only. With
+    lower batches, records move between batches from one upload to the next: a record's
+    lifetime is fixed when it is written, while the batches' TTLs count down.
+  - **In every other case the counts add up**, an upper bound for the batch choice as of
+    the start. A chunk the export lists twice (a merge a stopped run wrote again), or one a
+    stopped upload sent already, counts twice. `--no-capacity-check` uploads to a batch the
+    check refuses by a few chunks.
+  - **Not counted:** a record that moves to a longer lower batch while a long upload runs,
+    as the TTLs count down.
+  - **A lower batch not usable yet is refused** while records with a lifetime are still to
+    be sent: the upload would start using it once Bee confirms it, uncounted.
+  - **An import straight to Bee** cannot know its load in advance: Bee refuses the chunk
+    once an immutable batch's bucket is full, and the run stops there.
 - `--batch` is required unless the Bee node is bee-factory: the node whose `GET /wallet`
   reports chain 1337. There an upload without it takes the batch of the directory's
   earlier uploads, else the node's first usable immutable batch. On any other node no

@@ -213,7 +213,9 @@ ethswarm --bee <bee> addr-upload ~/addr1-<name>/export --batch <permanent batch>
 - **`--batch` is required** on every node but bee-factory, even to resume.
 - **Capacity check:** before sending anything, the upload counts its chunks per bucket of
   each batch and refuses a batch that cannot take them. `stamps plan` sizes one that can.
-  The count is an upper bound; `--no-capacity-check` skips it. A lower batch must be usable
+  The counts add up, an upper bound as of the start. The one exception is `--from-start`
+  into the single batch every earlier upload used, with no lower batch: there the chunks
+  take their old slots. `--no-capacity-check` skips the check. A lower batch must be usable
   (confirmed by Bee) before the upload starts.
 - **Origin check:** the upload checks the index's origin first, and refuses an export whose
   key already published another index.

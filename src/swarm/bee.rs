@@ -510,10 +510,13 @@ async fn error_from(resp: reqwest::Response) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[tokio::test]
     async fn only_bee_factory_has_a_default_batch() {
-        use crate::addr::stamps::tests::serve;
+        use crate::addr::stamps::tests::serve as serve_json;
         let id = B256::repeat_byte(4);
         let list: &'static str = Box::leak(
             format!(
@@ -522,7 +525,7 @@ mod tests {
             )
             .into_boxed_str(),
         );
-        let bee = Bee::new(serve(vec![Some(r#"{"chainID":1337}"#), Some(list)])).unwrap();
+        let bee = Bee::new(serve_json(vec![Some(r#"{"chainID":1337}"#), Some(list)])).unwrap();
         assert_eq!(bee.default_batch("x").await.unwrap(), id);
         for (answer, says) in [
             (
@@ -536,7 +539,7 @@ mod tests {
             (None, "could not be asked whether it is bee-factory"),
             (Some("500"), "could not be asked whether it is bee-factory"),
         ] {
-            let bee = Bee::new(serve(vec![answer])).unwrap().with_retries(1);
+            let bee = Bee::new(serve_json(vec![answer])).unwrap().with_retries(1);
             let e = format!(
                 "{:#}",
                 bee.default_batch("x needs --batch").await.unwrap_err()
@@ -544,9 +547,6 @@ mod tests {
             assert!(e.starts_with("x needs --batch") && e.contains(says), "{e}");
         }
     }
-    use super::*;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
 
     /// A local HTTP server answering its n-th connection with `responses[n]` (raw bytes),
     /// then closing it — mid-body when the body is shorter than its Content-Length.

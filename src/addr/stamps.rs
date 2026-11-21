@@ -83,6 +83,14 @@ impl Plan {
     }
 }
 
+/// Adds `used` to the batches a state or an upload records (`.claude/agent/postage.md`, rule
+/// 3), keeping them sorted and unique.
+pub fn record_batches(batches: &mut Vec<B256>, used: impl IntoIterator<Item = B256>) {
+    batches.extend(used);
+    batches.sort();
+    batches.dedup();
+}
+
 /// Default days a lower batch must outlive the slices it stamps.
 pub const GRACE_DAYS: u64 = 7;
 
