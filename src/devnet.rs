@@ -51,12 +51,12 @@ pub struct Activity {
     pub failed_creation: Address,
 }
 
-/// Sends the activity from `sender`; `authority` signs an EIP-7702 authorization that
-/// `sender` submits. `transfers` is the number of `Transfer` calls.
 /// Chain IDs of local dev chains (Anvil, Hardhat, bee-factory). Anything else needs an
 /// explicit `allow_chain_id`.
 pub const DEV_CHAINS: [u64; 2] = [1337, 31337];
 
+/// Sends the activity from `sender`; `authority` signs an EIP-7702 authorization that
+/// `sender` submits. `transfers` is the number of `Transfer` calls.
 pub async fn run(
     rpc: Url,
     sender: PrivateKeySigner,

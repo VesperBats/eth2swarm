@@ -214,11 +214,14 @@ enum Command {
         /// Merges of this level and above are built in the background.
         #[arg(long, default_value_t = 6)]
         defer_level: u8,
-        /// Highest slice level built. Memory is bounded by --sort-memory-mb at any level (a
-        /// busy address's spill file is written page by page, and above 1 MiB uploaded chunk
-        /// by chunk; an export started before layout 3 writes it whole and refuses one above
-        /// 256 MB); the cap bounds the time and the temporary disk one slice takes.
-        #[arg(long, default_value_t = 12)]
+        /// Highest slice level built (default: every level, up to the top level 16). Memory is
+        /// bounded by --sort-memory-mb at any level (a busy address's spill file is written
+        /// page by page, and above 1 MiB uploaded chunk by chunk; an export started before
+        /// layout 3 writes it whole and refuses one above 256 MB); a lower cap bounds the time
+        /// and the temporary disk one slice takes, and refuses the run once a slice would hold
+        /// more: a backfill from genesis at once, an index that follows the chain when its
+        /// merges reach the cap.
+        #[arg(long, default_value_t = addr::layout::L_MAX)]
         max_level: u8,
         /// Directory for the sort runs of the slice being built (default: --state); they go in
         /// an `ethswarm-sort` directory of their own there. About 45 bytes per appearance of

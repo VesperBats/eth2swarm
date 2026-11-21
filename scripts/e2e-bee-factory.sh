@@ -351,8 +351,8 @@ if [ "$CHAIN_ID" = 1337 ] || [ "$CHAIN_ID" = 31337 ]; then
   ACT_KEY=0x$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
   ACT_STATE=$(mktemp -d)
   # The backfill covers the whole dev chain from genesis; its blocks are nearly empty, so
-  # even large slices are quick to build here (--max-level 16, above the default of 12), only
-  # slower on an old stack. Every spill file is streamed: uploaded chunk by chunk as it is
+  # even large slices are quick to build here (--max-level 16, every level), only slower on an
+  # old stack. Every spill file is streamed: uploaded chunk by chunk as it is
   # written, as a busy address of a top-level slice is.
   OUT=$(ETH2SWARM_ADDR_STREAM_FILE_BYTES=1 $BIN --bee "$UPLOAD_BEE" addr-import --key "$ACT_KEY" --state "$ACT_STATE" --init \
     --units "$ACT_UNITS" --max-level 16 "${TRACE_FLAG[@]}") \

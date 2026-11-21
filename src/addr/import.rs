@@ -1233,7 +1233,8 @@ mod tests {
     #[test]
     fn a_trace_index_must_cover_the_run() {
         use super::super::trace_index::tests::write;
-        let dir = std::env::temp_dir().join(format!("a1tr-coverage-{}", std::process::id()));
+        // Not `a1tr-coverage-<pid>`: trace_index's own coverage test uses that, in parallel.
+        let dir = std::env::temp_dir().join(format!("a1tr-import-coverage-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Units 2..10 in two adjoining files (blocks 128..=639), then a gap.

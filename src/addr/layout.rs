@@ -820,6 +820,14 @@ impl HeadRecord {
                 .all(|w| pending_key(&w[0]) < pending_key(&w[1])),
             "pending merges not strictly ascending by (first unit, level)"
         );
+        // What `decode` refuses must never be signed: a head is write-once.
+        assert!(
+            self.pending
+                .iter()
+                .all(|(level, index)| ((*index as u64 + 1) << level) <= self.units),
+            "a pending merge ends after unit {}",
+            self.units
+        );
         let mut w = Writer::new(KIND_HEAD);
         w.u64(self.first_block());
         w.u64(self.units);
@@ -1145,7 +1153,11 @@ mod tests {
         over[13..21].copy_from_slice(&(MAX_UNITS + 1).to_be_bytes());
         over[21..29].copy_from_slice(&((MAX_UNITS + 1) * UNIT_BLOCKS - 1).to_be_bytes());
         assert!(HeadRecord::decode(&over).is_err());
-        assert!(HeadRecord::decode(&head(3, vec![(2, 0)]).encode()).is_err());
+        // Encoded with 4 units (the merge ends there), then cut to 3: `encode` refuses that.
+        let mut short = head(4, vec![(2, 0)]).encode();
+        short[13..21].copy_from_slice(&3u64.to_be_bytes());
+        short[21..29].copy_from_slice(&(3 * UNIT_BLOCKS - 1).to_be_bytes());
+        assert!(HeadRecord::decode(&short).is_err());
         // A start off a unit boundary, at or after the head's units, or after a pending merge.
         let start = |first: u64, units: u64, pending: Vec<(u8, u32)>| {
             let mut h = head(units, pending).encode();
@@ -1214,6 +1226,19 @@ mod tests {
             }
             assert!(HeadRecord::decode(&enc).is_err(), "{pending:?}");
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "a pending merge ends after unit 3")]
+    fn encoding_a_merge_past_the_head_panics() {
+        HeadRecord {
+            first_unit: 0,
+            units: 3,
+            last_block_hash: B256::ZERO,
+            last_block_timestamp: 0,
+            pending: vec![(2, 0)],
+        }
+        .encode();
     }
 
     #[test]
