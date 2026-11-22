@@ -39,9 +39,10 @@ mainnet nodes and their roles in the [README](../README.md#ethereum-mainnet-node
   that `addr-upload` sends later.
 - **Postage** (*Lifetime*): batches grouped by lifetime (`--lower-batch`), immutable
   batches only, `--batch` required on every node but bee-factory (and with `--lower-batch`
-  everywhere), a capacity check before
-  an upload, and every batch an index uses recorded. `stamps` and `stamps plan` list,
-  size and price batches; nothing buys one (`.claude/agent/postage.md`).
+  everywhere), a capacity check before an export's upload (`addr-upload`; an import
+  straight to Bee has none and stops when Bee refuses a chunk), and every batch an index
+  uses recorded. `stamps` and `stamps plan` list, size and price batches; nothing buys one
+  (`.claude/agent/postage.md`).
 - **Readers and checks:** `addr-verify` (a full read-back), `addr-lookup` (head discovery,
   incremental sync, `--against-chain`), and the inspector's *Address index* tab
   ([inspector.md](inspector.md)). `trace-compare` checks a frame index against
@@ -78,7 +79,7 @@ mainnet nodes and their roles in the [README](../README.md#ethereum-mainnet-node
 |---|---|---|---|---|---|
 | One week (superseded) | `0x01229dbb4201bd5b2c93ce7c744af90600114b70` | a week before 2026-11-19 | no | the nuc, as an export (`~/addr1-export`, layout 1, 631 MB) | superseded by the month index; not uploaded again since bee-factory was wiped |
 | One month | `0xefdb28e3Eac685FC0fFb8B61A2692FC671559e4b` | 26,236,928 → the tip | no: built without `--trace-index`, so that it can follow the tip | bee-factory on the nuc (local) | follows the tip, one unit about every 13 minutes; the export is about 2.3 GB after following it to 2026-11-22 (1.7 GB for the month itself) |
-| One year | `0xb11B5F07FEb04076c21092A64eb827f418087241` | 23,838,784 → 26,468,607 | yes, from the frame index | the nuc, as an export | being built since 2026-11-22. Estimated ≈ 3.7 billion appearances and ≈ 9–10 M chunks, for a test upload to Swarm mainnet |
+| One year | `0xb11B5F07FEb04076c21092A64eb827f418087241` | 23,838,784 → 26,468,607 | yes, from the frame index | the nuc, as an export | being built since 2026-11-22. Estimated by *Full history and cost*'s method (linear from 720 appearances per block at 22 M to 1,901 at 26.4 M, 2.30 chunks per 1000): ≈ 4.1 billion appearances, ≈ 9.5 M chunks. For a test upload to Swarm mainnet |
 | From genesis | — | — | — | — | not built: the import takes several days, the backfill has to run uninterrupted, and it needs a Swarm-mainnet Bee node and the owner's batches |
 
 - **bee-factory is not durable:** a reboot wipes its chain, so the month index is uploaded
@@ -587,7 +588,8 @@ How the importer stamps (`addr-import` and `addr-upload`, `--batch` and `--lower
   - Example: the mainnet month index of 2026-11-20 stamps 779,755 chunks with a fullest
     bucket of 32. That is depth 21 exactly full and 22 half full; it was uploaded to a
     depth-23 batch, which Bee then reported as 32/128. Followed to unit 413,417, it
-    stamped 852,615 chunks with a fullest bucket of 33, still depth 23.
+    stamped 852,615 chunks with a fullest bucket of 33: depth 21 would now overflow and 22
+    is over half full, so `stamps plan` now calls for 23 (it called for 22 at 32).
 
 The cap is what keeps the history from being rewritten: without it, the whole history
 would be merged into one new top slice every time `N` reaches a power of two, briefly

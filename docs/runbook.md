@@ -228,7 +228,8 @@ ethswarm --bee <bee> addr-upload ~/addr1-<name>/export --batch <permanent batch>
   mainnet: Gnosis Chain, a funded wallet, and batches the owner bought. No such node is set up
   yet; see [sepolia-notes.md](sepolia-notes.md) for running one. A month is about 1.7 GB of
   export and half an hour of upload on bee-factory (2.3 GB once it has followed the tip for
-  two more days).
+  two more days). Following grows it in steps, not at a rate: the log keeps every merged
+  copy, and a high-level merge can add the whole index again.
 
 ## 5. Keep it current
 
