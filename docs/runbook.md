@@ -227,7 +227,8 @@ ethswarm --bee <bee> addr-upload ~/addr1-<name>/export --batch <permanent batch>
 - **Mainnet Swarm** takes the same command, with `--bee` pointed at a Bee node on Swarm
   mainnet: Gnosis Chain, a funded wallet, and batches the owner bought. No such node is set up
   yet; see [sepolia-notes.md](sepolia-notes.md) for running one. A month is about 1.7 GB of
-  export and half an hour of upload on bee-factory.
+  export and half an hour of upload on bee-factory (2.3 GB once it has followed the tip for
+  two more days).
 
 ## 5. Keep it current
 
@@ -352,7 +353,7 @@ curl -s localhost:1735/wallet | python3 -c 'import json,sys; print(json.load(sys
 4. Read the queen's peer id again (`curl localhost:1733/addresses`) for anything that dials
    it, such as Myotis's Swarm node.
 
-## Open, as of 2026-11-20
+## Open, as of 2026-11-22
 
 - **Per-slice resume for the backfill,** so a multi-day import survives an interruption.
 - **`--follow` with a frame index** (an export that keeps up, and an import that re-reads

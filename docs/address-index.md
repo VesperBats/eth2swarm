@@ -38,12 +38,15 @@ mainnet nodes and their roles in the [README](../README.md#ethereum-mainnet-node
   following the chain (`--follow`), straight to Bee or to an export directory (`--out`)
   that `addr-upload` sends later.
 - **Postage** (*Lifetime*): batches grouped by lifetime (`--lower-batch`), immutable
-  batches only, `--batch` required on every node but bee-factory, a capacity check before
+  batches only, `--batch` required on every node but bee-factory (and with `--lower-batch`
+  everywhere), a capacity check before
   an upload, and every batch an index uses recorded. `stamps` and `stamps plan` list,
   size and price batches; nothing buys one (`.claude/agent/postage.md`).
 - **Readers and checks:** `addr-verify` (a full read-back), `addr-lookup` (head discovery,
   incremental sync, `--against-chain`), and the inspector's *Address index* tab
-  ([inspector.md](inspector.md)). Reader conformance vectors
+  ([inspector.md](inspector.md)). `trace-compare` checks a frame index against
+  `trace_block`, and `devnet-activity` generates test traffic on a dev chain. Reader
+  conformance vectors
   (`testdata/addr1-reader-vectors.txt`) pin the format for other readers.
 - **Measuring** (`addr-stats`): the *Measurements* below, with traces under the current
   rules.
@@ -54,7 +57,7 @@ mainnet nodes and their roles in the [README](../README.md#ethereum-mainnet-node
   page by page above it.
 - **In the importer:** a backfill that resumes per slice (a stopped backfill starts over),
   and `--follow` with a frame index (a traced index is extended in steps instead).
-- **Proofs of completeness:** a design sketch is in #41.
+- **Proofs of completeness:** a design sketch is proposed in PR #41 (open).
 
 **Readers outside this repository:**
 - **Myotis** (VesperBats/myotis#908, merged 2026-11-21): the address history in its Rust
@@ -73,14 +76,16 @@ mainnet nodes and their roles in the [README](../README.md#ethereum-mainnet-node
 
 | Index | Importer key (SOC owner) | Blocks | `TRACE` | Where | State |
 |---|---|---|---|---|---|
-| One month | `0xefdb28e3Eac685FC0fFb8B61A2692FC671559e4b` | 26,236,928 → the tip | no | bee-factory on the nuc (local) | follows the tip, one unit about every 13 minutes; the export is about 2.3 GB |
+| One week (superseded) | `0x01229dbb4201bd5b2c93ce7c744af90600114b70` | a week before 2026-11-19 | no | the nuc, as an export (`~/addr1-export`, layout 1, 631 MB) | superseded by the month index; not uploaded again since bee-factory was wiped |
+| One month | `0xefdb28e3Eac685FC0fFb8B61A2692FC671559e4b` | 26,236,928 → the tip | no: built without `--trace-index`, so that it can follow the tip | bee-factory on the nuc (local) | follows the tip, one unit about every 13 minutes; the export is about 2.3 GB after following it to 2026-11-22 (1.7 GB for the month itself) |
 | One year | `0xb11B5F07FEb04076c21092A64eb827f418087241` | 23,838,784 → 26,468,607 | yes, from the frame index | the nuc, as an export | being built since 2026-11-22. Estimated ≈ 3.7 billion appearances and ≈ 9–10 M chunks, for a test upload to Swarm mainnet |
 | From genesis | — | — | — | — | not built: the import takes several days, the backfill has to run uninterrupted, and it needs a Swarm-mainnet Bee node and the owner's batches |
 
 - **bee-factory is not durable:** a reboot wipes its chain, so the month index is uploaded
   again after one (`addr-upload --from-start` with a new batch).
-- **Both test indexes are chain 1** (mainnet). The month index is the data Myotis's and
-  Punicus's end-to-end checks run against.
+- **All the test indexes are chain 1** (mainnet). The month index is the data Myotis's and
+  Punicus's end-to-end checks run against. Rebuilding it as it is deployed means the
+  runbook's *Without traces* variant (step 2): `--follow` refuses `--trace-index`.
 
 ## Design constraints
 
