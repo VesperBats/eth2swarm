@@ -15,8 +15,9 @@ Importer of Ethereum blocks into Ethereum Swarm.
   up to a finalized block, every header hashed and linked here, the top pinned by
   `--top-hash` or by another node (`--cross-check`); `--extend <table>` continues an existing
   table from its last entry, which it must reproduce, up to a new top.
-- Address → transaction index (in progress, #8): a mobile-friendly index on Swarm from an
-  address to the transactions it appears in — design in
+- Address → transaction index (#8, on `main` since 2026-11-21): a mobile-friendly index on
+  Swarm from an address to the transactions it appears in — design, implementation status
+  and deployments in
   [docs/address-index.md](docs/address-index.md), every command in order in
   [docs/runbook.md](docs/runbook.md); `appearances`, `addr-stats`, `addr-import`,
   `addr-upload`, `addr-verify`, `addr-lookup`, `stamps` and `stamps plan` for postage batches
