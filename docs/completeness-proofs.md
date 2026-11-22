@@ -75,18 +75,27 @@ gave everyone the same ones: Swarm serves whatever SOC a reader asks for, and no
 stops an importer from signing two different heads for the same update and serving them
 to different readers.
 
-**The commitment:** per head update, or per slice, the importer posts on chain:
-- the block range and the hash of its last block;
-- the slice's `buckets_root` (already in every `SliceRecord`), or the hash of the
-  `HeadRecord`.
+**The commitment:** per head update, the importer posts on chain:
+- the update's number, its block range and the hash of its last block;
+- `keccak256` of the whole `SliceRecord` (111 bytes) of every slice the update adds: the
+  unit's slice, and a merged slice once it leaves `pending`;
+- `keccak256` of the `HeadRecord`.
+
+**The whole `SliceRecord`, not only its `buckets_root`:** a reader picks its bucket with
+`bucket_count`, `k = (u32(h[0..4]) · B) >> 32`, and `buckets_root` doesn't cover `B`. Two
+signed descriptors with the same root but a different `bucket_count` would send a chosen
+reader to a bucket that holds no record for its address: a per-reader view and an omission
+at once. The descriptor hash binds `bucket_count`, `roles`, `first_block` and
+`last_block_hash` too; *Independent importers* (address-index.md) already requires those
+fields to match. The `HeadRecord` hash alone binds no slice: a head holds no slice hash.
 
 **What the contract checks:** that the block hash is canonical, through `BLOCKHASH` or the
-EIP-2935 history contract. Units are final 13–32 minutes after their last block, so posting
-within 27 hours is easy. One commitment per range and key; a second one for the same range
+EIP-2935 history contract. A unit's last block is final 13–19 minutes after it (two to
+three epochs), so posting within 27 hours is easy. One commitment per range and key; a second one for the same range
 is refused, or is itself evidence of equivocation.
 
-**What the reader checks:** that the slice it read from Swarm matches the commitment
-(`SliceRecord.buckets_root`), with a verified state read of the contract. In Myotis that
+**What the reader checks:** that every `SliceRecord` it read from Swarm hashes to a
+committed descriptor hash, read from the contract with a verified state read. In Myotis that
 is an `eth_getProof` read against a verified state root.
 
 **What it buys:** every reader sees the same index, with two conditions:
@@ -100,10 +109,15 @@ is an `eth_getProof` read against a verified state root.
 It proves nothing about completeness.
 
 **What it costs:** one transaction per commitment. Per head update (every unit, about 13
-minutes) that is about 3,300 a month. Batching a day's heads in a Merkle tree, one root per
-day, keeps it to one transaction a day. The contract can then check only the batch's last
-block hash. The others are bound by the hash chain, so a reader checks a leaf's slices
-against it with the headers it verifies anyway.
+minutes) that is about 3,300 a month. Batching a day's updates in a Merkle tree, one root
+per day, keeps it to one transaction a day, with two rules:
+- **A fixed position per update:** update n's leaf sits at position n minus the batch's
+  first update, and the batch posts its leaf count. Otherwise two leaves for one update fit
+  in one batch, one for each group of readers, and the contract cannot see inside a batch
+  to refuse the second.
+- **One block hash checked:** the contract checks only the batch's last block hash. The
+  others are bound by the hash chain: a reader checks a leaf's `last_block_hash` against
+  the headers it verifies anyway.
 
 **A format detail:** a reader cannot check a bucket against `buckets_root` today, because
 no Merkle path comes with the bucket (*`SliceRecord`*). Step 1 needs one: `⌈log₂ B⌉`
@@ -129,16 +143,21 @@ shows two things:
    - `EMITTER`, `TOPIC`, `WORD` (log data): the receipt, against `receiptsRoot`.
    - `BLOCK`: the header itself (beneficiary), the uncle headers against `ommersHash`, or
      the withdrawal against `withdrawalsRoot`.
-2. **The committed slice lacks it:** the bucket the address hashes to, with its path to
-   the committed `buckets_root`. Then, depending on the record:
-   - **Inline:** the bucket's entries hold no entry for that (block, slot) under that
-     address's fingerprint.
+2. **The committed slice lacks it:** the committed `SliceRecord` (its hash on chain gives
+   `bucket_count`, so the bucket the address hashes to is fixed), and that bucket with its
+   path to the descriptor's `buckets_root`. Then the entries hold no entry for that
+   (block, slot) under that address's fingerprint, **or one whose role lacks a bit the
+   evidence shows.** An importer could otherwise keep the entry and clear a bit, turning
+   `TO | TOPIC | WORD` into `WORD`, so that a wallet filtering on transfers drops it.
+   Where the entries are:
+   - **Inline:** in the bucket.
    - **Spilled or paged:** the entries are in a spill or pages file (`spill_ref`,
      `pages_ref`). The proof then needs that file's pages with their chunk-tree (BMT)
      proofs to the reference, and a parser for those formats on chain.
 
    **A limit:** a fingerprint collision lets another address's record cover the same
-   (block, slot) under the same fingerprint, and such an omission cannot be proved. It is
+   (block, slot) under the same fingerprint, and such an omission or cleared bit cannot be
+   proved. It is
    rare (8-byte fingerprints), but the dispute game must accept "not provable" as an
    outcome.
 
@@ -167,32 +186,48 @@ commits to internal calls.
 ## Step 3: completeness, through zero-knowledge validity proofs
 
 **The statement**, for one unit slice of 64 blocks, with the public inputs `first_block`,
-*P* (the hash before it) and *H*:
+*P* (the hash before it) and *H*, and the public output `keccak256(SliceRecord)`:
 
 > There are headers *h_a … h_b*, with *h_a* numbered `first_block` and its `parentHash`
 > equal to *P*, each hashing to the next one's `parentHash`, and *h_b* hashing to *H*. There
 > are bodies (transactions, uncle headers, withdrawals) and receipts matching their
 > `transactionsRoot`, `ommersHash`, `withdrawalsRoot` and `receiptsRoot`. And the slice's
-> canonical bytes (`SliceRecord`, buckets, spill and pages files), summarized by the public
-> output `buckets_root`, are exactly *F*(those headers, bodies and receipts).
+> canonical bytes (`SliceRecord`, buckets, spill and pages files) are exactly *F*(those
+> headers, bodies and receipts).
 
 *F* is the detection rules (*Detection rules* in address-index.md), including signature
-recovery for `FROM` and `AUTH`, and the canonical encoding (*Record formats*).
+recovery for `FROM` and `AUTH`, and the canonical encoding (*Record formats*). Both are
+deterministic, and the reader conformance vectors (`testdata/addr1-reader-vectors.txt`) pin
+the encoding byte for byte. That makes a validity proof possible at all: for a given range
+there is exactly one correct slice.
+
+**The whole `SliceRecord`, not only `buckets_root`,** is the output, for the reason given
+under Step 1: a reader's bucket depends on `bucket_count`. The descriptor already carries
+`first_block` and *H* (`last_block_hash`). *P* is not one of its fields, so it is published
+with the proof.
 
 **Only for an index without `TRACE`.** F cannot produce `TRACE` entries, nor the `TRACE`
 bit on an entry it shares with another role, from these inputs. So the proven index is one
-built without traces, as the month test index was. `TRACE` would be a separate index
-(other slices, another root) on the importer's word, or proven with a zkEVM (below). A
-reader then combines a proven index with an unproven `TRACE` index, and marks the `TRACE`
-entries as resting on the importer. Both are deterministic, and the reader conformance vectors
-(`testdata/addr1-reader-vectors.txt`) pin the encoding byte for byte. That makes a
-validity proof possible at all: for a given range there is exactly one correct slice.
+built without traces, as the one-month test index on bee-factory was (VesperBats/myotis#899,
+*The data*). `TRACE` would be a separate index (other slices, another root) on the
+importer's word, or proven with a zkEVM (below). A reader then combines a proven index with
+an unproven `TRACE` index, and marks the `TRACE` entries as resting on the importer.
 
-**Recursion along the slice tree.** A merged slice's proof verifies its two children's
-proofs and the merge, rather than repeating them, and checks that they chain: the left
-child's *H* is the right child's *P*, and the first blocks follow. A head's cover (one
-slice per level) then carries proofs for every block from the index's start to its last
-unit. "Complete up to block N" becomes one small proof per slice of the cover. A client
+**Merges are not recursion only.** A merged slice is not a function of the slices it
+replaces: buckets carry fingerprints, not addresses, so a merge is built from the blocks
+again (*Building large slices* in address-index.md). And of the two halves a merge joins,
+the odd-indexed lower slice is never written (*Slices and covers*). So:
+- **Each slice proof also outputs a commitment to its items:** the sorted
+  `h[0..12] ‖ address ‖ block ‖ slot ‖ roles` records the builder sorts anyway
+  (`src/addr/build.rs`).
+- **A merge proof** opens its inputs' item commitments (the written slices the merge
+  replaces, its expansion in *Large merges in the background*), checks that they chain (one
+  input's *H* is the next one's *P*, and the first blocks follow), and re-encodes the
+  merged slice from the items: the bucket assignment under the new `bucket_count`, the
+  Keccak of every bucket, the BMT of every spill and pages file.
+
+A head's cover (one slice per level) then carries proofs for every block from the index's
+start to its last unit. "Complete up to block N" becomes one small proof per slice of the cover. A client
 checks each proof in milliseconds, and that the cover's slices chain (each slice's *P* is
 the previous slice's *H*). It verifies the last slice's *H* through its own anchors: the
 light client, or the checkpoint table.
@@ -207,9 +242,9 @@ commitment the reader reads from verified state (Step 1) tells it which head is 
 newest.
 
 **What it proves:** every role whose evidence is in the transaction, the receipt, the
-header or the body: `FROM`, `TO`, `EMITTER`, `TOPIC`, `WORD`, `AUTH`, `BLOCK`. The list is then complete
-for those roles, and no longer rests on the importer: the importer key only says where the
-slices are.
+header or the body: `FROM`, `TO`, `EMITTER`, `TOPIC`, `WORD`, `AUTH`, `BLOCK`. The list is
+then complete for those roles, and no longer rests on the importer: the importer key only
+says where the slices are.
 
 **What it does not prove:**
 - **`TRACE`:** internal calls exist only through execution, so proving them means proving
@@ -222,10 +257,13 @@ slices are.
 **What proving costs (order of magnitude, to be measured):**
 - **The work per block:** RLP decoding of the transactions and receipts, Keccak over both
   tries (a few hundred KB per block at the tip), signature recovery for every sender and
-  authority, the detection rules, and the encoding. No EVM execution. Current zkVMs prove whole mainnet blocks, execution included, in seconds
-  on GPU clusters, so this is a much smaller job per block.
-- **Forward from now:** about 7,200 blocks a day, plus the merges (recursion only, cheap
-  next to the unit proofs).
+  authority, the detection rules, and the encoding. No EVM execution. Current zkVMs prove
+  whole mainnet blocks, execution included, in seconds on GPU clusters, so this is a much
+  smaller job per block.
+- **The merges:** each re-encodes every appearance of the merged slice, and each block is
+  written about 9 times in all (*Writing* in address-index.md). So the merges are about as
+  much work again as the unit proofs, without the decoding and recovery.
+- **Forward from now:** about 7,200 blocks a day, unit proofs and merges together.
 - **Back over the 26 M blocks of history:** a one-off batch job. A guess of tens to
   hundreds of thousands of dollars at today's proving prices; measure before planning on
   it.
@@ -252,9 +290,14 @@ slices are.
   don't cover them directly. Two cheaper checks close most of the gap without any proof:
   - **The current root:** compare the rebuilt tree with the contract's current root, not
     with any root of `rootHistory`. That proves the commitments complete up to that block
-    and rules out truncation-based partitioning. RAILGUN starts a new tree when one fills,
-    and the current root is the active tree's. Each earlier tree needs its own check: that
-    it is full, and that its final root is in that tree's `rootHistory`.
+    and rules out truncation-based partitioning. RAILGUN starts a new tree when the
+    next batch of commitments does not fit (as the review of this sketch reads
+    `Commitments.sol`; to be confirmed against the contract), so an earlier tree can close
+    with fewer than 2^16 leaves, and the current root is the active tree's. Each earlier
+    tree needs its own check, and `rootHistory` is no help: it holds the tree's
+    intermediate roots too, so a truncated view passes. What holds: the tree's final
+    `merkleRoot`, read from verified state at the last block before `treeNumber` moved on.
+    That needs a node that still serves that block's state.
   - **Nullifiers in state:** read each own note's nullifier from the contract's state
     (assuming its nullifier mapping has a public getter), instead of trusting the
     nullifier logs.
@@ -276,6 +319,8 @@ slices are.
 
 ## Open questions
 
+- **The cost of a merge proof** next to the unit proofs: re-encoding at every level a
+  block is written at.
 - **The cost per block** of the Step 3 statement in a current zkVM (SP1, RISC Zero, …), at
   the tip and in older eras. Proving time, cost and proof size.
 - **The statement's size:** is one unit slice (64 blocks) the right proving unit, or one
