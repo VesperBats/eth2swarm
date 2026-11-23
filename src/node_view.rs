@@ -38,12 +38,12 @@ const PEER_ROWS: usize = 50;
 pub const WARN_TTL_DAYS: f64 = 7.0;
 /// A batch whose fullest bucket is at least this full is flagged.
 pub const WARN_FILL: f64 = 0.8;
-/// Less xDAI than this (0.01) is flagged: it pays the gas of deposits, cashouts and top-ups.
+/// Less gas token than this (0.01) is flagged: it pays for deposits, cashouts and top-ups.
 const WARN_XDAI_WEI: u128 = 10_000_000_000_000_000;
 
-/// Decimals of xBZZ (PLUR) and of xDAI (wei).
+/// Decimals of xBZZ (PLUR) and of the gas token (wei, on every chain listed in [`chain`]).
 const BZZ_DECIMALS: u32 = 16;
-const XDAI_DECIMALS: u32 = 18;
+const GAS_DECIMALS: u32 = 18;
 
 /// One endpoint's answer, or why there is none.
 type Answer = std::result::Result<Value, String>;
@@ -75,35 +75,45 @@ pub async fn read(bee: &Bee) -> Result<Value> {
 }
 
 async fn fetch_all(bee: &Bee, paths: impl Iterator<Item = String>) -> BTreeMap<String, Answer> {
-    let mut set = tokio::task::JoinSet::new();
-    for path in paths {
-        let bee = bee.clone();
-        set.spawn(async move {
-            let a = bee.get_value(&path).await.map_err(|e| format!("{e:#}"));
-            (path, a)
-        });
-    }
+    // Spawned together, awaited in turn: a task that panics still leaves its path, as unavailable.
+    let tasks: Vec<_> = paths
+        .map(|path| {
+            let bee = bee.clone();
+            let p = path.clone();
+            let task =
+                tokio::spawn(async move { bee.get_value(&p).await.map_err(|e| format!("{e:#}")) });
+            (path, task)
+        })
+        .collect();
     let mut out = BTreeMap::new();
-    while let Some(r) = set.join_next().await {
-        if let Ok((path, a)) = r {
-            out.insert(path, a);
-        }
+    for (path, task) in tasks {
+        let a = task
+            .await
+            .unwrap_or_else(|e| Err(format!("reading it failed: {e}")));
+        out.insert(path, a);
     }
     out
 }
 
 /// The overlay addresses (64 hex digits) of the peers `GET /chequebook/cheque` lists a
+/// received cheque for, the largest cheque first (only the first [`CASHOUT_PEERS`] are asked).
 /// received cheque for. Anything else is skipped: the address goes into a request path.
 fn received_cheque_peers(cheques: &Value) -> Vec<String> {
-    cheques["lastcheques"]
+    let mut peers: Vec<(u128, &str)> = cheques["lastcheques"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|c| !c["lastreceived"].is_null())
-        .filter_map(|c| c["peer"].as_str())
-        .filter(|p| p.len() == 64 && p.bytes().all(|b| b.is_ascii_hexdigit()))
-        .map(str::to_string)
-        .collect()
+        .filter_map(|c| {
+            Some((
+                big(&c["lastreceived"]["payout"]).unwrap_or(0),
+                c["peer"].as_str()?,
+            ))
+        })
+        .filter(|(_, p)| p.len() == 64 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect();
+    peers.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    peers.into_iter().map(|(_, p)| p.to_string()).collect()
 }
 
 /// A number Bee sends as a decimal string or a JSON number.
@@ -131,14 +141,18 @@ fn bzz(v: u128) -> Value {
     amount(v, BZZ_DECIMALS, "xBZZ")
 }
 
-/// The chain a node buys batches on, by the `chainID` of `GET /wallet`, and its block time in
-/// seconds (`None` where not known).
-fn chain(id: u64) -> (&'static str, Option<u64>) {
+/// The chain a node buys batches on, by the `chainID` of `GET /wallet`: its name, its block
+/// time in seconds (`None` where not known) and the token its gas is paid in.
+fn chain(id: u64) -> (&'static str, Option<u64>, &'static str) {
     match id {
-        100 => ("Gnosis Chain (Swarm mainnet)", Some(GNOSIS_BLOCK_SECS)),
-        11_155_111 => ("Sepolia (Swarm testnet)", Some(12)),
-        1337 => ("bee-factory dev chain", None),
-        _ => ("unknown chain", None),
+        100 => (
+            "Gnosis Chain (Swarm mainnet)",
+            Some(GNOSIS_BLOCK_SECS),
+            "xDAI",
+        ),
+        11_155_111 => ("Sepolia (Swarm testnet)", Some(12), "SepoliaETH"),
+        1337 => ("bee-factory dev chain", None, "ETH"),
+        _ => ("unknown chain", None, "native token"),
     }
 }
 
@@ -170,15 +184,18 @@ fn summarize(parts: &BTreeMap<String, Answer>, cashouts: &BTreeMap<String, Answe
     // The wallet.
     let wallet = get("wallet");
     let chain_id = wallet["chainID"].as_u64();
-    let (chain_name, block_secs) = chain_id.map(chain).unwrap_or(("not reported", None));
+    let (chain_name, block_secs, gas_token) =
+        chain_id
+            .map(chain)
+            .unwrap_or(("not reported", None, "native token"));
     let wallet_bzz = big(&wallet["bzzBalance"]);
-    let wallet_xdai = big(&wallet["nativeTokenBalance"]);
-    if let Some(x) = wallet_xdai
+    let wallet_gas = big(&wallet["nativeTokenBalance"]);
+    if let Some(x) = wallet_gas
         && x < WARN_XDAI_WEI
     {
         warnings.push(format!(
-            "The wallet holds {} xDAI: little gas for a deposit, a cashout or a top-up.",
-            units(x, XDAI_DECIMALS, 4)
+            "The wallet holds {} {gas_token}: little gas for a deposit, a cashout or a top-up.",
+            units(x, GAS_DECIMALS, 4)
         ));
     }
 
@@ -264,11 +281,19 @@ fn summarize(parts: &BTreeMap<String, Answer>, cashouts: &BTreeMap<String, Answe
     let price = big(&cs["currentPrice"]);
     let per_day = price.zip(block_secs).map(|(p, s)| amount_for(p, 86_400, s));
     let mut total_per_day: u128 = 0;
-    let batches: Vec<Value> = get("stamps")["stamps"]
-        .as_array()
+    // A batch Bee describes in a way not understood is named in a warning, never dropped quietly.
+    let mut parsed = Vec::new();
+    for v in get("stamps")["stamps"].as_array().into_iter().flatten() {
+        match serde_json::from_value::<BatchInfo>(v.clone()) {
+            Ok(b) => parsed.push((b, v)),
+            Err(e) => warnings.push(format!(
+                "Batch {} could not be read ({e}): it is missing from the table.",
+                v["batchID"].as_str().unwrap_or("without an ID")
+            )),
+        }
+    }
+    let batches: Vec<Value> = parsed
         .into_iter()
-        .flatten()
-        .filter_map(|v| serde_json::from_value::<BatchInfo>(v.clone()).ok().map(|b| (b, v)))
         .map(|(b, v)| {
             let id = format!("0x{}", hex::encode(b.batch_id));
             let short = &id[..10];
@@ -338,7 +363,8 @@ fn summarize(parts: &BTreeMap<String, Answer>, cashouts: &BTreeMap<String, Answe
         "wallet": {
             "address": wallet["walletAddress"],
             "bzz": wallet_bzz.map(bzz),
-            "xdai": wallet_xdai.map(|x| amount(x, XDAI_DECIMALS, "xDAI")),
+            "gas": wallet_gas.map(|x| amount(x, GAS_DECIMALS, gas_token)),
+            "gasToken": gas_token,
         },
         "chequebook": chequebook,
         "peers": peers,
@@ -418,7 +444,7 @@ mod tests {
         let s = summarize(&mainnet(), &cashouts);
         assert_eq!(s["chain"]["name"], "Gnosis Chain (Swarm mainnet)");
         assert_eq!(s["wallet"]["bzz"]["text"], "180.1073 xBZZ");
-        assert_eq!(s["wallet"]["xdai"]["text"], "1.9999 xDAI");
+        assert_eq!(s["wallet"]["gas"]["text"], "1.9999 xDAI");
         // Cheques sent and not cashed: total − available.
         assert_eq!(s["chequebook"]["sentUncashed"]["raw"], "17407417000023000");
         assert_eq!(s["chequebook"]["receivedUncashed"]["text"], "0.5000 xBZZ");
@@ -478,12 +504,32 @@ mod tests {
     }
 
     #[test]
-    fn only_hex_peers_are_asked_for_cashouts() {
+    fn cashouts_are_asked_for_hex_peers_largest_cheque_first() {
         let v = json!({"lastcheques":[
-            {"peer":"cc".repeat(32),"lastreceived":{}},
-            {"peer":"../wallet","lastreceived":{}},
+            {"peer":"cc".repeat(32),"lastreceived":{"payout":"5"}},
+            {"peer":"../wallet","lastreceived":{"payout":"9"}},
+            {"peer":"ee".repeat(32),"lastreceived":{"payout":"700"}},
             {"peer":"dd".repeat(32),"lastreceived":null}]});
-        assert_eq!(received_cheque_peers(&v), vec!["cc".repeat(32)]);
+        assert_eq!(
+            received_cheque_peers(&v),
+            vec!["ee".repeat(32), "cc".repeat(32)]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_batch_is_named() {
+        let mut p = mainnet();
+        p.insert(
+            "stamps".into(),
+            Ok(json!({"stamps":[{"batchID":"12".repeat(32),"usable":true,"batchTTL":"soon"}]})),
+        );
+        let s = summarize(&p, &BTreeMap::new());
+        assert!(s["postage"]["batches"].as_array().unwrap().is_empty());
+        let w = s["warnings"].to_string();
+        assert!(
+            w.contains(&"12".repeat(32)) && w.contains("missing from the table"),
+            "{w}"
+        );
     }
 
     #[test]

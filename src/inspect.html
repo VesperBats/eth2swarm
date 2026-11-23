@@ -355,20 +355,26 @@ function units(v, decimals = 16, places = 4) {
 const amt = (a) => a ? esc(a.text) : '<span class="muted">—</span>';
 const days = (d) => d == null ? '<span class="muted">—</span>' : `${d.toFixed(1)} days`;
 let nodeData = null;
+// The node the Node tab last loaded: coming back to the tab with another selected reloads it.
+let nodeShown = null;
 // The top-up and deposit forms are drawn once per load; typing redraws only their results.
+// Only batches that exist and are usable can be topped up usefully.
+const toppable = (d) => d.postage.batches.filter(b => b.exists && b.usable);
 function topupForm(d) {
-  const opts = d.postage.batches.map(x => `<option value="${esc(x.id)}">${esc(x.id.slice(0, 10))}… ${esc(x.label)}</option>`).join('');
+  if (!toppable(d).length) return '<div class="muted">No batch that exists and is usable, so nothing to top up.</div>';
+  const opts = toppable(d).map(x => `<option value="${esc(x.id)}">${esc(x.id.slice(0, 10))}… ${esc(x.label)}</option>`).join('');
   return `<div class="query" style="margin:12px 0 6px"><label>Batch<select id="topupBatch">${opts}</select></label>
     <label class="small">Days to add<input id="topupDays" type="number" min="1" step="1" value="7"></label></div><div id="topupOut"></div>`;
 }
 function topupResult(d) {
-  const p = d.postage, b = p.batches.find(x => x.id === $('topupBatch')?.value) || p.batches[0];
-  const n = Math.floor(+($('topupDays')?.value ?? 7));
-  if (!(n >= 1)) return '<div class="err">a whole number of days, at least 1</div>';
+  const p = d.postage, b = toppable(d).find(x => x.id === $('topupBatch')?.value) || toppable(d)[0];
+  const n = Number($('topupDays')?.value ?? 7);
+  // Up to 100 years: anything else (1e400, 2.5, empty) gets no command rather than a stale one.
+  if (!Number.isInteger(n) || n < 1 || n > 36500) return '<div class="err">a whole number of days, 1 to 36,500</div>';
   if (!p.perChunkPerDay) return '<div class="muted">No cost: the node\'s chain has no known block time.</div>';
   const amount = BigInt(p.perChunkPerDay) * BigInt(n), cost = amount << BigInt(b.depth);
   const wallet = d.wallet.bzz ? BigInt(d.wallet.bzz.raw) : null;
-  const cmd = `curl -X PATCH ${d.url}stamps/topup/${b.id.slice(2)}/${amount}`;
+  const cmd = `curl -X PATCH "${d.url}stamps/topup/${b.id.slice(2)}/${amount}"`;
   return kv([
     ['amount (PLUR per chunk)', `<span class="mono">${amount}</span>`],
     ['cost', `${units(cost)} xBZZ` + (wallet != null && cost > wallet ? ' <span class="badge warn">more than the wallet holds</span>' : '')],
@@ -385,6 +391,7 @@ function bookResult(d) {
   if (!/^\d+(\.\d{1,16})?$/.test(x)) return '<div class="err">an amount in xBZZ, with up to 16 decimals</div>';
   const [i, f = ''] = x.split('.');
   const plur = BigInt(i) * 10n ** 16n + BigInt(f.padEnd(16, '0'));
+  if (plur === 0n) return '<div class="err">an amount above 0</div>';
   const line = (verb) => `<span class="mono copy" tabindex="0" role="button" title="click or press Enter to copy">${esc(`curl -X POST "${d.url}chequebook/${verb}?amount=${plur}"`)}</span>`;
   return kv([['deposit (wallet → chequebook)', line('deposit')], ['withdraw (chequebook → wallet)', line('withdraw')]]);
 }
@@ -401,7 +408,7 @@ function renderNode(d, node) {
     ['peers', `${esc(n.connectedPeers ?? '—')} connected` + (n.isReachable === false ? ' <span class="muted">not reachable from outside</span>' : '')],
     ['synced block', `${esc(n.lastSyncedBlock ?? '—')} <span class="muted">of ${esc(n.chainTip ?? '—')}</span>`],
   ]));
-  html += card('Wallet', kv([['address', hash(d.wallet.address)], ['xBZZ', amt(d.wallet.bzz)], ['xDAI (gas)', amt(d.wallet.xdai)]]));
+  html += card('Wallet', kv([['address', hash(d.wallet.address)], ['xBZZ', amt(d.wallet.bzz)], [`${d.wallet.gasToken} (gas)`, amt(d.wallet.gas)]]));
   html += card('Chequebook', kv([
     ['address', hash(c.address)],
     ['total', amt(c.total)],
@@ -448,6 +455,7 @@ const runners = {
     const d = await api('node', params({}, node));
     if (stale()) return;
     nodeData = d.error ? null : d;
+    nodeShown = node;
     renderNode(d, node);
   },
   async addr(stale, node) {
@@ -626,8 +634,9 @@ function fromHash() {
     // its last lookup back into the URL so a reload or a shared link reproduces it.
     show(tab);
     if (lastHash[tab]) history.replaceState(null, '', lastHash[tab]);
-    // The Node tab has no input: its first visit loads it.
-    else if (tab === 'node') { fromUrl = true; try { run('node'); } finally { fromUrl = false; } }
+    // The Node tab has no input: it loads on the first visit, and again when another node
+    // was selected since (the change listener only reloads it while it is shown).
+    if (tab === 'node' && nodeShown !== $('node').value) { fromUrl = true; try { run('node'); } finally { fromUrl = false; } }
     return;
   }
   let val;

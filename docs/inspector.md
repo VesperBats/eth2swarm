@@ -45,9 +45,9 @@ fragment (`#block/97`, `#bytes/<ref>`, …) makes views bookmarkable.
   `eth:<chain>:<anchor>:hdr:<n>`, `…:epoch:<k>` and `eth:<chain>:accumulator`.
 - **Bytes** — fetch a `/bytes` reference and decode it as a block body or a header sequence
   (epoch file), with a hex preview.
-- **Node** — the selected node's wallet (xBZZ, xDAI), chequebook (total, available, cheques
-  sent and not cashed yet, paid and time-based settlements, received cheques still uncashed),
-  settlements per peer, and postage batches: depth, fullest bucket, lifetime, cost per day at
+- **Node** — the selected node's wallet (xBZZ, and the gas token: xDAI on Gnosis),
+  chequebook (total, available, cheques sent and not cashed yet, paid and time-based
+  settlements, received cheques still uncashed), settlements per peer, and postage batches: depth, fullest bucket, lifetime, cost per day at
   the current price, and how many days the wallet's xBZZ would pay. Warnings flag a batch
   near expiry or full, a mutable batch, a chequebook nearly spent and a wallet low on gas.
   Read with `GET` only (`/api/node`, `src/node_view.rs`): the tab sends no transaction. For a
@@ -107,8 +107,9 @@ Peer IDs: `curl -s localhost:1633/addresses` (use the `/ip4/127.0.0.1/…` under
 
 ## Opening it from another machine
 
-The UI has no authentication, and the Node tab shows the nodes' balances. It listens on `127.0.0.1:8090` by default and warns when it
-listens anywhere else. To open it from another machine:
+The UI has no authentication, and the Node tab shows the nodes' balances. It listens on
+`127.0.0.1:8090` by default and warns when it listens anywhere else. To open it from another
+machine:
 
 ```sh
 cargo run -- serve --tailscale        # this machine's Tailscale IPv4, port 8090
