@@ -74,6 +74,7 @@ dl.glossary dd { margin: 2px 0 0 0; max-width: 80ch; }
   <a href="#epoch">Epoch</a>
   <a href="#soc">SOC</a>
   <a href="#bytes">Bytes</a>
+  <a href="#node">Node</a>
   <a href="#errors">Errors and warnings</a>
   <a href="#glossary">Glossary A–Z</a>
 </nav>
@@ -81,9 +82,11 @@ dl.glossary dd { margin: 2px 0 0 0; max-width: 80ch; }
 
 <p>The inspector shows what the Swarm nodes hold for eth2swarm: Ethereum blocks stored as
 <a class="g" href="#g-soc">SOCs</a> (the Block, Epoch, SOC and Bytes tabs) and the
-<a class="g" href="#g-address-index">address index</a> (the Address index tab). Everything it
-shows is checked with the same code the <code>ethswarm</code> command-line client uses, so a
-green check here means the client would accept the data too. Underlined terms link to the
+<a class="g" href="#g-address-index">address index</a> (the Address index tab). Everything those
+tabs show is checked with the same code the <code>ethswarm</code> command-line client uses, so a
+green check here means the client would accept the data too. The <a href="#node">Node</a> tab
+is different: it shows a node's own figures (wallet, chequebook, batches) as the node reports
+them, unchecked. Underlined terms link to the
 <a href="#glossary">glossary</a>.</p>
 
 <h2 id="start">The settings bar</h2>
@@ -393,8 +396,8 @@ body, an epoch's header file, or text; otherwise a hex preview.</p>
 
 <h2 id="node">Node</h2>
 <p>The selected node's money: its wallet, its chequebook, what it has settled with its peers,
-and its postage batches. Everything is read with <code>GET</code>; the inspector sends no
-transaction. A deposit, a withdrawal or a top-up is shown as a <code>curl</code> command for
+and its postage batches, as the node reports them (unchecked, unlike the other tabs). Everything
+is read with <code>GET</code>; the inspector sends no transaction. A deposit, a withdrawal or a top-up is shown as a <code>curl</code> command for
 you to run on the inspector's machine (the node URL is the one the inspector uses). The tab
 loads when first opened and again with <b>Refresh</b> or another node.</p>
 <ul>
@@ -416,13 +419,17 @@ loads when first opened and again with <b>Refresh</b> or another node.</p>
     refuses the chunk that does not fit its fullest bucket. <b>lifetime</b> is Bee's
     estimate at the current price.</li>
   <li><b>Top up</b>: pick a batch and the days to add; the amount is PLUR per chunk, the cost
-    that times 2<sup>depth</sup>. A top-up keeps the batch's depth and immutability.</li>
+    that times 2<sup>depth</sup> (rounded up). A top-up keeps the batch's depth and
+    immutability. Only batches that exist, are usable and are immutable are offered: the
+    importer refuses a mutable one.</li>
   <li><b>Settlements with peers</b>: the 50 peers settled with most, and the address the last
     cheque to each was made out to.</li>
-  <li><b>Warnings</b>: a batch with under 7 days left, a fullest bucket 80 % full, a mutable or
-    unusable batch, a chequebook with under a tenth of its total available, a wallet with
-    under 0.01 xDAI. <b>Not available</b> lists the endpoints the node refused (a node without
-    a chequebook refuses those).</li>
+  <li><b>Warnings</b>: a batch with under 7 days left, a fullest bucket 80 % full, a mutable,
+    unusable or unreadable batch, a chequebook with under a tenth of its total available, a
+    wallet with under 0.01 of its gas token, and a failed read that hides a check (the
+    batches, the price, the wallet, the chequebook balance). <b>Not available</b> lists every
+    endpoint the node refused or did not answer within 15 s (a node without a chequebook
+    refuses those).</li>
 </ul>
 <p>The numbers are only as private as the inspector: anyone who can open it can read them.</p>
 

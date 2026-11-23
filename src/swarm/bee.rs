@@ -103,7 +103,7 @@ pub struct ChainState {
 }
 
 /// A number Bee sends as a JSON number or as a decimal string (its big integers).
-fn big_number(v: &serde_json::Value, what: &str) -> Result<u128> {
+pub(crate) fn big_number(v: &serde_json::Value, what: &str) -> Result<u128> {
     match v {
         serde_json::Value::Number(n) => n.as_u64().map(u128::from),
         serde_json::Value::String(s) => s.parse().ok(),
