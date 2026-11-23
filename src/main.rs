@@ -7,6 +7,7 @@ mod devnet;
 mod import;
 mod inspect;
 mod layout;
+mod node_view;
 mod stamps;
 mod swarm;
 

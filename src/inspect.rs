@@ -144,6 +144,7 @@ pub async fn serve(
         .route("/api/block", get(block_handler))
         .route("/api/epoch", get(epoch_handler))
         .route("/api/bytes", get(bytes_handler))
+        .route("/api/node", get(node_handler))
         .route("/api/addr/lookup", get(addr_lookup_handler))
         .route("/api/addr/slice", get(addr_slice_handler))
         .route("/api/addr/bucket", get(addr_bucket_handler))
@@ -154,7 +155,8 @@ pub async fn serve(
     if !listen.ip().is_loopback() {
         eprintln!(
             "WARNING: listening on {listen}, which is not loopback. The inspector has no \
-             authentication; anyone who can reach it can read the configured nodes through it."
+             authentication; anyone who can reach it can read the configured nodes through it, \
+             their wallet and chequebook balances included (read only: it sends no transaction)."
         );
     }
     println!("Swarm inspector on http://{listen}/");
@@ -1493,6 +1495,18 @@ fn body_contents(h: &Header) -> Vec<&'static str> {
         parts.push("withdrawals");
     }
     parts
+}
+
+// ---------------------------------------------------------------------------------------
+// Node: wallet, chequebook, settlements and postage batches (read only)
+
+#[derive(Deserialize)]
+struct NodeQuery {
+    node: Option<String>,
+}
+
+async fn node_handler(State(st): State<Arc<AppState>>, Query(q): Query<NodeQuery>) -> ApiResult {
+    ApiResult(async { crate::node_view::read(&st.bee(q.node.as_deref())?).await }.await)
 }
 
 // ---------------------------------------------------------------------------------------

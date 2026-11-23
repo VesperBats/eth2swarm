@@ -193,6 +193,12 @@ impl Bee {
             .context("GET /wallet answered without a chainID")
     }
 
+    /// `GET path` as untyped JSON (read-only status endpoints such as `wallet` or
+    /// `chequebook/balance`), retried like [`Bee::batch`].
+    pub async fn get_value(&self, path: &str) -> Result<serde_json::Value> {
+        self.get_json(path).await
+    }
+
     /// `GET path` as JSON, retrying transport and server errors as [`Bee::batch`] does.
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let url = self.url(path)?;

@@ -24,8 +24,9 @@ Importer of Ethereum blocks into Ethereum Swarm.
 - State on Swarm (design sketch, not implemented): accounts, storage and code on Swarm,
   read by a light client and checked against the state root, with no trust in the
   publisher — see [docs/state-on-swarm.md](docs/state-on-swarm.md).
-- `ethswarm serve` — local web UI to inspect SOCs, blocks, epochs and references on the
-  Swarm nodes; see [docs/inspector.md](docs/inspector.md).
+- `ethswarm serve` — local web UI to inspect SOCs, blocks, epochs, references and the address
+  index on the Swarm nodes, and a node's wallet, chequebook and postage batches (read only);
+  see [docs/inspector.md](docs/inspector.md).
 
 ## Ethereum mainnet nodes
 

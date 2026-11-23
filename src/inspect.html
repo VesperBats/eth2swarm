@@ -80,7 +80,7 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
     <label>Trust anchor (blank = owner's published anchor)<input id="anchor" placeholder="0x… pinned anchor" spellcheck="false"></label>
   </div>
   <nav>
-    <a href="#block" data-tab="block">Block</a><a href="#epoch" data-tab="epoch">Epoch</a><a href="#soc" data-tab="soc">SOC</a><a href="#bytes" data-tab="bytes">Bytes</a><a href="#addr" data-tab="addr">Address index</a>
+    <a href="#block" data-tab="block">Block</a><a href="#epoch" data-tab="epoch">Epoch</a><a href="#soc" data-tab="soc">SOC</a><a href="#bytes" data-tab="bytes">Bytes</a><a href="#addr" data-tab="addr">Address index</a><a href="#node" data-tab="node">Node</a>
   </nav>
 </header>
 <main>
@@ -132,6 +132,15 @@ pre.hex { background: var(--code); padding: 10px; border-radius: 4px; max-height
       <button type="button" class="ref" id="addrExamples">Show example addresses</button> (well-known addresses of the chain, counted against the index).
       <a class="ref" href="help#addr" target="_blank" rel="noopener">What do slice, bucket, slot and roles mean?</a></div>
     <div id="out-addr"></div>
+  </section>
+  <section id="tab-node" class="hidden">
+    <form class="query" data-run="node">
+      <button>Refresh</button>
+    </form>
+    <div class="muted" style="margin:-8px 0 14px;font-size:12px">The selected node's wallet, chequebook, settlements and
+      postage batches, read with GET only. Nothing here sends a transaction: a deposit, a withdrawal or a top-up is a command
+      shown for you to run. <a class="ref" href="help#node" target="_blank" rel="noopener">What do these numbers mean?</a></div>
+    <div id="out-node"></div>
   </section>
   <section id="tab-bytes" class="hidden">
     <form class="query" data-run="bytes">
@@ -335,7 +344,112 @@ function sliceCard(sl, extra) {
   ]) + (extra || ''));
 }
 
+// ---- node: wallet, chequebook, postage ----
+// xBZZ has 16 decimals (PLUR), xDAI 18. Amounts arrive as decimal strings and are computed
+// with BigInt, so a top-up or deposit command carries the exact number.
+function units(v, decimals = 16, places = 4) {
+  const one = 10n ** BigInt(decimals), x = BigInt(v);
+  const frac = (x % one) / 10n ** BigInt(decimals - places);
+  return `${x / one}.${String(frac).padStart(places, '0')}`;
+}
+const amt = (a) => a ? esc(a.text) : '<span class="muted">—</span>';
+const days = (d) => d == null ? '<span class="muted">—</span>' : `${d.toFixed(1)} days`;
+let nodeData = null;
+// The top-up and deposit forms are drawn once per load; typing redraws only their results.
+function topupForm(d) {
+  const opts = d.postage.batches.map(x => `<option value="${esc(x.id)}">${esc(x.id.slice(0, 10))}… ${esc(x.label)}</option>`).join('');
+  return `<div class="query" style="margin:12px 0 6px"><label>Batch<select id="topupBatch">${opts}</select></label>
+    <label class="small">Days to add<input id="topupDays" type="number" min="1" step="1" value="7"></label></div><div id="topupOut"></div>`;
+}
+function topupResult(d) {
+  const p = d.postage, b = p.batches.find(x => x.id === $('topupBatch')?.value) || p.batches[0];
+  const n = Math.floor(+($('topupDays')?.value ?? 7));
+  if (!(n >= 1)) return '<div class="err">a whole number of days, at least 1</div>';
+  if (!p.perChunkPerDay) return '<div class="muted">No cost: the node\'s chain has no known block time.</div>';
+  const amount = BigInt(p.perChunkPerDay) * BigInt(n), cost = amount << BigInt(b.depth);
+  const wallet = d.wallet.bzz ? BigInt(d.wallet.bzz.raw) : null;
+  const cmd = `curl -X PATCH ${d.url}stamps/topup/${b.id.slice(2)}/${amount}`;
+  return kv([
+    ['amount (PLUR per chunk)', `<span class="mono">${amount}</span>`],
+    ['cost', `${units(cost)} xBZZ` + (wallet != null && cost > wallet ? ' <span class="badge warn">more than the wallet holds</span>' : '')],
+    ['lifetime after', b.ttlSecs >= 0 ? days(b.ttlSecs / 86400 + n) : '<span class="muted">unknown</span>'],
+    ['command', `<span class="mono copy" tabindex="0" role="button" title="click or press Enter to copy">${esc(cmd)}</span>`],
+  ]) + '<div class="muted" style="font-size:12px">At today\'s price: a price change before the transaction changes the days it buys. ' +
+    'Run it where the node URL resolves (the inspector\'s machine). A top-up keeps the batch immutable and its depth.</div>';
+}
+function bookForm(d) {
+  return `<div class="query" style="margin:12px 0 6px"><label class="small">xBZZ<input id="bookAmount" value="1" spellcheck="false"></label></div><div id="bookOut"></div>`;
+}
+function bookResult(d) {
+  const x = ($('bookAmount')?.value ?? '1').trim();
+  if (!/^\d+(\.\d{1,16})?$/.test(x)) return '<div class="err">an amount in xBZZ, with up to 16 decimals</div>';
+  const [i, f = ''] = x.split('.');
+  const plur = BigInt(i) * 10n ** 16n + BigInt(f.padEnd(16, '0'));
+  const line = (verb) => `<span class="mono copy" tabindex="0" role="button" title="click or press Enter to copy">${esc(`curl -X POST "${d.url}chequebook/${verb}?amount=${plur}"`)}</span>`;
+  return kv([['deposit (wallet → chequebook)', line('deposit')], ['withdraw (chequebook → wallet)', line('withdraw')]]);
+}
+function renderNode(d, node) {
+  let html = source(node);
+  if (d.error) { $('out-node').innerHTML = html + errCard(d.error); return; }
+  if (d.warnings.length) html += cardB('Warnings', ` <span class="badge warn">${d.warnings.length}</span>`,
+    '<ul style="margin:0;padding-left:18px">' + d.warnings.map(w => `<li>${esc(w)}</li>`).join('') + '</ul>');
+  const n = d.node, c = d.chequebook, p = d.postage;
+  html += card('Node', kv([
+    ['version', esc(n.version ?? '—') + (n.apiVersion ? ` <span class="muted">API ${esc(n.apiVersion)}</span>` : '')],
+    ['mode', esc(n.beeMode ?? '—') + (n.swapEnabled === false ? ' <span class="muted">swap off</span>' : '')],
+    ['chain', `${esc(d.chain.name)} <span class="muted">chainID ${esc(d.chain.id ?? '—')}</span>`],
+    ['peers', `${esc(n.connectedPeers ?? '—')} connected` + (n.isReachable === false ? ' <span class="muted">not reachable from outside</span>' : '')],
+    ['synced block', `${esc(n.lastSyncedBlock ?? '—')} <span class="muted">of ${esc(n.chainTip ?? '—')}</span>`],
+  ]));
+  html += card('Wallet', kv([['address', hash(d.wallet.address)], ['xBZZ', amt(d.wallet.bzz)], ['xDAI (gas)', amt(d.wallet.xdai)]]));
+  html += card('Chequebook', kv([
+    ['address', hash(c.address)],
+    ['total', amt(c.total)],
+    ['available', amt(c.available)],
+    ['sent, not cashed yet', amt(c.sentUncashed)],
+    ['paid by cheque', `sent ${amt(c.sent)} · received ${amt(c.received)}`],
+    ['settled by time (free)', `sent ${amt(c.timeSent)} · received ${amt(c.timeReceived)}`],
+    ['received, uncashed', amt(c.receivedUncashed) + ` <span class="muted">${c.cashoutPeersChecked} peer(s) checked${c.cashoutPeersNotChecked ? `, ${c.cashoutPeersNotChecked} not` : ''}</span>`],
+  ]) + Object.entries(c.cashoutErrors || {}).map(([peer, e]) => `<div class="err">cashout ${esc(peer.slice(0, 10))}…: ${esc(e)}</div>`).join('') +
+    bookForm(d));
+  const rows = p.batches.map(b => `<tr><td class="mono copy" tabindex="0" role="button" title="${esc(b.id)} — click to copy">${esc(b.id)}</td><td>${esc(b.label)}</td>
+    <td>${b.depth}</td><td>${b.immutable ? 'yes' : '<span class="badge warn">no</span>'}${b.usable ? '' : ' <span class="badge warn">not usable</span>'}${b.exists ? '' : ' <span class="badge warn">gone</span>'}</td>
+    <td>${b.fullest}/${b.capacity} <span class="muted">(${(b.fill * 100).toFixed(0)} %)</span></td>
+    <td>${b.ttlSecs >= 0 ? days(b.ttlSecs / 86400) + ` <span class="muted">until ${esc(new Date(Date.now() + b.ttlSecs * 1000).toLocaleString())}</span>` : '<span class="muted">unknown</span>'}</td>
+    <td>${amt(b.costPerDay)}</td><td>${days(b.walletDays)}</td></tr>`).join('');
+  html += card('Postage batches', kv([
+    ['storage price', p.price ? `${esc(p.price)} PLUR per chunk per block <span class="muted">at block ${esc(p.block)}${p.blockSecs ? `, ${p.blockSecs} s blocks` : ''}</span>` : '—'],
+    ['all usable batches cost', p.costPerDay ? `${amt(p.costPerDay)} per day` : '—'],
+    ['the wallet\'s xBZZ keeps them all', days(p.walletDays)],
+  ]) + (p.batches.length ? `<div style="overflow-x:auto"><table style="margin-top:10px"><tr><th>batch</th><th>label</th><th>depth</th><th>immutable</th><th>fullest bucket</th><th>lifetime</th><th>cost per day</th><th>wallet pays</th></tr>${rows}</table></div>` +
+    '<h2 style="margin-top:14px">Top up</h2>' + topupForm(d) : '<div class="muted">The node holds no postage batch.</div>'));
+  const pr = d.peers;
+  if (pr.count) html += card(`Settlements with peers (${pr.count}${pr.count > pr.rows.length ? `, the ${pr.rows.length} most settled` : ''})`,
+    '<div style="overflow-x:auto"><table><tr><th>peer (overlay)</th><th>sent</th><th>received</th><th>beneficiary of the last cheque sent</th></tr>' +
+    pr.rows.map(r => `<tr><td class="mono copy" tabindex="0" role="button" title="${esc(r.peer)} — click to copy">${esc(r.peer.slice(0, 16))}…</td><td>${amt(r.sent)}</td><td>${amt(r.received)}</td><td class="mono">${esc(r.beneficiary ?? '—')}</td></tr>`).join('') + '</table></div>');
+  const un = Object.entries(d.unavailable);
+  if (un.length) html += card('Not available from this node', kv(un.map(([k, e]) => [`GET /${k}`, `<span class="muted">${esc(e)}</span>`])));
+  $('out-node').innerHTML = html;
+  // The results read the forms just drawn, not the ones of an earlier load.
+  if ($('topupOut')) $('topupOut').innerHTML = topupResult(d);
+  if ($('bookOut')) $('bookOut').innerHTML = bookResult(d);
+}
+document.addEventListener('input', (e) => {
+  if (!nodeData) return;
+  if (['topupBatch', 'topupDays'].includes(e.target.id)) $('topupOut').innerHTML = topupResult(nodeData);
+  if (e.target.id === 'bookAmount') $('bookOut').innerHTML = bookResult(nodeData);
+});
+// Another node selected while the Node tab is open: show that node's.
+$('node').addEventListener('change', () => { if (!$('tab-node').classList.contains('hidden')) run('node'); });
+
 const runners = {
+  async node(stale, node) {
+    setHash('node', 'status'); busy('out-node');
+    const d = await api('node', params({}, node));
+    if (stale()) return;
+    nodeData = d.error ? null : d;
+    renderNode(d, node);
+  },
   async addr(stale, node) {
     const a = $('addrA').value.trim();
     // A slice, bucket or spill view opened by a link or the URL; a lookup from the form
@@ -512,6 +626,8 @@ function fromHash() {
     // its last lookup back into the URL so a reload or a shared link reproduces it.
     show(tab);
     if (lastHash[tab]) history.replaceState(null, '', lastHash[tab]);
+    // The Node tab has no input: its first visit loads it.
+    else if (tab === 'node') { fromUrl = true; try { run('node'); } finally { fromUrl = false; } }
     return;
   }
   let val;
