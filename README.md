@@ -15,8 +15,9 @@ Importer of Ethereum blocks into Ethereum Swarm.
   up to a finalized block, every header hashed and linked here, the top pinned by
   `--top-hash` or by another node (`--cross-check`); `--extend <table>` continues an existing
   table from its last entry, which it must reproduce, up to a new top.
-- Address → transaction index (in progress, #8): a mobile-friendly index on Swarm from an
-  address to the transactions it appears in — design in
+- Address → transaction index (#8, on `main` since 2026-11-21): a mobile-friendly index on
+  Swarm from an address to the transactions it appears in — design, implementation status
+  and deployments in
   [docs/address-index.md](docs/address-index.md), every command in order in
   [docs/runbook.md](docs/runbook.md); `appearances`, `addr-stats`, `addr-import`,
   `addr-upload`, `addr-verify`, `addr-lookup`, `stamps` and `stamps plan` for postage batches
@@ -24,6 +25,9 @@ Importer of Ethereum blocks into Ethereum Swarm.
 - State on Swarm (design sketch, not implemented): accounts, storage and code on Swarm,
   read by a light client and checked against the state root, with no trust in the
   publisher — see [docs/state-on-swarm.md](docs/state-on-swarm.md).
+- Completeness proofs for the address index (design sketch, not implemented): a public
+  commitment for one view, fraud proofs, and zk proofs that a slice is complete — see
+  [docs/completeness-proofs.md](docs/completeness-proofs.md).
 - `ethswarm serve` — local web UI to inspect SOCs, blocks, epochs, references and the address
   index on the Swarm nodes, and a node's wallet, chequebook and postage batches (read only);
   see [docs/inspector.md](docs/inspector.md).
