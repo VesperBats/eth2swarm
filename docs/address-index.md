@@ -801,7 +801,9 @@ Oldest first is the same in the opposite order.
     bucket. This costs one more descriptor and bucket per slice and importer, and it
     requires the detection rules and canonical encodings above to be followed exactly.
   - Real proofs need an index committed by the protocol itself, or zero-knowledge proofs
-    that a slice was built correctly from the blocks. Both are out of scope.
+    that a slice was built correctly from the blocks. Neither is implemented; how they
+    could be added, with a public commitment and fraud proofs as steps on the way, is in
+    [completeness-proofs.md](completeness-proofs.md).
 - **An index from a later block claims nothing before it.** Its head states the start, and
   every descriptor must start where that start makes it (`addr-verify` and `addr-lookup`
   check this). Importers with different starts are compared on the slices that hold the
