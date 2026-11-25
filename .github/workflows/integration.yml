@@ -32,7 +32,9 @@ name: integration
 on:
   push:
     branches: [ "main" ]
-    paths: &paths
+    # The integration paths. The `changes` job below tests a PR against the
+    # same list as a regex: change both together.
+    paths:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -41,10 +43,16 @@ on:
       - "ci/bee-factory/**"
       - ".github/workflows/integration.yml"
       - ".github/actions/rust-toolchain/**"
-  # Unscoped base branch, like ci.yml; path-filtered because the run takes
-  # minutes and pulls ~1.5 GB of images.
+  # Unscoped base branch, like ci.yml. Not path-filtered at the workflow level:
+  # `integration result` is a required check of the merge queue, and a check
+  # that never reports keeps a PR out of the queue. The `changes` job applies
+  # the path filter instead, because the e2e run takes minutes and pulls
+  # ~1.5 GB of images.
   pull_request:
-    paths: *paths
+  # The merge queue: the e2e test runs on every queued commit, whatever it
+  # touches (`merge_group` takes no path filter), so the commit main becomes
+  # has passed it with every PR ahead of it.
+  merge_group:
   # Weekly: a registry or upstream change (a pinned digest deleted, Docker Hub
   # limits, the runner image) shows up here before a PR needs the job.
   schedule:
@@ -52,7 +60,7 @@ on:
   workflow_dispatch:
 
 # A newer push cancels a PR's superseded run (one group per PR ref). Every other
-# run (push to main, schedule, manual) gets a group of its own, keyed by its run
+# run (push to main, merge queue, schedule, manual) gets a group of its own, keyed by its run
 # ID, so it is never cancelled or replaced: with a shared group GitHub cancels a
 # *pending* run as soon as a newer one queues, even with cancel-in-progress
 # false, and a merge commit could end up without a result (security-fixes.md
@@ -62,8 +70,48 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # On a PR: does it touch the integration paths (the list under `push`)? The
+  # checkout is GitHub's test merge of the PR into its base, so its first
+  # parent is the base and the diff is what the PR changes. Any other event
+  # runs the test.
+  changes:
+    name: integration paths
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      e2e: ${{ steps.filter.outputs.e2e }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != pull_request ]; then
+            echo "e2e=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          printf '%s\n' "$changed"
+          # A here-string, not a pipe: `grep -q` exits at the first match, and
+          # under pipefail the writer's SIGPIPE would turn that match into "no".
+          if grep -qE \
+              '^(src/|ci/bee-factory/|\.github/actions/rust-toolchain/)|^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|scripts/e2e-bee-factory\.sh|\.github/workflows/integration\.yml)$' <<<"$changed"; then
+            echo "e2e=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "e2e=false" >> "$GITHUB_OUTPUT"
+          fi
+
   e2e:
     name: bee-factory end-to-end
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     permissions:
@@ -135,3 +183,31 @@ jobs:
       - name: Stop bee-factory
         if: always()
         run: ci/bee-factory/node_modules/.bin/bee-factory stop || true
+
+  # The one check of this workflow the merge queue requires. It runs on
+  # always(): a skipped required check counts as passed, so a cancelled or
+  # failed `changes` must fail here instead of letting a PR through. On a PR
+  # outside the integration paths it passes with a notice; everywhere else it
+  # needs the e2e test to have succeeded.
+  result:
+    name: integration result
+    needs: [changes, e2e]
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - env:
+          CHANGES: ${{ needs.changes.result }}
+          WANTED: ${{ needs.changes.outputs.e2e }}
+          E2E: ${{ needs.e2e.result }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANGES" != success ]; then
+            echo "::error::The path check ended '$CHANGES'."; exit 1
+          fi
+          if [ "$WANTED" != true ]; then
+            echo "::notice::Nothing in the integration paths changed: no end-to-end run on this PR. The merge queue runs it."
+            exit 0
+          fi
+          [ "$E2E" = success ] || { echo "::error::bee-factory end-to-end ended '$E2E'."; exit 1; }

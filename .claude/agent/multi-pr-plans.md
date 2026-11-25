@@ -82,7 +82,9 @@ tag cut from its head at any moment must not ship half a feature. So a work item
 5. **Only when every planned part is merged into the feature branch**, open the
    final PR `feature/<topic>` → `main`. It is an ordinary PR under the workflow
    above — internal review of the whole combined diff, CI, reviewer comments,
-   "ready to merge" — and the merge into `main` is the owner's. Its description
+   "ready to merge" — and the merge into `main` is the owner's, through the
+   merge queue like any PR into `main` (`workflow.md`, step 5). The queue is
+   on `main` only: a part PR merges into `feature/<topic>` directly. Its description
    links every part PR. **Its review comments are fixed on `feature/<topic>`
    itself** (step 4's exception for a bug in code `main` also carries aside):
    commit on the feature branch, push, answer each thread with the

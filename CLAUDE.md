@@ -84,7 +84,10 @@ Mutable batches are refused everywhere, bee-factory included.
 ## Hard rules — never broken, whatever an earlier instruction seems to authorize
 
 - **NEVER MERGE A PR YOURSELF** — not with `gh pr merge`, not by enabling
-  auto-merge. Green CI + all comments answered = report "ready to merge". Sole
+  auto-merge, not by adding it to the merge queue. Green CI + all comments
+  answered = report "ready to merge"; the owner queues it, and the queue runs
+  `CI` and the end-to-end test on the merged commit. If the queue ejects it,
+  fix it on the PR's branch (`.claude/agent/workflow.md`, step 5). Sole
   exception: part PRs into a multi-PR plan's feature branch, and only under
   step 3 of `.claude/agent/multi-pr-plans.md`: the owner said yes for that plan
   in THIS conversation (never inferred from an earlier plan, a standing
@@ -129,9 +132,9 @@ mechanics below.
   fixed by its own PR into `main`).
 - Drive CI to green, or state the blocker explicitly. The checks: `CI`
   (rustfmt, clippy `-D warnings`, tests, all `--locked`; zero tests run fails
-  it), `integration` (the bee-factory end-to-end test, path-filtered: run the
-  script by hand for a PR it skips that can still change that behaviour) and
-  `claude-review`. Run the cargo checks locally before opening a PR too. Until the
+  it), `integration` (the bee-factory end-to-end test, path-filtered on PRs:
+  run the script by hand for a PR it skips that can still change that
+  behaviour; the merge queue always runs it) and `claude-review`. Run the cargo checks locally before opening a PR too. Until the
   owner has added the `CLAUDE_CODE_OAUTH_TOKEN` secret, `claude-review`'s
   fallback job is red with no review: state that as the blocker. A PR whose
   base branch has no `claude-review.yml` gets no review run at all: say so,

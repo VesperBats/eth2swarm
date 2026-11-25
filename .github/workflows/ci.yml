@@ -1,4 +1,5 @@
-# Build and test on every pull request and every push to main.
+# Build and test on every pull request, in the merge queue and on every push
+# to main.
 #
 # The checks the PR rules (.claude/agent/pull-requests.md, "Drive CI to
 # green") asked authors to run by hand until a workflow did: rustfmt, clippy
@@ -14,10 +15,14 @@ on:
   # Unscoped (any base branch): part PRs into a feature branch get these checks
   # too (.claude/agent/multi-pr-plans.md). Do not narrow it to main.
   pull_request:
+  # The merge queue (a ruleset on main): `Build and Test` is a required check,
+  # so it runs again on the commit main will become, with every PR queued
+  # ahead of it.
+  merge_group:
   workflow_dispatch:
 
 # A newer push cancels a PR's superseded run (one group per PR ref). Every other
-# run (push to main, schedule, manual) gets a group of its own, keyed by its run
+# run (push to main, merge queue, schedule, manual) gets a group of its own, keyed by its run
 # ID, so it is never cancelled or replaced: with a shared group GitHub cancels a
 # *pending* run as soon as a newer one queues, even with cancel-in-progress
 # false, and a merge commit could end up without a result (security-fixes.md
