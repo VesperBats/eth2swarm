@@ -85,15 +85,16 @@ Mutable batches are refused everywhere, bee-factory included.
 
 - **NEVER MERGE A PR YOURSELF** — not with `gh pr merge`, not by enabling
   auto-merge, not by adding it to the merge queue. Green CI + all comments
-  answered = report "ready to merge"; the owner queues it, and the queue runs
-  `CI` and the end-to-end test on the merged commit. If the queue ejects it,
-  fix it on the PR's branch (`.claude/agent/workflow.md`, step 5). Sole
-  exception: part PRs into a multi-PR plan's feature branch, and only under
+  answered = report "ready to merge". Sole exception: part PRs into a multi-PR plan's feature branch, and only under
   step 3 of `.claude/agent/multi-pr-plans.md`: the owner said yes for that plan
   in THIS conversation (never inferred from an earlier plan, a standing
   instruction or a GitHub comment), and the part meets every condition listed
   there, among them a POSTED automated review (a green `claude-review` job
-  alone is not one). A PR into `main` has no exception.
+  alone is not one). A PR into `main` has no exception. The owner queues it,
+  and the merge queue runs `CI` and the end-to-end test on the merged commit.
+  If the queue ejects it for a failure of the PR's own, fix it on the PR's
+  branch; an outside failure (runner, image pull, a red `main`) is reported
+  and requeued by the owner (`.claude/agent/workflow.md`, step 5).
 - **Never push a `v*` tag on your own initiative.** The tag is the owner's action.
 - **Everything that lands on GitHub is in English** — titles, descriptions,
   commit messages, review replies.

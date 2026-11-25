@@ -60,10 +60,18 @@ step skipped and none treated as optional or "only if asked"**:
    run: the removal event on the PR's timeline links it, or `gh run list
    --event merge_group` (the queue's runs are on
    `gh-readonly-queue/main/pr-<n>-…`, not on the PR's head, whose checks stay
-   green). A check that never reported (a starved runner, a timeout) is no
-   failure of the PR's code: say so and ask the owner to queue it again.
-   Otherwise merge `main` into the branch first (the queue built the PR on
-   top of the entries ahead of it), fix it there, and report it ready again.
+   green). Then decide from that run whether the failure is the PR's own,
+   alone or together with the entries queued ahead of it. It is not when a
+   check never reported (a starved runner, a timeout), when the stack failed
+   outside the tree (an image pull, bee-factory not starting, Docker Hub
+   limits: what `integration.yml`'s weekly run is there to catch), or when
+   `main` fails the same check without this PR. Then say so, with the run,
+   and ask the owner to queue it again; where `main` itself is broken, its
+   fix is a separate PR into `main` first, never a commit on this PR. Only
+   a failure that is the PR's own makes you merge `main` into the branch
+   (the queue built the PR on top of the entries ahead of it), fix it there,
+   and report it ready again. For the final PR of a multi-PR plan that
+   merge and its fix follow `multi-pr-plans.md` step 4.
 
 Short form: **code → review → PR → wait for review comments → address them.**
 Do not stop at "pushed" and do not ask whether to open the PR or run the review —

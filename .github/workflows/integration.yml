@@ -98,14 +98,14 @@ jobs:
             echo "e2e=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
           # --no-renames: a rename lists its old path too, as GitHub's `paths`
-          # filter does. quotePath off: a non-ASCII path is printed as is,
-          # not quoted (which would defeat the anchors below).
-          changed=$(git -c core.quotePath=false diff --no-renames --name-only HEAD^1 HEAD)
-          printf '%s\n' "$changed"
-          # A here-string, not a pipe: `grep -q` exits at the first match, and
-          # under pipefail the writer's SIGPIPE would turn that match into "no".
-          if grep -qE \
-              '^(src/|ci/bee-factory/|\.github/actions/rust-toolchain/)|^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|scripts/e2e-bee-factory\.sh|\.github/workflows/integration\.yml)$' <<<"$changed"; then
+          # filter does. -z: NUL-separated and never quoted (a quoted path
+          # would defeat the anchors below). Read from a file, not a pipe:
+          # `grep -q` exits at the first match, and under pipefail the
+          # writer's SIGPIPE would turn that match into "no".
+          git diff --no-renames --name-only -z HEAD^1 HEAD > "$RUNNER_TEMP/changed"
+          tr '\0' '\n' < "$RUNNER_TEMP/changed"
+          if grep -zqE \
+              '^(src/|ci/bee-factory/|\.github/actions/rust-toolchain/)|^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|scripts/e2e-bee-factory\.sh|\.github/workflows/integration\.yml)$' "$RUNNER_TEMP/changed"; then
             echo "e2e=true" >> "$GITHUB_OUTPUT"
           else
             echo "e2e=false" >> "$GITHUB_OUTPUT"

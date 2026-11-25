@@ -83,9 +83,11 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    final PR `feature/<topic>` → `main`. It is an ordinary PR under the workflow
    above — internal review of the whole combined diff, CI, reviewer comments,
    "ready to merge" — and the merge into `main` is the owner's, through the
-   merge queue like any PR into `main` (`workflow.md`, step 5). The final
-   PR's description
-   links every part PR. **Its review comments are fixed on `feature/<topic>`
+   merge queue like any PR into `main` (`workflow.md`, step 5). If the queue
+   ejects it for a failure of its own, merging `main` into `feature/<topic>`
+   is step 4's merge: a clean one is pushed straight to the branch, one that
+   passes only with a change goes through a PR into the feature branch like
+   a part. The final PR's description links every part PR. **Its review comments are fixed on `feature/<topic>`
    itself** (step 4's exception for a bug in code `main` also carries aside):
    commit on the feature branch, push, answer each thread with the
    commit — exactly as on any PR's own branch — and NEVER through another part
