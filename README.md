@@ -62,8 +62,8 @@ bee-factory stop                               # tear down
 
 | Workflow | When | What |
 |---|---|---|
-| `CI` (`.github/workflows/ci.yml`) | every PR, pushes to `main` | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` (fails if no test ran) |
-| `integration` (`.github/workflows/integration.yml`) | PRs and pushes touching the code, toolchain, e2e script or workflow; weekly | starts bee-factory on the runner and runs `scripts/e2e-bee-factory.sh` against its Anvil chain: import, verified reads through another node, rejected bad inputs, and an inspector check |
+| `CI` (`.github/workflows/ci.yml`) | every PR, the merge queue, pushes to `main` | `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` (fails if no test ran) |
+| `integration` (`.github/workflows/integration.yml`) | PRs and pushes touching the code, toolchain, e2e script or workflow (a PR outside them gets a passing `integration result` and no run); every merge-queue entry; weekly | starts bee-factory on the runner and runs `scripts/e2e-bee-factory.sh` against its Anvil chain: import, verified reads through another node, rejected bad inputs, and an inspector check |
 | `claude-review` | PR opened / reopened / ready | automated review (needs the `CLAUDE_CODE_OAUTH_TOKEN` secret) |
 
 The rustc version is pinned in `rust-toolchain.toml`, every action by commit, and

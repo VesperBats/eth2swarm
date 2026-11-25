@@ -82,8 +82,12 @@ tag cut from its head at any moment must not ship half a feature. So a work item
 5. **Only when every planned part is merged into the feature branch**, open the
    final PR `feature/<topic>` → `main`. It is an ordinary PR under the workflow
    above — internal review of the whole combined diff, CI, reviewer comments,
-   "ready to merge" — and the merge into `main` is the owner's. Its description
-   links every part PR. **Its review comments are fixed on `feature/<topic>`
+   "ready to merge" — and the merge into `main` is the owner's, through the
+   merge queue like any PR into `main` (`workflow.md`, step 5). If the queue
+   ejects it for a failure of its own, merging `main` into `feature/<topic>`
+   is step 4's merge: a clean one is pushed straight to the branch, one that
+   passes only with a change goes through a PR into the feature branch like
+   a part. The final PR's description links every part PR. **Its review comments are fixed on `feature/<topic>`
    itself** (step 4's exception for a bug in code `main` also carries aside):
    commit on the feature branch, push, answer each thread with the
    commit — exactly as on any PR's own branch — and NEVER through another part
@@ -95,6 +99,10 @@ tag cut from its head at any moment must not ship half a feature. So a work item
    prompt and `CLAUDE.md` from the PR's base, so part PRs were reviewed under
    the feature branch's copies, and this is the one PR held to `main`'s (see
    the header of `claude-review.yml`).
+
+The merge queue is on `main` only: a part PR merges into `feature/<topic>`
+directly, and the queue's end-to-end run of a part PR that skipped it is the
+final PR's queue entry.
 
 A **single-PR** fix or plan still targets `main` directly; none of the above
 applies. If a single-PR task grows a second PR before its first has merged,

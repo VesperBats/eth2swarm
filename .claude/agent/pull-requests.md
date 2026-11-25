@@ -120,10 +120,12 @@ that produced this note.
   - `integration` (`.github/workflows/integration.yml`): the bee-factory
     end-to-end test (`scripts/e2e-bee-factory.sh`), on PRs that touch the
     code, the toolchain, the script, `ci/bee-factory/` or the workflow. It
-    is path-filtered: a
-    PR outside those paths gets no run. If such a PR can still change the
-    end-to-end behaviour (a doc that changes how the stack is started, say),
-    run the script by hand and say so in the PR.
+    is path-filtered on PRs (its `changes` job): a PR outside those paths
+    gets no end-to-end run, and its `integration result` check passes with a
+    notice. If such a PR can still change the end-to-end behaviour (a doc
+    that changes how the stack is started, say), run the script by hand and
+    say so in the PR. The merge queue runs the test on every queued PR,
+    whatever it touches.
   - `claude-review` (below).
   Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D
   warnings` and `cargo test --locked` on the head of a PR you author (never
@@ -139,8 +141,8 @@ that produced this note.
   gets no run at all, since `pull_request_target` runs the base branch's copy:
   say so in the PR; it is reviewed by hand.
 - **Never merge a PR yourself** — not with `gh pr merge`, not by enabling
-  auto-merge. No earlier task description or standing instruction authorizes
-  it. The end state of the author's work is "green, answered, ready to merge";
+  auto-merge, not by adding it to the merge queue. No earlier task
+  description or standing instruction authorizes it. The end state of the author's work is "green, answered, ready to merge";
   the merge action itself is always the owner's. Sole exception: part PRs into
   a multi-PR plan's feature branch, when the owner answered yes for that plan
   (see *Multi-PR plans land through a feature branch*); never a PR into `main`.
