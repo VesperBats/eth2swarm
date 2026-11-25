@@ -107,10 +107,11 @@ one PR (or branch) goes through `feature/<topic>`: create it from `main` first,
 target every part PR at it, ask the owner once per plan whether you may merge
 the parts into it yourself, keep it current by merging `main` into it (never
 rebase or force-push), and open the final `feature/<topic>` → `main` PR only
-when every part is in. Read `.claude/agent/multi-pr-plans.md` in full before the
-first part is coded, and again in any session that picks a plan up: before
-merging a part, before merging `main` into the feature branch, and before the
-final PR.
+when every part is in. The merge queue is on `main` only: part PRs merge into
+the feature branch directly, the final PR goes through the queue. Read
+`.claude/agent/multi-pr-plans.md` in full before the first part is coded, and
+again in any session that picks a plan up: before merging a part, before
+merging `main` into the feature branch, and before the final PR.
 
 ## Pull requests and code review
 
@@ -134,8 +135,8 @@ mechanics below.
   (rustfmt, clippy `-D warnings`, tests, all `--locked`; zero tests run fails
   it), `integration` (the bee-factory end-to-end test, path-filtered on PRs:
   run the script by hand for a PR it skips that can still change that
-  behaviour; the merge queue always runs it) and `claude-review`. Run the cargo checks locally before opening a PR too. Until the
-  owner has added the `CLAUDE_CODE_OAUTH_TOKEN` secret, `claude-review`'s
+  behaviour; the merge queue always runs it) and `claude-review`. Run the
+  cargo checks locally before opening a PR too. Until the owner has added the `CLAUDE_CODE_OAUTH_TOKEN` secret, `claude-review`'s
   fallback job is red with no review: state that as the blocker. A PR whose
   base branch has no `claude-review.yml` gets no review run at all: say so,
   it is reviewed by hand.

@@ -141,8 +141,8 @@ that produced this note.
   gets no run at all, since `pull_request_target` runs the base branch's copy:
   say so in the PR; it is reviewed by hand.
 - **Never merge a PR yourself** — not with `gh pr merge`, not by enabling
-  auto-merge, not by adding it to the merge queue. No earlier task description or standing instruction authorizes
-  it. The end state of the author's work is "green, answered, ready to merge";
+  auto-merge, not by adding it to the merge queue. No earlier task
+  description or standing instruction authorizes it. The end state of the author's work is "green, answered, ready to merge";
   the merge action itself is always the owner's. Sole exception: part PRs into
   a multi-PR plan's feature branch, when the owner answered yes for that plan
   (see *Multi-PR plans land through a feature branch*); never a PR into `main`.

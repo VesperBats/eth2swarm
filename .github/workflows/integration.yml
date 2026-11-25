@@ -97,7 +97,10 @@ jobs:
           if [ "$EVENT" != pull_request ]; then
             echo "e2e=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          changed=$(git diff --name-only HEAD^1 HEAD)
+          # --no-renames: a rename lists its old path too, as GitHub's `paths`
+          # filter does. quotePath off: a non-ASCII path is printed as is,
+          # not quoted (which would defeat the anchors below).
+          changed=$(git -c core.quotePath=false diff --no-renames --name-only HEAD^1 HEAD)
           printf '%s\n' "$changed"
           # A here-string, not a pipe: `grep -q` exits at the first match, and
           # under pipefail the writer's SIGPIPE would turn that match into "no".
@@ -126,6 +129,10 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+        # A queue run's ref (gh-readonly-queue/…) is never built again: a cache
+        # saved there only evicts main's. Same in ci.yml.
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
 
       # Test-only interpreter, floating on its major like Myotis's test lanes;
       # bee-factory needs Node >= 18.
@@ -206,8 +213,10 @@ jobs:
           if [ "$CHANGES" != success ]; then
             echo "::error::The path check ended '$CHANGES'."; exit 1
           fi
-          if [ "$WANTED" != true ]; then
-            echo "::notice::Nothing in the integration paths changed: no end-to-end run on this PR. The merge queue runs it."
+          # Fail closed: only an explicit `false` skips the test.
+          if [ "$WANTED" = false ]; then
+            echo "::notice::Nothing in the integration paths changed: no end-to-end run on this PR. The merge queue into main runs it (a part PR into a feature branch: the final PR's queue entry)."
             exit 0
           fi
+          [ "$WANTED" = true ] || { echo "::error::The path check gave no answer (e2e='$WANTED')."; exit 1; }
           [ "$E2E" = success ] || { echo "::error::bee-factory end-to-end ended '$E2E'."; exit 1; }
