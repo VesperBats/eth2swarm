@@ -1,20 +1,8 @@
 # Address index (design)
 
-Status: **implemented on a dev chain; mainnet scale in progress** (#8). Detection
-(`src/addr/detect.rs`, `ethswarm appearances`), the record formats (`src/addr/layout.rs`),
-slice building and the cover math (`src/addr/slice.rs`), measuring (`ethswarm addr-stats`),
-the importer (`ethswarm addr-import`) with a full read-back check (`ethswarm addr-verify`),
-and a client (`ethswarm addr-lookup`, head discovery from a finalized block, incremental
-sync, and a check against the chain). An index can start at a later block instead of
-genesis (`addr-import --from-block`, *Starting at a later block*), and an import can be
-written to a directory and uploaded later (`--out`, `addr-upload`). `ethswarm devnet-activity` generates test traffic on
-a dev chain. The client reads every slice, whole pages files, and spill files whole up to
-256 MB and page by page above (every page for a lookup; the newest pages, stopping at its
-limit, in the inspector's spill view); the page search of a paged bucket, stopping a lookup
-when the screen is full, and the time-based head estimate are not implemented. Slices of any level are built with bounded
-memory (*Building large slices*), and stamped with postage batches by lifetime
-(`--lower-batch`, *Lifetime*), and measured with traces under the current rules
-(*Measurements*). Design issue: #5.
+Status: **implemented, and on `main` since 2026-11-21** (plan #8, final PR #39). A one-month
+mainnet index runs on a local Swarm, a one-year one is being built, and none is on Swarm
+mainnet yet: *Implementation and deployment* below. Design issue: #5.
 
 An index from an **address** to the transactions it **appears in**, stored on Swarm next to
 the [SOC block store](soc-block-store.md). A mobile wallet uses it to list an address's
@@ -31,6 +19,74 @@ are hashed into **buckets** of about 2.8 KB, and each bucket is one SOC at a
 deterministic identifier. A lookup reads one bucket per slice. Nothing is ever
 overwritten: only a head feed advances. Large merges run in the background while clients
 keep using the smaller slices they replace.
+
+## Implementation and deployment
+
+As of 2026-11-22. The operator's commands, in order, are in [runbook.md](runbook.md); the
+mainnet nodes and their roles in the [README](../README.md#ethereum-mainnet-nodes).
+
+**Implemented** (`src/addr/`, `ethswarm addr-*`):
+- **Detection** (`detect.rs`, `ethswarm appearances`): every role of *Appearances*. Every
+  block's body and receipts are checked against its header (`fetch.rs`). `TRACE` comes from
+  Erigon's call-frame index (`tools/erigon-trace-export`, A1TR files, `--trace-index`) or
+  from `trace_block` (`--traces`). Receipts before Byzantium come from a second node
+  (`--receipts-rpc`), since Erigon 3 drops their state root.
+- **Building** (`layout.rs`, `slice.rs`, `build.rs`): the record formats, the cover math,
+  slices of every level up to `L_max` with bounded memory (*Building large slices*), and
+  merges deferred to the background.
+- **The importer** (`addr-import`): from genesis or a later block (`--from-block`),
+  following the chain (`--follow`), straight to Bee or to an export directory (`--out`)
+  that `addr-upload` sends later.
+- **Postage** (*Lifetime*): batches grouped by lifetime (`--lower-batch`), immutable
+  batches only, `--batch` required on every node but bee-factory (and with `--lower-batch`
+  everywhere), a capacity check before an export's upload (`addr-upload`; an import
+  straight to Bee has none and stops when Bee refuses a chunk), and every batch an index
+  uses recorded. `stamps` and `stamps plan` list, size and price batches; nothing buys one
+  (`.claude/agent/postage.md`).
+- **Readers and checks:** `addr-verify` (a full read-back), `addr-lookup` (head discovery,
+  incremental sync, `--against-chain`), and the inspector's *Address index* tab
+  ([inspector.md](inspector.md)). `trace-compare` checks a frame index against
+  `trace_block`, and `devnet-activity` generates test traffic on a dev chain. Reader
+  conformance vectors
+  (`testdata/addr1-reader-vectors.txt`) pin the format for other readers.
+- **Measuring** (`addr-stats`): the *Measurements* below, with traces under the current
+  rules.
+
+**Not implemented:**
+- **In the reader:** the page search of a paged bucket, stopping a lookup when the screen
+  is full, and the time-based head estimate. Spill files are read whole up to 256 MB and
+  page by page above it.
+- **In the importer:** a backfill that resumes per slice (a stopped backfill starts over),
+  and `--follow` with a frame index (a traced index is extended in steps instead).
+- **Proofs of completeness:** a design sketch is proposed in PR #41 (open).
+
+**Readers outside this repository:**
+- **Myotis** (VesperBats/myotis#908, merged 2026-11-21): the address history in its Rust
+  engine.
+  - **How it reads:** through an embedded Swarm light node (`ant`). It verifies each entry
+    against verified chain data, deep blocks through a bundled checkpoint table (built here,
+    `ethswarm checkpoint-table`; top block 26,457,537).
+  - **Release status:** behind the off-by-default `swarm` feature, and in no release
+    build yet. What a release needs is in Myotis's `rust/vendor/ant/VENDORED.md`.
+  - **Which format revision:** its rules pin an earlier revision of this document;
+    re-pinning it is Myotis's owner's call.
+- **Punicus** (VesperBats/punicus#334, in progress): the account's *Activity* tab on
+  desktop, as an endless list of verified entries, read through Myotis.
+
+**Deployments:**
+
+| Index | Importer key (SOC owner) | Blocks | `TRACE` | Where | State |
+|---|---|---|---|---|---|
+| One week (superseded) | `0x01229dbb4201bd5b2c93ce7c744af90600114b70` | a week before 2026-11-19 | no | the nuc, as an export (`~/addr1-export`, layout 1, 631 MB) | superseded by the month index; not uploaded again since bee-factory was wiped |
+| One month | `0xefdb28e3Eac685FC0fFb8B61A2692FC671559e4b` | 26,236,928 → the tip | no: built without `--trace-index`, so that it can follow the tip | bee-factory on the nuc (local) | follows the tip, one unit about every 13 minutes; the export is about 2.3 GB after following it to 2026-11-22 (1.7 GB for the month itself) |
+| One year | `0xb11B5F07FEb04076c21092A64eb827f418087241` | 23,838,784 → 26,468,607 | yes, from the frame index | the nuc, as an export | being built since 2026-11-22. Estimated by *Full history and cost*'s method (linear from 720 appearances per block at 22 M to 1,901 at 26.4 M, 2.30 chunks per 1000): ≈ 4.1 billion appearances, ≈ 9.5 M chunks. For a test upload to Swarm mainnet |
+| From genesis | — | — | — | — | not built: the import takes several days, the backfill has to run uninterrupted, and it needs a Swarm-mainnet Bee node and the owner's batches |
+
+- **bee-factory is not durable:** a reboot wipes its chain, so the month index is uploaded
+  again after one (`addr-upload --from-start` with a new batch).
+- **All the test indexes are chain 1** (mainnet). The month index is the data Myotis's and
+  Punicus's end-to-end checks run against. Rebuilding it as it is deployed means the
+  runbook's *Without traces* variant (step 2): `--follow` refuses `--trace-index`.
 
 ## Design constraints
 
@@ -531,7 +587,9 @@ How the importer stamps (`addr-import` and `addr-upload`, `--batch` and `--lower
     topping up and diluting stay the operator's action: no command here does them.
   - Example: the mainnet month index of 2026-11-20 stamps 779,755 chunks with a fullest
     bucket of 32. That is depth 21 exactly full and 22 half full; it was uploaded to a
-    depth-23 batch, which Bee then reported as 32/128.
+    depth-23 batch, which Bee then reported as 32/128. Followed to unit 413,417, it
+    stamped 852,615 chunks with a fullest bucket of 33: depth 21 would now overflow and 22
+    is over half full, so `stamps plan` now calls for 23 (it called for 22 at 32).
 
 The cap is what keeps the history from being rewritten: without it, the whole history
 would be merged into one new top slice every time `N` reaches a power of two, briefly
