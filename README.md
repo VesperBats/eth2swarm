@@ -28,8 +28,9 @@ Importer of Ethereum blocks into Ethereum Swarm.
 - Completeness proofs for the address index (design sketch, not implemented): a public
   commitment for one view, fraud proofs, and zk proofs that a slice is complete — see
   [docs/completeness-proofs.md](docs/completeness-proofs.md).
-- `ethswarm serve` — local web UI to inspect SOCs, blocks, epochs and references on the
-  Swarm nodes; see [docs/inspector.md](docs/inspector.md).
+- `ethswarm serve` — local web UI to inspect SOCs, blocks, epochs, references and the address
+  index on the Swarm nodes, and a node's wallet, chequebook and postage batches (read only);
+  see [docs/inspector.md](docs/inspector.md).
 
 ## Ethereum mainnet nodes
 

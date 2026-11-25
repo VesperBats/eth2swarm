@@ -7,6 +7,7 @@ mod devnet;
 mod import;
 mod inspect;
 mod layout;
+mod node_view;
 mod stamps;
 mod swarm;
 
@@ -435,10 +436,12 @@ enum Command {
         #[command(flatten)]
         source: Source,
     },
-    /// Local web UI to inspect SOCs, blocks, epochs and raw references on Swarm nodes.
+    /// Local web UI to inspect SOCs, blocks, epochs, raw references and the address index on
+    /// Swarm nodes, and a node's wallet, chequebook and postage batches (read only).
     Serve {
         /// Address to listen on. The UI has no authentication: anything else than loopback
-        /// lets whoever reaches the address read the configured nodes through it.
+        /// lets whoever reaches the address read the configured nodes through it, their
+        /// balances included.
         /// `0.0.0.0:8090` listens on every address.
         #[arg(long, default_value = "127.0.0.1:8090")]
         listen: std::net::SocketAddr,
